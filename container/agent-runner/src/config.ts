@@ -7,6 +7,8 @@
  */
 import fs from 'fs';
 
+import type { McpServerConfig } from './providers/types.js';
+
 const CONFIG_PATH = '/workspace/agent/container.json';
 
 export interface RunnerConfig {
@@ -15,9 +17,8 @@ export interface RunnerConfig {
   groupName: string;
   agentGroupId: string;
   maxMessagesPerPrompt: number;
-  mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  mcpServers: Record<string, McpServerConfig>;
   model?: string;
-  effort?: string;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -46,7 +47,6 @@ export function loadConfig(): RunnerConfig {
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     model: (raw.model as string) || undefined,
-    effort: (raw.effort as string) || undefined,
   };
 
   return _config;

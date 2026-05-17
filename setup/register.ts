@@ -166,13 +166,14 @@ export async function run(args: string[]): Promise<void> {
   if (!existing) {
     newlyWired = true;
     const mgaId = generateId('mga');
-    // Mirrors scripts/init-first-agent.ts:wireIfMissing so both setup paths
-    // create rows with the same shape. Groups default to 'mention' (bot only
-    // responds when addressed); DMs default to 'pattern'/'.' (respond to
-    // every message). An explicit --trigger overrides the pattern regex.
-    const isGroup = messagingGroup.is_group === 1;
-    const engageMode: 'pattern' | 'mention' = isGroup && !parsed.trigger ? 'mention' : 'pattern';
-    const engagePattern: string | null = engageMode === 'pattern' ? parsed.trigger || '.' : null;
+    // Fork preserves a single 'pattern' engage mode. When --trigger is set
+    // and --requires-trigger is false, the bot responds to both the trigger
+    // and any other message: `(<trigger>|.*)`. Without --trigger, pattern '.'
+    // matches everything (always-on in DMs and groups).
+    const engageMode: 'pattern' | 'mention' = 'pattern';
+    const engagePattern: string | null = parsed.trigger
+      ? (parsed.requiresTrigger ? parsed.trigger : `(${parsed.trigger}|.*)`)
+      : '.';
     createMessagingGroupAgent({
       id: mgaId,
       messaging_group_id: messagingGroup.id,

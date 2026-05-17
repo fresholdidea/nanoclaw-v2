@@ -39,3 +39,10 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Local-only scratch
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+nanoclaw-v2/
+falcone-spawn.mjs
+.upgrade-worktree/

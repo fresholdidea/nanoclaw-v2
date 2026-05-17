@@ -90,16 +90,11 @@ registerResource({
               onWake: 1,
             });
           }
-          killContainer(
-            ctx.sessionId,
-            'restarted via ncl',
-            message
-              ? () => {
-                  const s = getSession(ctx.sessionId);
-                  if (s) wakeContainer(s);
-                }
-              : undefined,
-          );
+          killContainer(ctx.sessionId, 'restarted via ncl');
+          if (message) {
+            const s = getSession(ctx.sessionId);
+            if (s) await wakeContainer(s);
+          }
           return { restarted: 1, rebuilt: !!args.rebuild };
         }
 

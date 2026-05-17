@@ -9,19 +9,9 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
-import {
-  CONTAINER_IMAGE,
-  CONTAINER_IMAGE_BASE,
-  CONTAINER_INSTALL_LABEL,
-  DATA_DIR,
-  GROUPS_DIR,
-  ONECLI_API_KEY,
-  ONECLI_URL,
-  TIMEZONE,
-} from './config.js';
-import { materializeContainerJson } from './container-config.js';
-import { getContainerConfig } from './db/container-configs.js';
-import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
+import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
+import { readContainerConfig, writeContainerConfig } from './container-config.js';
+import { readEnvFile } from './env.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -38,13 +28,7 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
-import {
-  heartbeatPath,
-  markContainerRunning,
-  markContainerStopped,
-  sessionDir,
-  writeSessionRouting,
-} from './session-manager.js';
+import { heartbeatPath, markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
@@ -60,7 +44,7 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
  * a duplicate container against the same session directory, producing
  * racy double-replies.
  */
-const wakePromises = new Map<string, Promise<boolean>>();
+const wakePromises = new Map<string, Promise<void>>();
 
 export function getActiveContainerCount(): number {
   return activeContainers.size;
@@ -75,32 +59,20 @@ export function isContainerRunning(sessionId: string): boolean {
  * (the in-flight wake promise is reused).
  *
  * The container runs the v2 agent-runner which polls the session DB.
- *
- * Contract: never throws. Returns `true` on successful spawn, `false` on
- * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
- * need to wrap — the inbound row stays pending and host-sweep retries on
- * its next tick. Callers that care (e.g. the router's typing indicator)
- * can branch on the boolean.
  */
-export function wakeContainer(session: Session): Promise<boolean> {
+export function wakeContainer(session: Session): Promise<void> {
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
-    return Promise.resolve(true);
+    return Promise.resolve();
   }
   const existing = wakePromises.get(session.id);
   if (existing) {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  const promise = spawnContainer(session)
-    .then(() => true)
-    .catch((err) => {
-      log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
-      return false;
-    })
-    .finally(() => {
-      wakePromises.delete(session.id);
-    });
+  const promise = spawnContainer(session).finally(() => {
+    wakePromises.delete(session.id);
+  });
   wakePromises.set(session.id, promise);
   return promise;
 }
@@ -121,10 +93,13 @@ async function spawnContainer(session: Session): Promise<void> {
   }
   writeSessionRouting(agentGroup.id, session.id);
 
-  // Materialize container.json from DB — writes fresh file and returns
-  // the config object, threaded through provider resolution, buildMounts,
-  // and buildContainerArgs so we don't re-read.
-  const containerConfig = materializeContainerJson(agentGroup.id);
+  // Read container config once — threaded through provider resolution,
+  // buildMounts, and buildContainerArgs so we don't re-read the file.
+  const containerConfig = readContainerConfig(agentGroup.folder);
+
+  // Ensure container.json has the agent group identity fields the runner needs.
+  // Written at spawn time so the runner can read them from the RO mount.
+  ensureRuntimeFields(containerConfig, agentGroup);
 
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
@@ -146,13 +121,21 @@ async function spawnContainer(session: Session): Promise<void> {
     agentIdentifier,
   );
 
-  log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+  // Clear any stale heartbeat from a previous run of this session. The host
+  // sweep's absolute-ceiling check reads heartbeat mtime; without this, a
+  // file left behind by a prior container kill makes the sweep see an
+  // ancient heartbeat and kill the fresh spawn before it touches the file.
+  // See host-sweep.ts:79 — the ceiling check is intentionally skipped when
+  // no heartbeat file exists.
+  try {
+    fs.unlinkSync(heartbeatPath(agentGroup.id, session.id));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('Failed to clear stale heartbeat before spawn', { sessionId: session.id, err });
+    }
+  }
 
-  // Clear any orphan heartbeat from a previous container instance — the
-  // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
-  // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
-  // immediate kill before the new container touches the file itself.
-  fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
+  log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -190,13 +173,9 @@ async function spawnContainer(session: Session): Promise<void> {
 }
 
 /** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
+export function killContainer(sessionId: string, reason: string): void {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
-
-  if (onExit) {
-    entry.process.once('close', onExit);
-  }
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
   try {
@@ -206,28 +185,12 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   }
 }
 
-/**
- * Resolve the provider name for a session:
- *
- *   sessions.agent_provider
- *     → container_configs.provider
- *     → 'claude'
- *
- * Pure so the precedence can be unit-tested without a DB or filesystem.
- */
-export function resolveProviderName(
-  sessionProvider: string | null | undefined,
-  containerConfigProvider: string | null | undefined,
-): string {
-  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
-}
-
 function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
 ): { provider: string; contribution: ProviderContainerContribution } {
-  const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
+  const provider = (containerConfig.provider || 'claude').toLowerCase();
   const fn = getProviderContainerConfig(provider);
   const contribution = fn
     ? fn({
@@ -396,6 +359,65 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   }
 }
 
+/**
+ * Ensure container.json has the runtime identity fields the runner needs.
+ * Written at spawn time so they're always current even if the DB values
+ * change (e.g. group rename). Only writes if values differ to avoid
+ * unnecessary file churn.
+ */
+function ensureRuntimeFields(
+  containerConfig: import('./container-config.js').ContainerConfig,
+  agentGroup: AgentGroup,
+): void {
+  let dirty = false;
+  if (containerConfig.agentGroupId !== agentGroup.id) {
+    containerConfig.agentGroupId = agentGroup.id;
+    dirty = true;
+  }
+  if (containerConfig.groupName !== agentGroup.name) {
+    containerConfig.groupName = agentGroup.name;
+    dirty = true;
+  }
+  if (containerConfig.assistantName !== agentGroup.name) {
+    containerConfig.assistantName = agentGroup.name;
+    dirty = true;
+  }
+  if (dirty) {
+    writeContainerConfig(agentGroup.folder, containerConfig);
+  }
+}
+
+/**
+ * Scan a container.json for `${VAR}` or `$VAR` placeholders inside stdio MCP
+ * `env` blocks, then read those variables from the host `.env` and return
+ * the values to forward to the container. The agent-runner inside the
+ * container substitutes the placeholders before spawning the MCP process.
+ *
+ * This is the escape hatch for stdio MCPs that read their API key directly
+ * (e.g. `SERPER_API_KEY` for the Serper MCP). HTTP MCPs should rely on the
+ * OneCLI proxy injection path instead.
+ */
+function collectMcpEnvPassthrough(
+  containerConfig: import('./container-config.js').ContainerConfig,
+): Record<string, string> {
+  const placeholderRe = /\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g;
+  const wanted = new Set<string>();
+  for (const server of Object.values(containerConfig.mcpServers ?? {})) {
+    if (!('command' in server) || !server.env) continue;
+    for (const value of Object.values(server.env)) {
+      if (typeof value !== 'string') continue;
+      for (const m of value.matchAll(placeholderRe)) wanted.add(m[1] || m[2]);
+    }
+  }
+  if (wanted.size === 0) return {};
+  const values = readEnvFile([...wanted]);
+  const missing = [...wanted].filter((k) => !values[k]);
+  if (missing.length > 0) {
+    log.warn('MCP env passthrough: missing keys in .env', { missing, groupName: containerConfig.groupName });
+  }
+  return values;
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -405,7 +427,7 @@ async function buildContainerArgs(
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  const args: string[] = ['run', '--rm', '--name', containerName];
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -418,19 +440,31 @@ async function buildContainerArgs(
     }
   }
 
+  // MCP env passthrough: stdio MCPs that bake their API key into outgoing
+  // requests can't use the OneCLI proxy injection path — they read a key
+  // from process.env at startup. Scan container.json mcpServers for any
+  // `${VAR}` placeholders, read those vars from .env, and forward them.
+  // Values are passed to the container env (and substituted into the MCP
+  // env block inside the agent-runner — see container/agent-runner/src/index.ts).
+  for (const [key, value] of Object.entries(collectMcpEnvPassthrough(containerConfig))) {
+    args.push('-e', `${key}=${value}`);
+  }
+
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection. Treated as
-  // a transient hard failure: if we can't wire the gateway, we don't spawn.
-  // The caller (router or host-sweep) catches the throw, leaves the inbound
-  // message pending, and the next sweep tick retries.
-  if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+  // are routed through the agent vault for credential injection.
+  try {
+    if (agentIdentifier) {
+      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    }
+    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    if (onecliApplied) {
+      log.info('OneCLI gateway applied', { containerName });
+    } else {
+      log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
+    }
+  } catch (err) {
+    log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
   }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-  if (!onecliApplied) {
-    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-  }
-  log.info('OneCLI gateway applied', { containerName });
 
   // Host gateway
   args.push(...hostGatewayArgs());
@@ -469,10 +503,10 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   const agentGroup = getAgentGroup(agentGroupId);
   if (!agentGroup) throw new Error('Agent group not found');
 
-  const configRow = getContainerConfig(agentGroup.id);
-  if (!configRow) throw new Error('Container config not found');
-  const aptPackages = JSON.parse(configRow.packages_apt) as string[];
-  const npmPackages = JSON.parse(configRow.packages_npm) as string[];
+  const containerConfig = readContainerConfig(agentGroup.folder);
+  const aptPackages = containerConfig.packages.apt;
+  const npmPackages = containerConfig.packages.npm;
+
   if (aptPackages.length === 0 && npmPackages.length === 0) {
     throw new Error('No packages to install. Use install_packages first.');
   }
@@ -491,7 +525,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   }
   dockerfile += 'USER node\n';
 
-  const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;
+  const imageTag = `nanoclaw-agent:${agentGroupId}`;
 
   log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages });
 
@@ -502,14 +536,15 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     execSync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
       cwd: DATA_DIR,
       stdio: 'pipe',
-      timeout: 900_000,
+      timeout: 300_000,
     });
   } finally {
     fs.unlinkSync(tmpDockerfile);
   }
 
-  // Store the image tag in the DB
-  updateContainerConfigScalars(agentGroup.id, { image_tag: imageTag });
+  // Store the image tag in groups/<folder>/container.json
+  containerConfig.imageTag = imageTag;
+  writeContainerConfig(agentGroup.folder, containerConfig);
 
   log.info('Per-agent-group image built', { agentGroupId, imageTag });
 }

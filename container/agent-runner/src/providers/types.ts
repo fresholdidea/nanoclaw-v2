@@ -25,16 +25,7 @@ export interface ProviderOptions {
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   additionalDirectories?: string[];
-  /**
-   * Model alias (`sonnet`, `opus`, `haiku`) or full model ID. Passed through
-   * to the underlying SDK. If omitted, the SDK default is used.
-   */
   model?: string;
-  /**
-   * Reasoning effort (`'low' | 'medium' | 'high' | 'xhigh' | 'max'`). Passed
-   * through to the underlying SDK. If omitted, the SDK default is used.
-   */
-  effort?: string;
 }
 
 export interface QueryInput {
@@ -59,11 +50,18 @@ export interface QueryInput {
   };
 }
 
-export interface McpServerConfig {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
+export type McpServerConfig =
+  | {
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+      type?: 'stdio';
+    }
+  | {
+      type: 'http' | 'sse';
+      url: string;
+      headers?: Record<string, string>;
+    };
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */

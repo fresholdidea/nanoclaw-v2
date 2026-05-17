@@ -3,6 +3,31 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+// Claude Agent SDK 0.2.x requires the *native* claude binary, not the
+// JS wrapper at /pnpm/bin/claude. The native binary ships bundled with
+// the SDK at @anthropic-ai/claude-agent-sdk-<platform>-<arch>[-musl]/claude.
+//
+// On Debian glibc images, bun installs BOTH the glibc and musl variants
+// as optional deps. The SDK's built-in fallback resolver checks the musl
+// path first — but the musl binary fails to launch on glibc (missing
+// /lib/ld-musl-*.so.1). We pin the path explicitly to the glibc variant.
+function resolveClaudeBinary(): string {
+  const arch = process.arch; // 'arm64' | 'x64' on linux
+  const candidates = [
+    `/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-${arch}/claude`,
+    `/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-${arch}-musl/claude`,
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      /* keep trying */
+    }
+  }
+  return candidates[0];
+}
+const CLAUDE_BIN = resolveClaudeBinary();
+
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
@@ -258,14 +283,12 @@ export class ClaudeProvider implements AgentProvider {
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
   private model?: string;
-  private effort?: string;
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
     this.model = options.model;
-    this.effort = options.effort;
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -289,7 +312,7 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        pathToClaudeCodeExecutable: CLAUDE_BIN,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: [
           ...TOOL_ALLOWLIST,
@@ -298,8 +321,6 @@ export class ClaudeProvider implements AgentProvider {
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: this.env,
         model: this.model,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        effort: this.effort as any,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
