@@ -28,7 +28,13 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
-import { heartbeatPath, markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
+import {
+  heartbeatPath,
+  markContainerRunning,
+  markContainerStopped,
+  sessionDir,
+  writeSessionRouting,
+} from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
@@ -142,10 +148,23 @@ async function spawnContainer(session: Session): Promise<void> {
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
 
-  // Log stderr
+  // Capture stderr for diagnostics (dumped to error log on non-zero exit).
+  let stderrBuf = '';
   container.stderr?.on('data', (data) => {
+    stderrBuf += data.toString();
     for (const line of data.toString().trim().split('\n')) {
       if (line) log.debug(line, { container: agentGroup.folder });
+    }
+  });
+  container.on('close', (code) => {
+    if (code && code !== 0) {
+      log.error('Container spawn failed', {
+        sessionId: session.id,
+        code,
+        containerName,
+        stderr: stderrBuf.slice(-2000),
+        args: args.join(' '),
+      });
     }
   });
 
