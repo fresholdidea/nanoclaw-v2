@@ -22,11 +22,18 @@ Branch: spike/agy-provider
   - `install.sh` fetched from `https://antigravity.google/cli/install.sh` documents platform detection and manifest schema
   - Direct fetch of `/manifests/linux_arm64.json` and `/manifests/linux_amd64.json` returned valid JSON with download URLs and checksums (no auth required)
   - Companion docs repo at `github.com/google-antigravity/antigravity-cli` (CHANGELOG only — no release artifacts hosted there)
-- **TODO (deferred to controller approval):**
-  - [ ] Step 4: download `cli_linux_arm64.tar.gz`, verify sha512, extract `agy` binary
-  - [ ] Step 5: bind-mount the extracted binary into a `node:22-slim` container and verify it runs (`agy --help`, glibc compatibility)
+- **Download + extraction verified (2026-05-25):**
+  - Downloaded `cli_linux_arm64.tar.gz` (46.7 MB) from the manifest URL above.
+  - sha512 matched the manifest exactly (`1cbd300794617da091e8f10b40cd555727e50dcadaa60f275a873b7ab4ff5868bfeb12812da012be878fde79407c89a8a1ff3eeb4f1c50e26834d4e01bc073d7`).
+  - Tarball contains a single file named `antigravity` (not `agy` or `cli`) at the root — extracted path: `scripts/spike/agy/cache/antigravity` (gitignored, 168 MB, executable bit set).
+  - `file` output: `ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0, BuildID[md5/uuid]=207bc3b130f20dc90d3ac6fa876c04e6, stripped`.
+- **Container compat verified (2026-05-25):**
+  - Bind-mounted the binary read-only into `node:22-slim` as `/usr/local/bin/agy` and ran `--help`.
+  - Help text rendered cleanly — no glibc/loader errors. Confirmed flags include `--print`, `--prompt`, `--continue`, `--conversation`, `--dangerously-skip-permissions`, `--sandbox`, `--add-dir`, `--log-file`, `--print-timeout`, plus subcommands `changelog`, `help`, `install`, `plugin`/`plugins`, `update`.
+  - glibc 3.7.0 minimum requirement is well below `node:22-slim`'s Debian Trixie glibc, so no compat surprise expected for the supported container base.
+- **Note on binary name:** the tarball's executable is `antigravity`, not `agy`. The host's `agy` command (installed via `install.sh`) is a symlink/wrapper to `antigravity`. Provider integration should either rename the binary on install or invoke it as `antigravity` directly.
 
-**Verdict: PASS (pending download verification)**
+**Verdict: PASS**
 
 ## Gate 2 — Headless streaming
 TBD
