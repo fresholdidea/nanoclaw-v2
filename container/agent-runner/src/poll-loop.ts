@@ -303,6 +303,14 @@ async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Mutable routing pointer — updated each time a follow-up batch is pushed
+  // into the active query so the *next* `result` event's <message to=...>
+  // blocks (and any MCP send_message calls between push and result) stamp
+  // the follow-up's id as in_reply_to instead of the initial batch's.
+  // Without this, replies to the second user message arrive in chat as
+  // "Re: <first-message-id>" — looks like a duplicate response to the
+  // first message rather than a reply to the second.
+  let currentRouting: RoutingContext = routing;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -376,6 +384,12 @@ async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
+        // Advance routing to the follow-up batch BEFORE pushing so MCP
+        // send_message calls the agent issues between push and the next
+        // result event stamp the follow-up's id as in_reply_to. Result-event
+        // dispatch reads currentRouting too (see dispatchResultText below).
+        currentRouting = extractRouting(keep);
+        setCurrentInReplyTo(currentRouting.inReplyTo);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         query.push(prompt);
@@ -420,7 +434,7 @@ async function processQuery(
 
   try {
     for await (const event of query.events) {
-      handleEvent(event, routing);
+      handleEvent(event, currentRouting);
       touchHeartbeat();
 
       if (event.type === 'init') {
@@ -441,7 +455,7 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+          const { hasUnwrapped } = dispatchResultText(event.text, currentRouting);
           if (hasUnwrapped && !unwrappedNudged) {
             unwrappedNudged = true;
             const destinations = getAllDestinations();
