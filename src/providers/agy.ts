@@ -20,11 +20,10 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 
 // Candidate paths for the Linux agy binary, in priority order.
 // The binary inside the tarball is named `antigravity`, not `agy`.
-// Override with AGY_LINUX_BIN env if you keep it elsewhere.
+// `/add-agy` installs to `antigravity-linux-<arch>`. Override via AGY_LINUX_BIN.
 const DEFAULT_AGY_LINUX_BIN_CANDIDATES = [
-  path.join(process.cwd(), 'scripts/spike/agy/cache/antigravity'),
   path.join(os.homedir(), '.local/bin/antigravity-linux-arm64'),
-  path.join(os.homedir(), '.local/bin/agy-linux-arm64'),
+  path.join(os.homedir(), '.local/bin/antigravity-linux-amd64'),
 ];
 const DEFAULT_GEMINI_DIR = path.join(os.homedir(), '.gemini');
 
