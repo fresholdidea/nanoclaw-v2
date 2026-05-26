@@ -74,6 +74,7 @@ export class AgyProvider implements AgentProvider {
     let activeProc: ChildProcess | null = null;
     let aborted = false;
     let ended = false;
+    let terminatingForPush = false;
     let waiting: (() => void) | null = null;
 
     const kick = (): void => { waiting?.(); waiting = null; };
@@ -92,6 +93,7 @@ export class AgyProvider implements AgentProvider {
       let initYielded = false;
 
       while (!aborted) {
+        terminatingForPush = false;
         while (pending.length === 0 && !ended && !aborted) {
           await new Promise<void>((resolve) => { waiting = resolve; });
         }
@@ -129,13 +131,18 @@ export class AgyProvider implements AgentProvider {
             errorChunks.push(chunk.toString());
           });
           proc.on('close', (code) => {
-            if (stdoutBuf) lines.push(stdoutBuf);
+            if (stdoutBuf) {
+              lines.push(stdoutBuf);
+              if (STALE_SESSION_RE.test(stdoutBuf)) {
+                staleWarningDetected = true;
+              }
+            }
             if (staleWarningDetected) {
               const id = self.activeConversationId ?? '?';
               reject(new Error(`Warning: conversation "${id}" not found.`));
               return;
             }
-            if (code !== 0 && !aborted) {
+            if (code !== 0 && !aborted && !terminatingForPush) {
               reject(new Error(`agy exited ${code}: ${errorChunks.join('').slice(0, 500)}`));
             } else {
               resolve();
@@ -206,6 +213,7 @@ export class AgyProvider implements AgentProvider {
         // is the only way to inject a follow-up message into a `-p` run.
         pending.push(message);
         if (activeProc) {
+          terminatingForPush = true;
           try { activeProc.kill('SIGTERM'); } catch { /* ignore */ }
         }
         kick();
