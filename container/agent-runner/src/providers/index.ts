@@ -19,4 +19,5 @@ await Promise.all([
   loadProvider('claude'),
   loadProvider('mock'),
   loadProvider('opencode'),
+  loadProvider('agy'),
 ]);
