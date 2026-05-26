@@ -32,7 +32,7 @@ for f in src/providers/agy.ts \
   test -f "$f" && echo "  source: $f ✓" || echo "  source: $f MISSING"
 done
 grep -q "./agy.js" src/providers/index.ts && echo "  host barrel: ✓" || echo "  host barrel: MISSING"
-grep -q "./agy.js" container/agent-runner/src/providers/index.ts && echo "  container barrel: ✓" || echo "  container barrel: MISSING"
+grep -q "loadProvider('agy')" container/agent-runner/src/providers/index.ts && echo "  container barrel: ✓" || echo "  container barrel: MISSING"
 
 ARCH=$(uname -m); case "$ARCH" in arm64|aarch64) A=arm64;; x86_64|amd64) A=amd64;; *) A=unknown;; esac
 test -x "$HOME/.local/bin/antigravity-linux-${A}" && echo "  binary: ✓" || echo "  binary: MISSING"
@@ -251,7 +251,7 @@ If you have agent groups built with per-agent image tags (e.g. `nanoclaw-agent:a
 ## Verify
 
 ```bash
-grep -q "./agy.js" container/agent-runner/src/providers/index.ts && echo "container barrel: OK"
+grep -q "loadProvider('agy')" container/agent-runner/src/providers/index.ts && echo "container barrel: OK"
 grep -q "./agy.js" src/providers/index.ts && echo "host barrel: OK"
 ARCH=$(uname -m); case "$ARCH" in arm64|aarch64) A=arm64;; *) A=amd64;; esac
 test -x "$HOME/.local/bin/antigravity-linux-${A}" && echo "binary: OK"
