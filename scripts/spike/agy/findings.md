@@ -36,7 +36,13 @@ Branch: spike/agy-provider
 **Verdict: PASS**
 
 ## Gate 2 — Headless streaming
-TBD
+
+### Stdout streaming
+- Incremental: yes
+- Gap between first and last output: 167s total span across 27 lines; typical inter-line gap <2s. One 122s silence occurred while a long-running `find /` tool call executed (agent narrated "I will wait for the `find` command to complete..." immediately before the silence, confirming the gap is tool-execution time, not output buffering). All narration/action lines arrived before the final answer, not bundled at the end.
+- Structured output mode: not found. `--help` exposes only `--print`, `--print-timeout`, `--log-file`, `--add-dir`, `--continue`, `--conversation`, `--dangerously-skip-permissions`, `--sandbox`, `-i/--prompt-interactive`. No `--output-format`, no `--json`, no `--stream` flag. Subcommands are `changelog`, `help`, `install`, `plugin`, `update` — none relevant.
+- Line shape: each pre-tool-call line is a plain-text first-person narration of the upcoming action, e.g. `I will search for foo.txt on the filesystem to locate its path.` / `I will list the contents of /Users/bradhess to see what is in there.` Final answer lines arrive as normal prose (`Here are the lines of the file, numbered:` followed by `1. line one`, `2. line two`). No `event:` / `tool:` / `assistant:` prefixes. No JSON.
+- Parseable for activity pings: yes for activity-ping purposes (any new line on stdout = liveness signal — sufficient to reset an idle-kill timer). No for structured event parsing (would need to LLM-classify lines, which we don't want). Recommendation: treat any stdout write as an activity ping; do not attempt to parse line semantics.
 
 ## Decision
 TBD
