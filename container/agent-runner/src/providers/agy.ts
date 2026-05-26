@@ -92,7 +92,10 @@ export class AgyProvider implements AgentProvider {
       }
       args.push('--add-dir', input.cwd);
       const env: Record<string, string> = { ...process.env } as Record<string, string>;
-      return spawn(AGY_BIN, args, { cwd: input.cwd, env, detached: false });
+      // stdin must be closed (ignore = /dev/null). agy -p reads stdin and
+      // blocks forever if it stays open as a pipe, even with --print mode.
+      // (Verified by tracing the hang to syscall read(0) during smoke test.)
+      return spawn(AGY_BIN, args, { cwd: input.cwd, env, detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
     }
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
