@@ -88,7 +88,7 @@ Three corrections that must land in `docs/superpowers/plans/2026-05-25-agy-provi
 
 | Criterion | Result | Notes |
 |---|---|---|
-| 1. Single-turn response | ✓ | seq 29 at 16:57:40 — `Hey Brad! Cache here...` via telegram-cache |
+| 1. Single-turn response | ✓ (with prefix leak) | seq 29 at 16:57:40 — content correct, leading `` ` block.\n</internal>\n`` prefix leaked (see "Known issues" below) |
 | 2. Continuation | partial | conv-id discovery timed out at 30s on first run (file path delay); response still landed without continuation. Worth a follow-up to widen the poll window or accept it as best-effort. |
 | 3. Long-task tolerance | n/a | Single-turn test; not exercised. Heartbeat code present. |
 | 4. OneCLI MCP creds | ✓ | seq 25/27 are cli_request system actions — agent successfully called `ncl` from container; MCP wiring intact. |
@@ -100,3 +100,9 @@ Three corrections that must land in `docs/superpowers/plans/2026-05-25-agy-provi
 2. **agy hung on stdin read** — Node spawn defaults to `stdio: 'pipe'` for stdin; agy `-p` reads stdin and blocks even in print mode. Fixed in commit `cf071d2` by `stdio: ['ignore', 'pipe', 'pipe']`.
 3. **CA certs missing in node:22-slim** — auth-login throwaway container needed agent image (which has ca-certificates). Fixed in `scripts/spike/agy/auth-login.sh`.
 4. **Container-mode token storage** — agy detects container env and switches to file-based token storage (`~/.gemini/antigravity-cli/antigravity-oauth-token`). The host's macOS keychain tokens are not portable. Resolution: one-time `agy auth login` inside a throwaway container (script provided). This is a deployment step, not a code defect.
+
+## Known issues (follow-up)
+
+1. **Narration leak in result text.** agy emits running narration on stdout with no "final answer starts here" marker; the provider passes the entire concatenated stdout as `result.text`. Stray `</internal>` close-tags or stray code-fence remnants from narration leak through ahead of the `<message>` block. Sample: the delivered message above starts with `` ` block.\n</internal>\n`` before the real `<message>` tag. The content within `<message>` is correct; only the prefix leaks. Fix options: (a) only emit the trailing chunk after the last apparent prompt boundary, (b) buffer everything but strip orphan tags from `</internal>` and stray code-fence tokens, (c) ask the agent to explicitly bracket the final answer (system-prompt change). Lowest-cost fix is (b) — a post-process pass in `result.text`.
+2. **Conversation-ID discovery sometimes misses the 30s window.** agy writes to `last_conversations.json` after some setup work; on a cold first turn the 30s poll can elapse before the file appears. Current behavior: logs a warning and proceeds without continuation (so the next turn starts a fresh conversation). Fix options: extend the poll window, watch the `brain/<id>/` folder as a secondary signal, or read the file after agy exits if discovery during the turn fails.
+3. **Result text includes raw narration noise.** Even when no orphan tags leak, the full stdout dump is noisy for chat-channel destinations that don't render `<message>` extraction (e.g., direct destinations that consume `result.text` raw). Same root cause as #1; same fix candidates.
