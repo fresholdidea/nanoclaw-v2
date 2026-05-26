@@ -83,3 +83,20 @@ Three corrections that must land in `docs/superpowers/plans/2026-05-25-agy-provi
 3. **isSessionInvalid mechanics.** Invalid `--conversation` does NOT error — agy exits 0 with `Warning: conversation "<id>" not found.` on stdout and silently starts a fresh conversation. Provider must:
    - Either pre-check `brain/<id>/` exists before spawning (cheap, race-free)
    - Or scan stdout for `/^Warning: conversation ".*" not found\.$/m` mid-stream and treat it as session-invalid (clear `activeConversationId`, fail loudly so caller can retry without continuation)
+
+## Phase 2 smoke test (2026-05-26)
+
+| Criterion | Result | Notes |
+|---|---|---|
+| 1. Single-turn response | ✓ | seq 29 at 16:57:40 — `Hey Brad! Cache here...` via telegram-cache |
+| 2. Continuation | partial | conv-id discovery timed out at 30s on first run (file path delay); response still landed without continuation. Worth a follow-up to widen the poll window or accept it as best-effort. |
+| 3. Long-task tolerance | n/a | Single-turn test; not exercised. Heartbeat code present. |
+| 4. OneCLI MCP creds | ✓ | seq 25/27 are cli_request system actions — agent successfully called `ncl` from container; MCP wiring intact. |
+| 5. Google billing | tbd | Brad to confirm token spend on https://aistudio.google.com/usage |
+
+## Issues uncovered during smoke test (fixed in-flight)
+
+1. **Host wasn't rebuilt** — host runs from `dist/`; without `pnpm run build` the new `src/providers/agy.ts` registration never loaded, so the provider config callback didn't fire and no mounts/env were applied. Fixed by running build before launchd kickstart.
+2. **agy hung on stdin read** — Node spawn defaults to `stdio: 'pipe'` for stdin; agy `-p` reads stdin and blocks even in print mode. Fixed in commit `cf071d2` by `stdio: ['ignore', 'pipe', 'pipe']`.
+3. **CA certs missing in node:22-slim** — auth-login throwaway container needed agent image (which has ca-certificates). Fixed in `scripts/spike/agy/auth-login.sh`.
+4. **Container-mode token storage** — agy detects container env and switches to file-based token storage (`~/.gemini/antigravity-cli/antigravity-oauth-token`). The host's macOS keychain tokens are not portable. Resolution: one-time `agy auth login` inside a throwaway container (script provided). This is a deployment step, not a code defect.
