@@ -44,5 +44,22 @@ Branch: spike/agy-provider
 - Line shape: each pre-tool-call line is a plain-text first-person narration of the upcoming action, e.g. `I will search for foo.txt on the filesystem to locate its path.` / `I will list the contents of /Users/bradhess to see what is in there.` Final answer lines arrive as normal prose (`Here are the lines of the file, numbered:` followed by `1. line one`, `2. line two`). No `event:` / `tool:` / `assistant:` prefixes. No JSON.
 - Parseable for activity pings: yes for activity-ping purposes (any new line on stdout = liveness signal — sufficient to reset an idle-kill timer). No for structured event parsing (would need to LLM-classify lines, which we don't want). Recommendation: treat any stdout write as an activity ping; do not attempt to parse line semantics.
 
+### Conversation ID
+- **Emitted on stdout:** no. **Emitted on stderr:** no. **Filesystem-only:** yes.
+- **Discovery mechanism:** new directory appears under `~/.gemini/antigravity-cli/brain/<uuid>/` and an entry is written to `~/.gemini/antigravity-cli/cache/last_conversations.json` keyed by the agent's cwd:
+  ```json
+  "/tmp/tmp.TD9VYo5WgC": "e7578d42-16d5-41df-936e-be5f5bc1ac4d"
+  ```
+  The cwd-keyed cache is the cleanest discovery path for the provider — give each session a unique cwd (we already do, per-session workspace mount) and read the cache after the first turn completes.
+- **Note on directory:** the CLI uses `~/.gemini/antigravity-cli/` — NOT `~/.gemini/antigravity/` (which belongs to the desktop app). My first probe pass watched the wrong folder and saw no changes; corrected in the committed script.
+- **ID format:** UUID v4 (sample: `e7578d42-16d5-41df-936e-be5f5bc1ac4d`).
+- **Resume works:** yes. Turn 1: `Say hi in three words.` → `Hello there, user.` Turn 2 with `--conversation <id>`: `What did you just say?` → `Hello there, user. / I said, "Hello there, user."` — turn 2 saw turn 1.
+- **Invalid-conversation behavior:**
+  - Error text (verbatim, first line of stdout): `Warning: conversation "does-not-exist-12345" not found.`
+  - Channel: **stdout**, not stderr.
+  - Exit code: **0** (agy silently falls through and starts a fresh conversation — does NOT error out).
+  - Regex candidate for `isSessionInvalid` (Phase 2 Task 2.4): `/^Warning: conversation ".*" not found\.$/m`
+  - Implication: the provider cannot rely on exit code to detect session-invalid; it MUST scan stdout for this warning string and treat it as "fall back to fresh session" rather than letting agy auto-create one and lose continuation state on the host side.
+
 ## Decision
 TBD
