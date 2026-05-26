@@ -62,4 +62,24 @@ Branch: spike/agy-provider
   - Implication: the provider cannot rely on exit code to detect session-invalid; it MUST scan stdout for this warning string and treat it as "fall back to fresh session" rather than letting agy auto-create one and lose continuation state on the host side.
 
 ## Decision
-TBD
+
+| Outcome | Action |
+|---|---|
+| Gate 1 fails (no Linux binary) | DEFER — Phase 2 skipped, revisit when Google ships. End spike branch. |
+| Gate 1 passes, Gate 2a passes (stream + parseable) | PROCEED — Phase 2 CLI-per-turn pattern. |
+| Gate 1 passes, Gate 2a fails, Gate 2c shows usable agentapi | PROCEED — Phase 2 server pattern (opencode-style). |
+| Gate 1 passes, both 2a and 2c fail | DEFER — accept the cost or revisit when agy ships a streaming mode. |
+
+**Selected:** PROCEED
+**Implementation variant:** CLI-per-turn (Task 2.5 base path; agentapi alternate not needed)
+**Rationale:** Gate 1 PASSED — verified Linux arm64 binary runs in `node:22-slim`. Gate 2a PASSED — agy `-p` emits stdout incrementally (narration + final answer); treating any stdout byte as an activity ping plus a 5s heartbeat from a sidecar timer covers the worst observed silence (122s tool-internal wait). No need to fall back to agentapi.
+
+## Plan deltas required before Phase 2
+
+Three corrections that must land in `docs/superpowers/plans/2026-05-25-agy-provider.md` and the matching code before Phase 2 implementation begins:
+
+1. **Path correction.** Plan uses `~/.gemini/antigravity/` (desktop app) throughout. Real CLI path is `~/.gemini/antigravity-cli/`. Affects Task 2.5 constants (`BRAIN_DIR`, `MCP_CONFIG_PATH`) and Task 2.7 host mount (`DEFAULT_GEMINI_DIR` is fine but the in-container env vars need the `-cli` suffix).
+2. **Conv-ID discovery.** Plan uses brain/-folder diff. Prefer reading `~/.gemini/antigravity-cli/cache/last_conversations.json` (cwd-keyed JSON map) — no race window, no polling. Brain/-folder diff is still a viable fallback.
+3. **isSessionInvalid mechanics.** Invalid `--conversation` does NOT error — agy exits 0 with `Warning: conversation "<id>" not found.` on stdout and silently starts a fresh conversation. Provider must:
+   - Either pre-check `brain/<id>/` exists before spawning (cheap, race-free)
+   - Or scan stdout for `/^Warning: conversation ".*" not found\.$/m` mid-stream and treat it as session-invalid (clear `activeConversationId`, fail loudly so caller can retry without continuation)
