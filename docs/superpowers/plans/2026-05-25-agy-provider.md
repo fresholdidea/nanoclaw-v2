@@ -580,7 +580,7 @@ describe('mcpServersToAgyConfig', () => {
 });
 ```
 
-> **Why this shape:** agy's MCP config (`~/.gemini/antigravity/mcp_config.json`) uses Google's GenAI MCP schema: stdio servers are `{command, args, env?}`; HTTP servers are `{httpUrl, headers?}`. If Phase 1 step 1.2 revealed a different shape in the actual mcp_config.json, adjust BOTH the test expectations and the implementation in Task 2.2 to match.
+> **Why this shape:** agy's MCP config (`~/.gemini/antigravity-cli/mcp_config.json`) uses Google's GenAI MCP schema: stdio servers are `{command, args, env?}`; HTTP servers are `{httpUrl, headers?}`. (Spike Task 1.3 confirmed the CLI's data dir is `antigravity-cli/`, not `antigravity/` — that's the desktop app.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -621,8 +621,11 @@ export type AgyMcpEntry = AgyMcpLocal | AgyMcpRemote;
 
 /**
  * Translate NanoClaw v2 MCP server definitions into the schema agy reads from
- * `~/.gemini/antigravity/mcp_config.json`. The container provider writes the
- * full `{ mcpServers: ... }` envelope before each query.
+ * `~/.gemini/antigravity-cli/mcp_config.json`. The container provider writes
+ * the full `{ mcpServers: ... }` envelope before each query.
+ *
+ * (Path is `antigravity-cli`, not `antigravity` — the unsuffixed dir is the
+ * desktop app's data, not the CLI's. Verified in spike Task 1.3.)
  */
 export function mcpServersToAgyConfig(
   servers: Record<string, McpServerConfig> | undefined,
@@ -691,15 +694,19 @@ describe('AgyProvider', () => {
     await import('./agy.js');
     const { getProviderFactory } = await import('./provider-registry.js');
     const provider = getProviderFactory('agy')({});
-    // Replace this string with the EXACT error captured in spike findings 1.3 step 3.
-    const NOT_FOUND_MSG = 'conversation not found';
+    // Exact warning agy emits on stdout for a missing --conversation id
+    // (verified in spike Task 1.3 step 3). NOTE: agy exits 0 in this case
+    // and silently falls through to a fresh conversation — the provider
+    // scans stdout for this warning mid-stream and throws an error whose
+    // message matches the regex so the agent-runner clears continuation.
+    const NOT_FOUND_MSG = 'Warning: conversation "abc-123" not found.';
     expect(provider.isSessionInvalid(new Error(NOT_FOUND_MSG))).toBe(true);
     expect(provider.isSessionInvalid(new Error('something else entirely'))).toBe(false);
   });
 });
 ```
 
-> **IMPORTANT:** Replace `'conversation not found'` with the literal error text recorded in spike findings 1.3 step 3 (the `--conversation does-not-exist` probe). The regex in Task 2.4 must match that text.
+> **Test text was set from spike Task 1.3 step 3:** `Warning: conversation "<id>" not found.` This is what agy prints to stdout when `--conversation <unknown-id>` is passed. agy then exits 0 and starts a fresh conversation — the provider's job is to detect this mid-stream and throw so the agent-runner can clear `continuation` and retry properly.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -732,10 +739,13 @@ function log(msg: string): void {
 }
 
 /**
- * Stale-session detection. Update this regex from spike findings 1.3 step 3
- * to match the EXACT error text agy emits for an unknown --conversation id.
+ * Stale-session detection. agy exits 0 when --conversation <id> is missing
+ * and prints `Warning: conversation "<id>" not found.` on stdout, then
+ * silently starts a fresh conversation. The provider scans stdout for this
+ * warning and throws an error whose message matches this regex.
+ * (Verified in spike Task 1.3 step 3.)
  */
-const STALE_SESSION_RE = /conversation not found|unknown conversation|invalid conversation/i;
+const STALE_SESSION_RE = /Warning: conversation ".*" not found\./;
 
 export class AgyProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
@@ -805,11 +815,12 @@ function log(msg: string): void {
   console.error(`[agy-provider] ${msg}`);
 }
 
-const STALE_SESSION_RE = /conversation not found|unknown conversation|invalid conversation/i;
+const STALE_SESSION_RE = /Warning: conversation ".*" not found\./;
 
 const AGY_BIN = process.env.AGY_BIN || 'agy';
-const BRAIN_DIR = process.env.AGY_BRAIN_DIR || '/home/node/.gemini/antigravity/brain';
-const MCP_CONFIG_PATH = process.env.AGY_MCP_CONFIG_PATH || '/home/node/.gemini/antigravity/mcp_config.json';
+const CLI_DATA_DIR = process.env.AGY_CLI_DATA_DIR || '/home/node/.gemini/antigravity-cli';
+const MCP_CONFIG_PATH = process.env.AGY_MCP_CONFIG_PATH || `${CLI_DATA_DIR}/mcp_config.json`;
+const LAST_CONVS_PATH = process.env.AGY_LAST_CONVS_PATH || `${CLI_DATA_DIR}/cache/last_conversations.json`;
 const PRINT_TIMEOUT = process.env.AGY_PRINT_TIMEOUT || '15m';
 
 function writeMcpConfig(servers: ProviderOptions['mcpServers']): void {
@@ -818,27 +829,20 @@ function writeMcpConfig(servers: ProviderOptions['mcpServers']): void {
   fs.writeFileSync(MCP_CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
-/** Snapshot current brain/ folder so we can spot the new conversation id later. */
-function brainSnapshot(): Set<string> {
+/**
+ * Look up the conversation id agy associated with this cwd. agy writes the
+ * cwd→uuid mapping to `cache/last_conversations.json` shortly after starting
+ * a -p run. Race-free vs. the brain/ folder diff because the key is known.
+ * (Verified in spike Task 1.3.)
+ */
+function getConvIdForCwd(cwd: string): string | null {
   try {
-    return new Set(fs.readdirSync(BRAIN_DIR));
-  } catch {
-    return new Set();
-  }
-}
-
-/** Return any conversation id present after snapshot but not before. */
-function findNewConversationId(before: Set<string>): string | null {
-  let after: string[];
-  try {
-    after = fs.readdirSync(BRAIN_DIR);
+    const cache = JSON.parse(fs.readFileSync(LAST_CONVS_PATH, 'utf-8')) as Record<string, unknown>;
+    const value = cache[cwd];
+    return typeof value === 'string' ? value : null;
   } catch {
     return null;
   }
-  for (const name of after) {
-    if (!before.has(name)) return name;
-  }
-  return null;
 }
 
 export class AgyProvider implements AgentProvider {
@@ -872,16 +876,14 @@ export class AgyProvider implements AgentProvider {
 
     const kick = (): void => { waiting?.(); waiting = null; };
 
-    function spawnTurn(text: string): { proc: ChildProcess; brainBefore: Set<string> } {
+    function spawnTurn(text: string): ChildProcess {
       const args = ['-p', text, '--dangerously-skip-permissions', '--print-timeout', PRINT_TIMEOUT];
       if (self.activeConversationId) {
         args.push('--conversation', self.activeConversationId);
       }
       args.push('--add-dir', input.cwd);
-      const brainBefore = brainSnapshot();
       const env: Record<string, string> = { ...process.env } as Record<string, string>;
-      const proc = spawn(AGY_BIN, args, { cwd: input.cwd, env, detached: false });
-      return { proc, brainBefore };
+      return spawn(AGY_BIN, args, { cwd: input.cwd, env, detached: false });
     }
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
@@ -894,22 +896,17 @@ export class AgyProvider implements AgentProvider {
         if (aborted || (pending.length === 0 && ended)) return;
 
         const turnText = pending.shift()!;
-        const { proc, brainBefore } = spawnTurn(turnText);
+        const proc = spawnTurn(turnText);
         activeProc = proc;
 
         let stdoutBuf = '';
-        const lineHandlers = {
-          onLine(line: string): void {
-            // Every parsed line is activity; the host poll loop needs this so
-            // the idle-kill timer doesn't fire during long tool runs.
-            // The shape of the lines was characterized in spike Task 1.2 —
-            // see findings.md "Stdout streaming".
-            // No-op here; the actual yield happens in the consumer below.
-          },
-        };
+        let staleWarningDetected = false;
 
-        // Race: read stdout incrementally; on `data`, emit activity + a
-        // progress line; on close, resolve with the final concatenated output.
+        // Stdout handler: collect lines, scan for the stale-conversation
+        // warning. agy doesn't error when --conversation is missing — it
+        // exits 0 after printing this warning and silently starts a fresh
+        // conversation. We must abort the turn and surface as session-
+        // invalid so the agent-runner clears the stored continuation.
         const lines: string[] = [];
         const errorChunks: string[] = [];
         const stdoutPromise = new Promise<void>((resolve, reject) => {
@@ -920,7 +917,10 @@ export class AgyProvider implements AgentProvider {
             stdoutBuf = parts.pop() ?? '';
             for (const ln of parts) {
               lines.push(ln);
-              lineHandlers.onLine(ln);
+              if (STALE_SESSION_RE.test(ln)) {
+                staleWarningDetected = true;
+                try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+              }
             }
           });
           proc.stderr?.on('data', (chunk: Buffer) => {
@@ -928,6 +928,11 @@ export class AgyProvider implements AgentProvider {
           });
           proc.on('close', (code) => {
             if (stdoutBuf) lines.push(stdoutBuf);
+            if (staleWarningDetected) {
+              const id = self.activeConversationId ?? '?';
+              reject(new Error(`Warning: conversation "${id}" not found.`));
+              return;
+            }
             if (code !== 0 && !aborted) {
               reject(new Error(`agy exited ${code}: ${errorChunks.join('').slice(0, 500)}`));
             } else {
@@ -937,12 +942,14 @@ export class AgyProvider implements AgentProvider {
           proc.on('error', reject);
         });
 
-        // Discover the conversation id on first turn — diff brain/ folder.
-        // Poll every 500ms until either id appears or process exits.
+        // Discover the conversation id on first turn via the cwd-keyed
+        // last_conversations.json cache (see spike Task 1.3). Poll every
+        // 500ms until the id appears or the process exits. The poll also
+        // serves as activity-pings while we wait.
         if (!initYielded && !self.activeConversationId) {
           const start = Date.now();
           while (Date.now() - start < 30_000) {
-            const id = findNewConversationId(brainBefore);
+            const id = getConvIdForCwd(input.cwd);
             if (id) {
               self.activeConversationId = id;
               yield { type: 'init', continuation: id };
@@ -1105,9 +1112,12 @@ Write `src/providers/agy.ts`:
 /**
  * Host-side container config for the `agy` provider.
  *
- * Agy reads OAuth credentials from `~/.gemini/oauth_creds.json` and uses
- * `~/.gemini/antigravity/mcp_config.json` to configure MCP servers. The
- * Linux binary is bind-mounted because we don't bake agy into the image —
+ * Agy reads OAuth credentials from `~/.gemini/oauth_creds.json` and writes
+ * CLI data (cache, brain, mcp_config) under `~/.gemini/antigravity-cli/`.
+ * The desktop app uses `~/.gemini/antigravity/` — we mount the parent so
+ * both are available, but only the `-cli` paths matter to the provider.
+ *
+ * The Linux binary is bind-mounted because we don't bake agy into the image —
  * users who never enable agy shouldn't carry the binary in their image.
  *
  * Real secrets never enter the container in env vars; the OAuth token file
@@ -1119,16 +1129,31 @@ import path from 'path';
 
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
-const DEFAULT_AGY_LINUX_BIN = path.join(os.homedir(), '.local/bin/agy-linux-arm64');
+// Candidate paths for the Linux agy binary, in priority order.
+// The binary inside the tarball is named `antigravity`, not `agy`.
+// Override with AGY_LINUX_BIN env if you keep it elsewhere.
+const DEFAULT_AGY_LINUX_BIN_CANDIDATES = [
+  path.join(process.cwd(), 'scripts/spike/agy/cache/antigravity'),
+  path.join(os.homedir(), '.local/bin/antigravity-linux-arm64'),
+  path.join(os.homedir(), '.local/bin/agy-linux-arm64'),
+];
 const DEFAULT_GEMINI_DIR = path.join(os.homedir(), '.gemini');
 
+function resolveAgyBin(envOverride?: string): string | null {
+  if (envOverride) return fs.existsSync(envOverride) ? envOverride : null;
+  for (const candidate of DEFAULT_AGY_LINUX_BIN_CANDIDATES) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 registerProviderContainerConfig('agy', (ctx) => {
-  const agyBin = ctx.hostEnv.AGY_LINUX_BIN || DEFAULT_AGY_LINUX_BIN;
+  const agyBin = resolveAgyBin(ctx.hostEnv.AGY_LINUX_BIN);
   const geminiDir = ctx.hostEnv.AGY_GEMINI_DIR || DEFAULT_GEMINI_DIR;
 
-  if (!fs.existsSync(agyBin)) {
+  if (!agyBin) {
     throw new Error(
-      `agy provider: Linux binary not found at ${agyBin}. ` +
+      `agy provider: Linux binary not found. Tried: ${DEFAULT_AGY_LINUX_BIN_CANDIDATES.join(', ')}. ` +
         `Set AGY_LINUX_BIN in the host env or download per docs/superpowers/specs/2026-05-25-agy-provider-design.md.`,
     );
   }
@@ -1145,8 +1170,9 @@ registerProviderContainerConfig('agy', (ctx) => {
     ],
     env: {
       AGY_BIN: '/usr/local/bin/agy',
-      AGY_BRAIN_DIR: '/home/node/.gemini/antigravity/brain',
-      AGY_MCP_CONFIG_PATH: '/home/node/.gemini/antigravity/mcp_config.json',
+      AGY_CLI_DATA_DIR: '/home/node/.gemini/antigravity-cli',
+      AGY_MCP_CONFIG_PATH: '/home/node/.gemini/antigravity-cli/mcp_config.json',
+      AGY_LAST_CONVS_PATH: '/home/node/.gemini/antigravity-cli/cache/last_conversations.json',
     },
   };
 });
