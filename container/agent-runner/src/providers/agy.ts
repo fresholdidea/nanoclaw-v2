@@ -47,6 +47,11 @@ function getConvIdForCwd(cwd: string): string | null {
   }
 }
 
+function wrapPromptWithContext(text: string, systemInstructions?: string): string {
+  if (!systemInstructions) return text;
+  return `<system>\n${systemInstructions}\n</system>\n\n${text}`;
+}
+
 export class AgyProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -69,7 +74,8 @@ export class AgyProvider implements AgentProvider {
 
     writeMcpConfig(this.options.mcpServers);
 
-    const pending: string[] = [input.prompt];
+    const systemInstructions = input.systemContext?.instructions;
+    const pending: string[] = [wrapPromptWithContext(input.prompt, systemInstructions)];
     const self = this;
     let activeProc: ChildProcess | null = null;
     let aborted = false;
@@ -202,8 +208,10 @@ export class AgyProvider implements AgentProvider {
           activeProc = null;
         }
 
-        const resultText = lines.join('\n').trim();
-        yield { type: 'result', text: resultText || null };
+        if (!terminatingForPush) {
+          const resultText = lines.join('\n').trim();
+          yield { type: 'result', text: resultText || null };
+        }
       }
     }
 
@@ -211,7 +219,7 @@ export class AgyProvider implements AgentProvider {
       push: (message: string) => {
         // CLI-per-turn pattern: aborting the current process and respawning
         // is the only way to inject a follow-up message into a `-p` run.
-        pending.push(message);
+        pending.push(wrapPromptWithContext(message, systemInstructions));
         if (activeProc) {
           terminatingForPush = true;
           try { activeProc.kill('SIGTERM'); } catch { /* ignore */ }
