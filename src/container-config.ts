@@ -49,6 +49,13 @@ export interface ContainerConfig {
   skills: string[] | 'all';
   /** Agent provider name (e.g. "claude", "opencode"). Default: "claude". */
   provider?: string;
+  /**
+   * When true, the host applies the agy provider's mounts + env to this
+   * group regardless of `provider`. Lets a Claude-backed group expose
+   * `mcp__nanoclaw__query_agy` without flipping its primary provider.
+   * Requires the agy provider to be installed (via `/add-agy`).
+   */
+  enableAgyTooling?: boolean;
   /** Agent group display name (used in transcript archiving). */
   groupName?: string;
   /** Assistant display name (used in system prompt / responses). */
@@ -95,6 +102,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       additionalMounts: raw.additionalMounts ?? [],
       skills: raw.skills ?? 'all',
       provider: raw.provider,
+      enableAgyTooling: raw.enableAgyTooling === true,
       groupName: raw.groupName,
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,

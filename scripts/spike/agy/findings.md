@@ -98,7 +98,7 @@ Three corrections that must land in `docs/superpowers/plans/2026-05-25-agy-provi
 
 1. **Host wasn't rebuilt** — host runs from `dist/`; without `pnpm run build` the new `src/providers/agy.ts` registration never loaded, so the provider config callback didn't fire and no mounts/env were applied. Fixed by running build before launchd kickstart.
 2. **agy hung on stdin read** — Node spawn defaults to `stdio: 'pipe'` for stdin; agy `-p` reads stdin and blocks even in print mode. Fixed in commit `cf071d2` by `stdio: ['ignore', 'pipe', 'pipe']`.
-3. **CA certs missing in node:22-slim** — auth-login throwaway container needed agent image (which has ca-certificates). Fixed in `scripts/spike/agy/auth-login.sh`.
+3. **CA certs missing in node:22-slim** — auth-login throwaway container needed agent image (which has ca-certificates). Fixed in `scripts/agy/auth-login.sh`.
 4. **Container-mode token storage** — agy detects container env and switches to file-based token storage (`~/.gemini/antigravity-cli/antigravity-oauth-token`). The host's macOS keychain tokens are not portable. Resolution: one-time `agy auth login` inside a throwaway container (script provided). This is a deployment step, not a code defect.
 
 ## Known issues (follow-up)
