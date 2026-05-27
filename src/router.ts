@@ -475,11 +475,11 @@ async function deliverToAgent(
     startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
     const freshSession = getSession(session.id);
     if (freshSession) {
-      const woke = await wakeContainer(freshSession);
-      // wakeContainer never throws — it returns false on transient spawn
-      // failure (host-sweep retries). Stop the typing indicator we just
-      // started so it doesn't leak; the inbound row stays pending.
-      if (!woke) stopTypingRefresh(freshSession.id);
+      // wakeContainer is fire-and-forget; spawn failures surface via
+      // container exit events and are retried by host-sweep. The typing
+      // indicator stays active and is stopped when delivery happens (or
+      // expires on its own).
+      await wakeContainer(freshSession);
     }
   }
 }

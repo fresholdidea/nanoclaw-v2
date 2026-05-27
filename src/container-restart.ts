@@ -40,16 +40,11 @@ export function restartAgentGroupContainers(agentGroupId: string, reason: string
         onWake: 1,
       });
     }
-    killContainer(
-      session.id,
-      reason,
-      wakeMessage
-        ? () => {
-            const s = getSession(session.id);
-            if (s) wakeContainer(s);
-          }
-        : undefined,
-    );
+    killContainer(session.id, reason);
+    if (wakeMessage) {
+      const s = getSession(session.id);
+      if (s) void wakeContainer(s);
+    }
   }
 
   if (sessions.length > 0) {
