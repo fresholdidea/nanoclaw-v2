@@ -110,9 +110,23 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contributions } = resolveProviderContribution(session, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
+  // Merge mounts from all contributions, de-duping by containerPath (last wins).
+  // This means enableAgyTooling + provider:'agy' is functionally identical to
+  // provider-only — the agy contribution is added twice and the Map dedupes.
+  const mergedMountsMap = new Map<string, VolumeMount>();
+  const mergedEnv: Record<string, string> = {};
+  for (const c of contributions) {
+    for (const m of c.mounts ?? []) mergedMountsMap.set(m.containerPath, m);
+    Object.assign(mergedEnv, c.env ?? {});
+  }
+  const mergedContribution: ProviderContainerContribution = {
+    mounts: [...mergedMountsMap.values()],
+    env: mergedEnv,
+  };
+
+  const mounts = buildMounts(agentGroup, session, containerConfig, mergedContribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -123,7 +137,7 @@ async function spawnContainer(session: Session): Promise<void> {
     agentGroup,
     containerConfig,
     provider,
-    contribution,
+    mergedContribution,
     agentIdentifier,
   );
 
@@ -208,17 +222,33 @@ function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
+): { provider: string; contributions: ProviderContainerContribution[] } {
   const provider = (containerConfig.provider || 'claude').toLowerCase();
-  const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        hostEnv: process.env,
-      })
-    : {};
-  return { provider, contribution };
+  const ctx = {
+    sessionDir: sessionDir(agentGroup.id, session.id),
+    agentGroupId: agentGroup.id,
+    hostEnv: process.env,
+  };
+  const contributions: ProviderContainerContribution[] = [];
+
+  const providerFn = getProviderContainerConfig(provider);
+  if (providerFn) contributions.push(providerFn(ctx));
+
+  // enableAgyTooling: layer agy's mounts/env on top so cross-provider groups
+  // can use mcp__nanoclaw__query_agy without flipping their primary provider.
+  // Graceful no-op if agy provider isn't registered (e.g., /add-agy not run).
+  if (containerConfig.enableAgyTooling && provider !== 'agy') {
+    const agyFn = getProviderContainerConfig('agy');
+    if (agyFn) {
+      contributions.push(agyFn(ctx));
+    } else {
+      console.error(
+        `[container-runner] enableAgyTooling=true on group ${agentGroup.id} but agy provider is not registered. Run /add-agy.`,
+      );
+    }
+  }
+
+  return { provider, contributions };
 }
 
 function buildMounts(
