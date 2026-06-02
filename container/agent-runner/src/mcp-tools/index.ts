@@ -11,6 +11,7 @@ import './interactive.js';
 import './agents.js';
 import './self-mod.js';
 import './query-agy.js';
+import './query-opencode.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
