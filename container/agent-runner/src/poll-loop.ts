@@ -4,6 +4,7 @@ import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import { clearTurnDedup, recordTurnSend, wasSentThisTurn } from './turn-dedup.js';
 import {
   formatMessages,
   extractRouting,
@@ -11,6 +12,7 @@ import {
   isClearCommand,
   isRunnerCommand,
   stripInternalTags,
+  sanitizeMessageBody,
   type RoutingContext,
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
@@ -217,6 +219,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
+    clearTurnDedup();
     try {
       const result = await processQuery(query, routing, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
@@ -390,6 +393,7 @@ async function processQuery(
         // dispatch reads currentRouting too (see dispatchResultText below).
         currentRouting = extractRouting(keep);
         setCurrentInReplyTo(currentRouting.inReplyTo);
+        clearTurnDedup();
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         query.push(prompt);
@@ -518,7 +522,7 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[1];
-    const body = match[2].trim();
+    const body = sanitizeMessageBody(match[2]);
     lastIndex = MESSAGE_RE.lastIndex;
 
     const dest = findByName(toName);
@@ -527,7 +531,16 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
+    // Dedup against anything already sent this turn — most commonly the
+    // agent acked via send_message mid-turn and then re-said the same line
+    // at end-of-turn inside a <message to="..."> wrap. See turn-dedup.ts.
+    const destKey = dest.type === 'channel' ? `${dest.channelType}:${dest.platformId}` : `agent:${dest.agentGroupId}`;
+    if (wasSentThisTurn(destKey, body)) {
+      log(`Skipping <message to="${toName}"> — same body already delivered this turn`);
+      continue;
+    }
     sendToDestination(dest, body, routing);
+    recordTurnSend(destKey, body);
     sent++;
   }
   if (lastIndex < text.length) {

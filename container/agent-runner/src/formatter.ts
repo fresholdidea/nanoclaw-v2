@@ -276,3 +276,18 @@ function escapeXml(str: string): string {
 export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
+
+/**
+ * Sanitize the inner text of a `<message to="…">…</message>` block before
+ * it is sent. Defends against the agent leaking its own scratchpad
+ * markers into the delivered text — typically a stray <internal>…</internal>
+ * block, or a nested `<message to="…">` opener that the non-greedy outer
+ * regex didn't see as a separate block.
+ */
+export function sanitizeMessageBody(body: string): string {
+  return body
+    .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+    .replace(/<message\s+to="[^"]*"\s*>/g, '')
+    .replace(/<\/internal>/g, '')
+    .trim();
+}

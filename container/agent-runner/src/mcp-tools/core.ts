@@ -13,6 +13,7 @@ import { getCurrentInReplyTo } from '../current-batch.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
+import { recordTurnSend } from '../turn-dedup.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -125,6 +126,10 @@ export const sendMessage: McpToolDefinition = {
       thread_id: routing.thread_id,
       content: JSON.stringify({ text }),
     });
+
+    // Record so a later end-of-turn <message to="..."> block with the same
+    // text doesn't get re-delivered. See turn-dedup.ts.
+    recordTurnSend(`${routing.channel_type}:${routing.platform_id}`, text);
 
     log(`send_message: #${seq} → ${routing.resolvedName}`);
     return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);

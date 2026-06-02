@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags } from './formatter.js';
+import { formatMessages, stripInternalTags, sanitizeMessageBody } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
 beforeEach(() => {
@@ -192,5 +192,37 @@ describe('stripInternalTags', () => {
     expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
       'The answer is 42',
     );
+  });
+});
+
+describe('sanitizeMessageBody', () => {
+  it('passes through clean text unchanged (modulo trim)', () => {
+    expect(sanitizeMessageBody('Hey Brad! Cache here.')).toBe('Hey Brad! Cache here.');
+  });
+
+  it('strips a complete <internal>...</internal> block inside the body', () => {
+    expect(sanitizeMessageBody('before <internal>secret</internal> after')).toBe('before  after');
+  });
+
+  it('strips a stray nested <message to="..."> opener', () => {
+    expect(
+      sanitizeMessageBody('<message to="telegram-cache">Hey Brad!</message>'.replace(/<\/message>/, '')),
+    ).toBe('Hey Brad!');
+  });
+
+  it('handles the Cache regression: leaked </internal> + nested <message> opener', () => {
+    const leaked =
+      '` block.\n</internal>\n<message to="telegram-cache">Hey Brad! Cache here.';
+    expect(sanitizeMessageBody(leaked)).toBe('` block.\n\n\nHey Brad! Cache here.');
+  });
+
+  it('strips multiple stray nested message openers', () => {
+    expect(
+      sanitizeMessageBody('<message to="a">x<message to="b">y'),
+    ).toBe('xy');
+  });
+
+  it('trims surrounding whitespace', () => {
+    expect(sanitizeMessageBody('\n  hello world  \n')).toBe('hello world');
   });
 });
