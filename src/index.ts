@@ -16,6 +16,7 @@ import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { readEnvFile } from './env.js';
+import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -172,6 +173,13 @@ async function main(): Promise<void> {
     log.info('Dashboard disabled (no DASHBOARD_SECRET)');
   }
 
+  // 8. ncl CLI socket — host-side dispatch for the ncl binary.
+  try {
+    await startCliServer();
+  } catch (err) {
+    log.error('Failed to start ncl CLI server', { err });
+  }
+
   log.info('NanoClaw running');
 }
 
@@ -187,6 +195,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  await stopCliServer();
   await teardownChannelAdapters();
   process.exit(0);
 }

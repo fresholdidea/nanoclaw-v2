@@ -14,6 +14,9 @@ import { log } from '../log.js';
 import { dispatch } from './dispatch.js';
 import type { CallerContext, RequestFrame, ResponseFrame } from './frame.js';
 import { DEFAULT_SOCKET_PATH } from './socket-client.js';
+// Side-effect import: populates the command registry so dispatch() can find
+// `groups list`, `groups create`, etc. Without this the registry is empty.
+import './commands/index.js';
 
 let server: net.Server | null = null;
 
