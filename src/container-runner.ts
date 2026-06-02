@@ -248,6 +248,21 @@ function resolveProviderContribution(
     }
   }
 
+  // enableOpencodeTooling: layer opencode's XDG mount + OPENCODE_* env on top
+  // so cross-provider groups can use mcp__nanoclaw__query_opencode without
+  // flipping their primary provider. Graceful no-op if opencode provider
+  // isn't registered (e.g., /add-opencode not run).
+  if (containerConfig.enableOpencodeTooling && provider !== 'opencode') {
+    const opencodeFn = getProviderContainerConfig('opencode');
+    if (opencodeFn) {
+      contributions.push(opencodeFn(ctx));
+    } else {
+      console.error(
+        `[container-runner] enableOpencodeTooling=true on group ${agentGroup.id} but opencode provider is not registered. Run /add-opencode.`,
+      );
+    }
+  }
+
   return { provider, contributions };
 }
 

@@ -56,6 +56,14 @@ export interface ContainerConfig {
    * Requires the agy provider to be installed (via `/add-agy`).
    */
   enableAgyTooling?: boolean;
+  /**
+   * When true, the host applies the opencode provider's mounts + env to this
+   * group regardless of `provider`. Lets a Claude-backed group expose
+   * `mcp__nanoclaw__query_opencode` without flipping its primary provider.
+   * Requires OPENCODE_PROVIDER / OPENCODE_MODEL to be set in the host env
+   * (typically via /add-opencode + .env).
+   */
+  enableOpencodeTooling?: boolean;
   /** Agent group display name (used in transcript archiving). */
   groupName?: string;
   /** Assistant display name (used in system prompt / responses). */
@@ -103,6 +111,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       skills: raw.skills ?? 'all',
       provider: raw.provider,
       enableAgyTooling: raw.enableAgyTooling === true,
+      enableOpencodeTooling: raw.enableOpencodeTooling === true,
       groupName: raw.groupName,
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,
