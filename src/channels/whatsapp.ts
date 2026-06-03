@@ -1,10 +1,15 @@
 /**
- * WhatsApp channel adapter (v2) — native Baileys v6 implementation.
+ * WhatsApp channel adapter (v2) — native Baileys v7 implementation.
  *
  * Implements ChannelAdapter directly (no Chat SDK bridge) using
- * @whiskeysockets/baileys v6 (stable). Ports proven v1 infrastructure:
- * getMessage fallback, outgoing queue, group metadata cache, LID mapping,
- * reconnection with backoff.
+ * @whiskeysockets/baileys 7.0.0-rc.9 (pinned — last release, unmaintained).
+ * Ports proven v1 infrastructure: getMessage fallback, outgoing queue,
+ * group metadata cache, LID mapping, reconnection with backoff.
+ *
+ * LID handling: Baileys v7 provides participantAlt / remoteJidAlt on every
+ * inbound message via extractAddressingContext, plus a real
+ * signalRepository.lidMapping.getPNForLID API. The adapter always resolves
+ * to phone JID (@s.whatsapp.net) before emitting to the router.
  *
  * Auth credentials persist in store/auth/. On first run:
  * - If WHATSAPP_PHONE_NUMBER is set → pairing code (printed to log)
@@ -22,6 +27,7 @@ import { pino } from 'pino';
 
 import {
   makeWASocket,
+  proto,
   Browsers,
   DisconnectReason,
   fetchLatestWaWebVersion,
@@ -40,28 +46,53 @@ import { registerChannelAdapter } from './channel-registry.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundMessage, OutboundMessage } from './adapter.js';
 
-// Baileys v6 bug: getPlatformId sends charCode (49) instead of enum value (1).
-// Fixed in Baileys 7.x but not backported. Without this, pairing codes fail with
-// "couldn't link device" because WhatsApp receives an invalid platform ID.
-// Must use createRequire — ESM `import *` creates a read-only namespace.
-// proto is not available as a named ESM export — use createRequire (same as v1)
-import { createRequire } from 'module';
-const _require = createRequire(import.meta.url);
-const { proto } = _require('@whiskeysockets/baileys') as { proto: any };
-try {
-  const _generics = _require('@whiskeysockets/baileys/lib/Utils/generics') as Record<string, unknown>;
-  _generics.getPlatformId = (browser: string): string => {
-    const platformType =
-      proto.DeviceProps.PlatformType[browser.toUpperCase() as keyof typeof proto.DeviceProps.PlatformType];
-    return platformType ? platformType.toString() : '1';
-  };
-} catch {
-  // If CJS require fails (Node version mismatch), pairing codes may not work
-  // but QR auth will still function fine.
-  log.warn('Could not patch getPlatformId — pairing code auth may fail');
-}
-
 const baileysLogger = pino({ level: 'silent' });
+
+/**
+ * Fetch the latest WhatsApp Web version. Baileys' built-in
+ * fetchLatestWaWebVersion scrapes sw.js which is aggressively
+ * rate-limited (429). When it fails, Baileys falls back to a
+ * hardcoded version that goes stale within weeks — WhatsApp
+ * rejects connections with an expired buildHash (405 at Noise
+ * layer). This fetches from wppconnect's version tracker as a
+ * more reliable source, with Baileys' own fetch as fallback.
+ */
+async function resolveWaWebVersion(): Promise<[number, number, number]> {
+  // 1. Try wppconnect version tracker (HTML scrape — no JSON API)
+  try {
+    const res = await fetch('https://wppconnect.io/whatsapp-versions/', {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const match = html.match(/2\.3000\.(\d+)/);
+      if (match) {
+        const version: [number, number, number] = [2, 3000, Number(match[1])];
+        log.info('Fetched WA Web version from wppconnect', { version });
+        return version;
+      }
+    }
+  } catch {
+    // Fall through to Baileys' own fetch
+  }
+
+  // 2. Try Baileys' built-in fetch (scrapes sw.js — often 429'd)
+  try {
+    const { version } = await fetchLatestWaWebVersion({});
+    if (version) {
+      log.info('Fetched WA Web version from Baileys', { version });
+      return version as [number, number, number];
+    }
+  } catch {
+    // Fall through
+  }
+
+  throw new Error(
+    'Could not fetch current WhatsApp Web version from any source. ' +
+      'Baileys hardcodes a stale version that WhatsApp rejects (405). ' +
+      'Check network connectivity to wppconnect.io and web.whatsapp.com.',
+  );
+}
 
 const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
@@ -120,10 +151,99 @@ function transformForWhatsApp(text: string): string {
   return text;
 }
 
-/** Convert Claude's markdown to WhatsApp-native formatting. */
-function formatWhatsApp(text: string): string {
+// WhatsApp tags `@<phone-digits>` (5–15 digit local part — covers short test
+// numbers up to ITU E.164 max). A leading `+` is accepted but stripped so
+// the literal in text matches the digits in the JID — WhatsApp clients
+// scan the rendered text for `@<digits>` and cross-reference it with the
+// contextInfo.mentionedJid list to draw the bold/clickable tag.
+const MENTION_RE = /(^|[^\w@+])@\+?(\d{5,15})(?!\d)/g;
+
+/** Extract `@<digits>` mentions from text and normalize them. */
+export function parseWhatsAppMentions(text: string): { text: string; mentions: string[] } {
+  const mentions = new Set<string>();
+  const out = text.replace(MENTION_RE, (_full, lead: string, digits: string) => {
+    mentions.add(`${digits}@s.whatsapp.net`);
+    return `${lead}@${digits}`;
+  });
+  return { text: out, mentions: [...mentions] };
+}
+
+/**
+ * Convert Claude's markdown to WhatsApp-native formatting and extract any
+ * `@<phone>` mentions. Code-block regions are passed through untouched so
+ * phone-like sequences inside code aren't tagged.
+ */
+function formatWhatsApp(text: string): { text: string; mentions: string[] } {
   const segments = splitProtectedRegions(text);
-  return segments.map(({ content, isProtected }) => (isProtected ? content : transformForWhatsApp(content))).join('');
+  const mentions = new Set<string>();
+  const out = segments
+    .map(({ content, isProtected }) => {
+      if (isProtected) return content;
+      const transformed = transformForWhatsApp(content);
+      const { text: withMentions, mentions: found } = parseWhatsAppMentions(transformed);
+      for (const m of found) mentions.add(m);
+      return withMentions;
+    })
+    .join('');
+  return { text: out, mentions: [...mentions] };
+}
+
+/**
+ * Subset of a normalized Baileys message content carrying the message
+ * types that can host a `contextInfo.mentionedJid` array. Kept as a
+ * structural type so the helper (and its tests) don't pull in the full
+ * `proto.IMessage` shape just to construct fixtures.
+ */
+type MentionContextSource = {
+  extendedTextMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+  imageMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+  videoMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+  documentMessage?: { contextInfo?: { mentionedJid?: string[] | null } | null } | null;
+};
+
+/**
+ * Detect an explicit @-mention of the bot in a WhatsApp group message.
+ * WhatsApp carries mentions in `contextInfo.mentionedJid` on the text +
+ * caption-bearing message types. Matches against both the bot's phone
+ * JID and LID — most modern clients emit the LID even when the human
+ * typed a phone-number mention.
+ *
+ * Exported for unit testing. The inbound construction site calls this
+ * to set `InboundMessage.isMention` for group messages (#2560). DMs are
+ * unconditionally mentions and don't go through this helper.
+ */
+export function isBotMentionedInGroup(
+  normalized: MentionContextSource,
+  botPhoneJid: string | undefined,
+  botLidUser: string | undefined,
+): boolean {
+  if (!botPhoneJid && !botLidUser) return false;
+  const mentionedJids: string[] = [
+    ...(normalized.extendedTextMessage?.contextInfo?.mentionedJid ?? []),
+    ...(normalized.imageMessage?.contextInfo?.mentionedJid ?? []),
+    ...(normalized.videoMessage?.contextInfo?.mentionedJid ?? []),
+    ...(normalized.documentMessage?.contextInfo?.mentionedJid ?? []),
+  ];
+  const botLidJid = botLidUser ? `${botLidUser}@lid` : undefined;
+  return mentionedJids.some((jid) => {
+    if (!jid) return false;
+    const bare = jid.split(':')[0];
+    return bare === botPhoneJid || bare === botLidJid;
+  });
+}
+
+/**
+ * Compute `InboundMessage.isMention` for a WhatsApp message:
+ *   - DMs are always mentions (router auto-engages on the bot's behalf).
+ *   - Group messages are mentions only when the bot is explicitly tagged.
+ *
+ * Returns `true | undefined` rather than `true | false` because the
+ * `InboundMessage` field is `isMention?: boolean` and downstream code
+ * treats `undefined` differently than an explicit `false` (#2560).
+ */
+export function computeIsMention(isGroup: boolean, botMentionedInGroup: boolean): true | undefined {
+  if (!isGroup) return true;
+  return botMentionedInGroup ? true : undefined;
 }
 
 /** Map file extension to Baileys media message type. */
@@ -161,14 +281,16 @@ registerChannelAdapter('whatsapp', {
     // State
     let sock: WASocket;
     let connected = false;
+    let shuttingDown = false;
     let setupConfig: ChannelSetup;
 
     // LID → phone JID mapping (WhatsApp's new ID system)
     const lidToPhoneMap: Record<string, string> = {};
     let botLidUser: string | undefined;
+    let botPhoneJid: string | undefined;
 
     // Outgoing queue for messages sent while disconnected
-    const outgoingQueue: Array<{ jid: string; text: string }> = [];
+    const outgoingQueue: Array<{ jid: string; text: string; mentions?: string[] }> = [];
     let flushing = false;
 
     // Sent message cache for retry/re-encrypt requests
@@ -207,21 +329,30 @@ registerChannelAdapter('whatsapp', {
       groupMetadataCache.clear();
     }
 
-    async function translateJid(jid: string): Promise<string> {
+    async function translateJid(jid: string, altJid?: string): Promise<string> {
       if (!jid.endsWith('@lid')) return jid;
       const lidUser = jid.split('@')[0].split(':')[0];
 
+      // 1. Check local cache
       const cached = lidToPhoneMap[lidUser];
       if (cached) return cached;
 
-      // Query Baileys' signal repository
+      // 2. Use the alt JID from extractAddressingContext (v7 provides this
+      //    on every inbound message as remoteJidAlt / participantAlt)
+      if (altJid && !altJid.endsWith('@lid')) {
+        const phoneJid = altJid.includes('@') ? altJid : `${altJid}@s.whatsapp.net`;
+        setLidPhoneMapping(lidUser, phoneJid);
+        log.info('Translated LID via alt JID', { lidJid: jid, phoneJid });
+        return phoneJid;
+      }
+
+      // 3. Query Baileys v7 LID mapping store
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const pn = await (sock.signalRepository as any)?.lidMapping?.getPNForLID(jid);
+        const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
         if (pn) {
           const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
           setLidPhoneMapping(lidUser, phoneJid);
-          log.info('Translated LID to phone JID', { lidJid: jid, phoneJid });
+          log.info('Translated LID via signal repository', { lidJid: jid, phoneJid });
           return phoneJid;
         }
       } catch (err) {
@@ -280,7 +411,9 @@ registerChannelAdapter('whatsapp', {
         log.info('Flushing outgoing message queue', { count: outgoingQueue.length });
         while (outgoingQueue.length > 0) {
           const item = outgoingQueue.shift()!;
-          const sent = await sock.sendMessage(item.jid, { text: item.text });
+          const payload: { text: string; mentions?: string[] } = { text: item.text };
+          if (item.mentions && item.mentions.length > 0) payload.mentions = item.mentions;
+          const sent = await sock.sendMessage(item.jid, payload);
           if (sent?.key?.id && sent.message) {
             sentMessageCache.set(sent.key.id, sent.message);
           }
@@ -332,14 +465,16 @@ registerChannelAdapter('whatsapp', {
       return results;
     }
 
-    async function sendRawMessage(jid: string, text: string): Promise<string | undefined> {
+    async function sendRawMessage(jid: string, text: string, mentions?: string[]): Promise<string | undefined> {
       if (!connected) {
-        outgoingQueue.push({ jid, text });
+        outgoingQueue.push({ jid, text, mentions });
         log.info('WA disconnected, message queued', { jid, queueSize: outgoingQueue.length });
         return;
       }
       try {
-        const sent = await sock.sendMessage(jid, { text });
+        const payload: { text: string; mentions?: string[] } = { text };
+        if (mentions && mentions.length > 0) payload.mentions = mentions;
+        const sent = await sock.sendMessage(jid, payload);
         if (sent?.key?.id && sent.message) {
           sentMessageCache.set(sent.key.id, sent.message);
           if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
@@ -349,7 +484,7 @@ registerChannelAdapter('whatsapp', {
         }
         return sent?.key?.id ?? undefined;
       } catch (err) {
-        outgoingQueue.push({ jid, text });
+        outgoingQueue.push({ jid, text, mentions });
         log.warn('Failed to send, message queued', { jid, err, queueSize: outgoingQueue.length });
         return undefined;
       }
@@ -360,10 +495,7 @@ registerChannelAdapter('whatsapp', {
     async function connectSocket(): Promise<void> {
       const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-      const { version } = await fetchLatestWaWebVersion({}).catch((err) => {
-        log.warn('Failed to fetch latest WA Web version, using default', { err });
-        return { version: undefined };
-      });
+      const version = await resolveWaWebVersion();
 
       sock = makeWASocket({
         version,
@@ -380,7 +512,7 @@ registerChannelAdapter('whatsapp', {
           const cached = sentMessageCache.get(key.id || '');
           if (cached) return cached;
           // Return empty message to prevent indefinite "waiting for this message"
-          return proto.Message.fromObject({});
+          return proto.Message.create({});
         },
       });
 
@@ -417,9 +549,13 @@ registerChannelAdapter('whatsapp', {
         if (connection === 'close') {
           connected = false;
           const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
-          const shouldReconnect = reason !== DisconnectReason.loggedOut;
+          // Don't auto-reconnect during shutdown — a parallel connectSocket()
+          // initializes useMultiFileAuthState which can truncate creds.json
+          // mid-write when the process exits, leaving a 0-byte creds file
+          // and forcing a fresh QR pairing on next start.
+          const shouldReconnect = !shuttingDown && reason !== DisconnectReason.loggedOut;
 
-          log.info('WhatsApp connection closed', { reason, shouldReconnect });
+          log.info('WhatsApp connection closed', { reason, shouldReconnect, shuttingDown });
 
           if (shouldReconnect) {
             log.info('Reconnecting...');
@@ -433,6 +569,17 @@ registerChannelAdapter('whatsapp', {
             });
           } else {
             log.info('WhatsApp logged out');
+            // Delete auth credentials immediately. Keeping stale credentials
+            // causes the next service restart to attempt authentication with an
+            // invalidated session, producing a second 401 that can trigger
+            // WhatsApp's re-link cooldown ("can't link new devices now").
+            try {
+              fs.rmSync(authDir, { recursive: true, force: true });
+              fs.mkdirSync(authDir, { recursive: true });
+              log.info('WhatsApp auth cleared — set WHATSAPP_ENABLED=true and restart to re-link');
+            } catch (err) {
+              log.error('Failed to clear WhatsApp auth after logout', { err });
+            }
             if (rejectFirstOpen) {
               rejectFirstOpen(new Error('WhatsApp logged out'));
               rejectFirstOpen = undefined;
@@ -459,8 +606,9 @@ registerChannelAdapter('whatsapp', {
           if (sock.user) {
             const phoneUser = sock.user.id.split(':')[0];
             const lidUser = sock.user.lid?.split(':')[0];
+            botPhoneJid = `${phoneUser}@s.whatsapp.net`;
             if (lidUser && phoneUser) {
-              setLidPhoneMapping(lidUser, `${phoneUser}@s.whatsapp.net`);
+              setLidPhoneMapping(lidUser, botPhoneJid);
               botLidUser = lidUser;
             }
           }
@@ -488,10 +636,13 @@ registerChannelAdapter('whatsapp', {
 
       sock.ev.on('creds.update', saveCreds);
 
-      // Phone number sharing events — update LID mapping
-      sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+      // LID ↔ phone mapping updates (v7 replaces chats.phoneNumberShare)
+      sock.ev.on('lid-mapping.update', ({ lid, pn }) => {
         const lidUser = lid?.split('@')[0].split(':')[0];
-        if (lidUser && jid) setLidPhoneMapping(lidUser, jid);
+        if (lidUser && pn) {
+          const phoneJid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
+          setLidPhoneMapping(lidUser, phoneJid);
+        }
       });
 
       // Inbound messages
@@ -504,16 +655,8 @@ registerChannelAdapter('whatsapp', {
             const rawJid = msg.key.remoteJid;
             if (!rawJid || rawJid === 'status@broadcast') continue;
 
-            // Translate LID → phone JID
-            let chatJid = await translateJid(rawJid);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            if (chatJid.endsWith('@lid') && (msg.key as any).senderPn) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const pn = (msg.key as any).senderPn as string;
-              const phoneJid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
-              setLidPhoneMapping(rawJid.split('@')[0].split(':')[0], phoneJid);
-              chatJid = phoneJid;
-            }
+            // Translate LID → phone JID using v7's alt JID from extractAddressingContext
+            const chatJid = await translateJid(rawJid, msg.key.remoteJidAlt);
 
             const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
             const isGroup = chatJid.endsWith('@g.us');
@@ -539,20 +682,26 @@ registerChannelAdapter('whatsapp', {
             // Skip empty protocol messages (no text and no attachments)
             if (!content && attachments.length === 0) continue;
 
-            const sender = msg.key.participant || msg.key.remoteJid || '';
+            // Resolve sender: in groups, participant may be LID — use participantAlt
+            const rawSender = msg.key.participant || msg.key.remoteJid || '';
+            const sender = rawSender.endsWith('@lid')
+              ? await translateJid(rawSender, msg.key.participantAlt)
+              : rawSender;
             const senderName = msg.pushName || sender.split('@')[0];
             const fromMe = msg.key.fromMe || false;
+            // Filter bot's own messages to prevent echo loops.
+            // In self-chat (user messaging their own number), all messages have
+            // fromMe=true — use sentMessageCache to distinguish bot echoes from
+            // user-typed messages. For all other chats, the blanket fromMe
+            // filter is correct since the user's phone messages shouldn't wake
+            // the agent in third-party conversations.
+            if (fromMe) {
+              const isSelfChat = botPhoneJid && chatJid === botPhoneJid;
+              if (!isSelfChat) continue;
+              if (sentMessageCache.has(msg.key.id || '')) continue;
+            }
+
             const isBotMessage = ASSISTANT_HAS_OWN_NUMBER ? false : content.startsWith(`${ASSISTANT_NAME}:`);
-            // Echo filter. Two modes:
-            //  - ASSISTANT_HAS_OWN_NUMBER=true: bot has its own number; every
-            //    fromMe is the bot's own outbound coming back via sync. Skip.
-            //  - ASSISTANT_HAS_OWN_NUMBER=false (paired-device): the bot IS
-            //    the user's account on a companion device. fromMe is true for
-            //    everything the user sends from any device on this account, so
-            //    a blanket skip would drop the user's own messages. Distinguish
-            //    bot replies by the "<ASSISTANT_NAME>: " prefix the deliver path
-            //    adds (see formatOutbound below).
-            if (ASSISTANT_HAS_OWN_NUMBER ? fromMe : isBotMessage) continue;
 
             // Check if this reply answers a pending question via slash command
             const pending = pendingQuestions.get(chatJid);
@@ -573,9 +722,22 @@ registerChannelAdapter('whatsapp', {
               }
             }
 
+            // Detect explicit @-mentions of the bot in groups. Detail in
+            // isBotMentionedInGroup(); short version is contextInfo.mentionedJid
+            // on text + caption-bearing messages, matched against the bot's
+            // phone JID and LID (#2560).
+            const botMentionedInGroup = isGroup && isBotMentionedInGroup(normalized, botPhoneJid, botLidUser);
+
             const inbound: InboundMessage = {
               id: msg.key.id || `wa-${Date.now()}`,
               kind: 'chat',
+              // DMs are addressed to the bot by definition. Mark them as
+              // platform-confirmed mentions so the router auto-creates an
+              // approval-required messaging_group when the chat is unknown,
+              // instead of silently dropping. In groups, only an explicit
+              // @-mention counts.
+              isMention: computeIsMention(isGroup, botMentionedInGroup),
+              isGroup,
               content: {
                 text: content,
                 sender,
@@ -679,8 +841,15 @@ registerChannelAdapter('whatsapp', {
           for (const file of message.files!) {
             try {
               const ext = path.extname(file.filename).toLowerCase();
-              const caption = !captionUsed ? text : undefined;
+              let caption: string | undefined;
+              let captionMentions: string[] | undefined;
+              if (!captionUsed && text) {
+                const formatted = formatWhatsApp(text);
+                caption = formatted.text;
+                captionMentions = formatted.mentions.length > 0 ? formatted.mentions : undefined;
+              }
               const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
+              if (captionMentions) mediaMsg.mentions = captionMentions;
               const sent = await sock.sendMessage(platformId, mediaMsg);
               if (sent?.key?.id && sent.message) {
                 sentMessageCache.set(sent.key.id, sent.message);
@@ -694,9 +863,9 @@ registerChannelAdapter('whatsapp', {
         }
 
         if (text) {
-          const formatted = formatWhatsApp(text);
+          const { text: formatted, mentions } = formatWhatsApp(text);
           const prefixed = ASSISTANT_HAS_OWN_NUMBER ? formatted : `${ASSISTANT_NAME}: ${formatted}`;
-          return sendRawMessage(platformId, prefixed);
+          return sendRawMessage(platformId, prefixed, mentions);
         }
       },
 
@@ -709,6 +878,7 @@ registerChannelAdapter('whatsapp', {
       },
 
       async teardown() {
+        shuttingDown = true;
         connected = false;
         sock?.end(undefined);
         log.info('WhatsApp adapter shut down');
