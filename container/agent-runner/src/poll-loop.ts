@@ -108,9 +108,39 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   let isFirstPoll = true;
+  let outerCorruptionStreak = 0;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    let messages: MessageInRow[];
+    try {
+      messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+      outerCorruptionStreak = 0;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // Initial-batch parity with the follow-up poll's corruption handler
+      // (see further down in processQuery). Without this, a virtiofs page-
+      // cache torn read on a cold poll bubbles straight to main()'s catch
+      // and the container exits 1 — host-sweep eventually respawns but the
+      // SDK session checkpoint can land mid-turn. Treat the same family of
+      // errors as a transient mount issue, count consecutive hits, and only
+      // exit once the streak says the mount is genuinely poisoned.
+      if (isCorruptionError(errMsg)) {
+        outerCorruptionStreak += 1;
+        log(`Initial poll: corruption error #${outerCorruptionStreak} (${errMsg})`);
+        if (outerCorruptionStreak >= CORRUPTION_STREAK_EXIT) {
+          log(
+            `Initial poll: ${outerCorruptionStreak} consecutive corruption errors — ` +
+              `inbound.db page cache is poisoned. Exiting so host respawns with a fresh mount.`,
+          );
+          // Defer exit one tick so the log line flushes through Docker's log driver.
+          setTimeout(() => process.exit(75), 100);
+          return;
+        }
+        await sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+      throw err;
+    }
     isFirstPoll = false;
     pollCount++;
 
