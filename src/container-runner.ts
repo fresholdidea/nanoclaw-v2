@@ -9,7 +9,7 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
+import { CONTAINER_IMAGE, CONTAINER_INSTALL_LABEL, DATA_DIR, GROUPS_DIR, ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { readEnvFile } from './env.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
@@ -492,6 +492,12 @@ async function buildContainerArgs(
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName];
+
+  // Install label — used by cleanupOrphans() on host startup to reap any
+  // containers from a prior host process that outlived their parent. Without
+  // this stamp the orphan-ps filter returns zero matches and zombies survive
+  // restarts forever, racing the live container on the same session DBs.
+  args.push('--label', CONTAINER_INSTALL_LABEL);
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).

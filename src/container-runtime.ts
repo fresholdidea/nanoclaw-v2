@@ -60,31 +60,62 @@ export function ensureContainerRuntimeRunning(): void {
 /**
  * Kill orphaned NanoClaw containers from THIS install's previous runs.
  *
- * Scoped by label `nanoclaw-install=<slug>` so a crash-looping peer install
- * cannot reap our containers, and we cannot reap theirs. The label is
- * stamped onto every container at spawn time — see container-runner.ts.
+ * Two passes:
+ *   1. Containers labelled `nanoclaw-install=<our-slug>` — definitely ours.
+ *   2. Containers named `nanoclaw-v2-*` with NO `nanoclaw-install` label —
+ *      pre-fix zombies from before the label-stamping code shipped. A peer
+ *      install's containers carry a DIFFERENT slug, not an absent label, so
+ *      this pass cannot misfire across installs. Remove this pass once it has
+ *      been in the tree long enough that no unlabelled zombies remain on
+ *      anyone's machine.
+ *
+ * Stamp side: container-runner.ts adds `--label CONTAINER_INSTALL_LABEL` on
+ * every spawn — pass 1 is the steady-state path.
  */
 export function cleanupOrphans(): void {
-  try {
-    const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
-      {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        encoding: 'utf-8',
-      },
-    );
-    const orphans = output.trim().split('\n').filter(Boolean);
-    for (const name of orphans) {
-      try {
-        stopContainer(name);
-      } catch {
-        /* already stopped */
-      }
+  const reap = (name: string): void => {
+    try {
+      stopContainer(name);
+    } catch {
+      /* already stopped */
     }
-    if (orphans.length > 0) {
-      log.info('Stopped orphaned containers', { count: orphans.length, names: orphans });
+  };
+
+  try {
+    const labelled = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    )
+      .trim()
+      .split('\n')
+      .filter(Boolean);
+    for (const name of labelled) reap(name);
+    if (labelled.length > 0) {
+      log.info('Stopped orphaned containers (label match)', { count: labelled.length, names: labelled });
     }
   } catch (err) {
-    log.warn('Failed to clean up orphaned containers', { err });
+    log.warn('Failed to clean up labelled orphan containers', { err });
+  }
+
+  try {
+    const unlabelled = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter name=^nanoclaw-v2- --format '{{.Names}}\t{{.Label "nanoclaw-install"}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    )
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => line.split('\t'))
+      .filter(([, label]) => !label) // only unlabelled ones
+      .map(([name]) => name);
+    for (const name of unlabelled) reap(name);
+    if (unlabelled.length > 0) {
+      log.info('Stopped orphaned containers (pre-label-fix migration)', {
+        count: unlabelled.length,
+        names: unlabelled,
+      });
+    }
+  } catch (err) {
+    log.warn('Failed to clean up unlabelled pre-fix orphan containers', { err });
   }
 }

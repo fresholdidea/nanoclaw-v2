@@ -85,74 +85,96 @@ describe('ensureContainerRuntimeRunning', () => {
 // --- cleanupOrphans ---
 
 describe('cleanupOrphans', () => {
-  it('filters ps by the install label so peers are not reaped', () => {
-    mockExecSync.mockReturnValueOnce('');
+  it('filters labelled pass by install label so peers are not reaped', () => {
+    mockExecSync.mockReturnValue('');
 
     cleanupOrphans();
 
-    expect(mockExecSync).toHaveBeenCalledWith(
+    expect(mockExecSync).toHaveBeenNthCalledWith(
+      1,
       `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
       expect.any(Object),
     );
   });
 
-  it('stops orphaned nanoclaw containers', () => {
-    // docker ps returns container names, one per line
-    mockExecSync.mockReturnValueOnce('nanoclaw-group1-111\nnanoclaw-group2-222\n');
-    // stop calls succeed
-    mockExecSync.mockReturnValue('');
+  it('stops labelled orphan containers', () => {
+    mockExecSync.mockReturnValueOnce('nanoclaw-group1-111\nnanoclaw-group2-222\n'); // labelled pass
+    mockExecSync.mockReturnValueOnce(''); // stop group1
+    mockExecSync.mockReturnValueOnce(''); // stop group2
+    mockExecSync.mockReturnValueOnce(''); // unlabelled pass — no rows
 
     cleanupOrphans();
 
-    // ps + 2 stop calls
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
     expect(mockExecSync).toHaveBeenNthCalledWith(2, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group1-111`, {
       stdio: 'pipe',
     });
     expect(mockExecSync).toHaveBeenNthCalledWith(3, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group2-222`, {
       stdio: 'pipe',
     });
-    expect(log.info).toHaveBeenCalledWith('Stopped orphaned containers', {
+    expect(log.info).toHaveBeenCalledWith('Stopped orphaned containers (label match)', {
       count: 2,
       names: ['nanoclaw-group1-111', 'nanoclaw-group2-222'],
     });
   });
 
-  it('does nothing when no orphans exist', () => {
-    mockExecSync.mockReturnValueOnce('');
+  it('reaps unlabelled pre-fix zombies but leaves peer-install labels alone', () => {
+    mockExecSync.mockReturnValueOnce(''); // labelled pass — no rows
+    // unlabelled pass: 2 rows, one unlabelled (ours, pre-fix), one labelled with a peer slug
+    mockExecSync.mockReturnValueOnce(
+      'nanoclaw-v2-zombie-111\t\nnanoclaw-v2-peer-222\tnanoclaw-install=other-install\n',
+    );
+    mockExecSync.mockReturnValueOnce(''); // stop zombie
 
     cleanupOrphans();
 
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(mockExecSync).toHaveBeenNthCalledWith(3, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-v2-zombie-111`, {
+      stdio: 'pipe',
+    });
+    expect(log.info).toHaveBeenCalledWith('Stopped orphaned containers (pre-label-fix migration)', {
+      count: 1,
+      names: ['nanoclaw-v2-zombie-111'],
+    });
+  });
+
+  it('does nothing when no orphans exist', () => {
+    mockExecSync.mockReturnValue('');
+
+    cleanupOrphans();
+
+    // labelled ps + unlabelled ps, no stops
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
     expect(log.info).not.toHaveBeenCalled();
   });
 
-  it('warns and continues when ps fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
+  it('warns and continues each pass when ps fails', () => {
+    mockExecSync.mockImplementation(() => {
       throw new Error('docker not available');
     });
 
     cleanupOrphans(); // should not throw
 
     expect(log.warn).toHaveBeenCalledWith(
-      'Failed to clean up orphaned containers',
+      'Failed to clean up labelled orphan containers',
+      expect.objectContaining({ err: expect.any(Error) }),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      'Failed to clean up unlabelled pre-fix orphan containers',
       expect.objectContaining({ err: expect.any(Error) }),
     );
   });
 
   it('continues stopping remaining containers when one stop fails', () => {
-    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\nnanoclaw-b-2\n');
-    // First stop fails
+    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\nnanoclaw-b-2\n'); // labelled pass
     mockExecSync.mockImplementationOnce(() => {
       throw new Error('already stopped');
-    });
-    // Second stop succeeds
-    mockExecSync.mockReturnValueOnce('');
+    }); // stop a
+    mockExecSync.mockReturnValueOnce(''); // stop b
+    mockExecSync.mockReturnValueOnce(''); // unlabelled pass — no rows
 
     cleanupOrphans(); // should not throw
 
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
-    expect(log.info).toHaveBeenCalledWith('Stopped orphaned containers', {
+    expect(log.info).toHaveBeenCalledWith('Stopped orphaned containers (label match)', {
       count: 2,
       names: ['nanoclaw-a-1', 'nanoclaw-b-2'],
     });
