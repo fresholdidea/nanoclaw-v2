@@ -11,6 +11,10 @@
 
 set -e
 
+# Register mnemon hooks for Claude Code. Idempotent — safe on every start.
+# Output routed to stderr so it doesn't pollute the stdin JSON handshake.
+mnemon setup --target claude-code --yes --global >/dev/stderr 2>&1 || true
+
 cat > /tmp/input.json
 
 exec bun run /app/src/index.ts < /tmp/input.json
