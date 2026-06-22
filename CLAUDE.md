@@ -181,6 +181,10 @@ onecli secrets list                                    # all vault secrets (with
 
 If you've just enabled `mode all`, no container restart is needed — the gateway looks up secrets per request, so the next API call from the running container will see the new credentials.
 
+### Gotcha: broad `Authorization`-injecting secrets clobber app-managed OAuth
+
+The inverse of the selective-mode 401. For an agent in `mode all`, **every** matching vault secret is injected — so a secret that injects `Authorization` on a broad shared host (e.g. `*.googleapis.com`) **overwrites the OAuth bearer of any tool that manages its own auth** (gws, gcloud, the gmail/gcal MCP tools), yielding a 401 even with a valid token. Scope `Authorization`-injecting secrets to their exact service host (Gemini → `generativelanguage.googleapis.com`, not `*.googleapis.com`) via `onecli secrets update --id <id> --host-pattern <host>`; secrets that inject a *custom* header (e.g. `X-GWS-Refresh`) don't conflict. The gws-specific symptom + diagnosis lives in the `google-workspace` container skill's Errors section.
+
 ### Requiring approval for credential use
 
 Approval-gating credentialed actions is a **two-sided** flow:
@@ -262,6 +266,7 @@ Check these first when something goes wrong:
 | Host logs | `logs/nanoclaw.error.log` first (delivery failures, crash-loop backoff, warnings), then `logs/nanoclaw.log` for the full routing chain |
 | Setup logs | `logs/setup.log` (overall), `logs/setup-steps/*.log` (per-step: bootstrap, environment, container, onecli, mounts, service, etc.) |
 | Session DBs | `data/v2-sessions/<agent-group>/<session>/` — `inbound.db` (`messages_in`: did the message reach the container?), `outbound.db` (`messages_out`: did the agent produce a response?) |
+| Host won't start / exits immediately | The container runtime must be running. If `docker info` (or Apple Container) fails, the host aborts at startup with `FATAL: Container runtime failed to start`. Start the runtime, then restart the service. |
 
 Note: container logs are lost after the container exits (`--rm` flag). If the agent silently failed inside the container, there's no persistent log to inspect.
 
@@ -308,6 +313,7 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 - **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy.
 - **Changing the Dockerfile entrypoint or the dynamic-spawn command** (`src/container-runner.ts` line ~301) → keep `exec bun ...` so signals forward cleanly. The image has no `/app/dist`; don't reintroduce a tsc build step.
 - **Changing session-DB pragmas** (`container/agent-runner/src/db/connection.ts`) → `journal_mode=DELETE` is load-bearing for cross-mount visibility. Read the comment block at the top of the file first.
+- **Debugging a container CLI tool via `docker exec <c> bash -lc '…'`** → a login shell does **not** inherit the agent-runner's PATH. pnpm globals (`gws`, `vercel`, etc.) live on `/pnpm/bin:/pnpm`, which is on the agent's runtime PATH but absent from a fresh login shell — a tool can read `not found` under `docker exec` yet resolve fine for the agent. Confirm the real PATH with `tr '\0' '\n' < /proc/1/environ | grep ^PATH=`.
 
 ## CJK font support
 
