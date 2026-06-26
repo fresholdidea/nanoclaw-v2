@@ -22,13 +22,7 @@ ARG INSTALL_CJK_FONTS=false
 ARG CLAUDE_CODE_VERSION=2.1.154
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=52.2.1
-ARG OPENCODE_VERSION=1.4.17
 ARG BUN_VERSION=1.3.12
-# audit-website skill stack — pin exact versions, must be ≥3 days old per
-# pnpm-workspace.yaml minimumReleaseAge: 4320.
-ARG LIGHTHOUSE_VERSION=13.3.0
-ARG AXE_CLI_VERSION=4.11.3
-ARG LINKINATOR_VERSION=7.6.1
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -55,6 +49,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         git \
+        python3 \
         tini \
         unzip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
@@ -80,6 +75,15 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/mnemon
 
 ENV MNEMON_DATA_DIR=/workspace/extra/mnemon
+
+# ---- deepline CLI ------------------------------------------------------------
+# Download the Python binary directly — the full install script runs `npx
+# skills add` at the end to install Claude Code host skills, which hangs in
+# Docker build context. Write the shim manually instead.
+RUN curl -fsSL "https://code.deepline.com/api/v2/cli/python" -o /usr/local/bin/deepline-real && \
+    chmod +x /usr/local/bin/deepline-real && \
+    printf '#!/usr/bin/env sh\nexport DEEPLINE_API_BASE_URL="https://code.deepline.com"\nexport DEEPLINE_CONFIG_SCOPE="code-deepline-com"\nexport DEEPLINE_REAL_BINARY="/usr/local/bin/deepline-real"\nexport DEEPLINE_INSTALL_METHOD="shiv"\nexec "$DEEPLINE_REAL_BINARY" "$@"\n' > /usr/local/bin/deepline && \
+    chmod +x /usr/local/bin/deepline
 
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
@@ -127,20 +131,6 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
-
-RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
-
-# ---- audit-website skill stack -----------------------------------------------
-# Lighthouse, axe-core CLI, and linkinator power the audit-website skill
-# (.claude/skills/audit-website/). Lighthouse drives Chromium directly, so it
-# reuses the system Chromium installed above. All three are pinned and bump
-# deliberately — replace by editing the ARG block at the top of this file.
-RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g \
-        "lighthouse@${LIGHTHOUSE_VERSION}" \
-        "@axe-core/cli@${AXE_CLI_VERSION}" \
-        "linkinator@${LINKINATOR_VERSION}"
 
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.

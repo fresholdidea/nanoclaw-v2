@@ -250,10 +250,10 @@ mkdir -p data/env && cp .env data/env/env
 # Authenticate (choose one):
 
 # QR code — scan with WhatsApp camera:
-pnpm exec tsx src/whatsapp-auth.ts
+pnpm exec tsx setup/index.ts --step whatsapp-auth
 
 # OR pairing code — enter code in WhatsApp > Linked Devices > Link with phone number:
-pnpm exec tsx src/whatsapp-auth.ts --pairing-code --phone <phone-number-no-plus>
+pnpm exec tsx setup/index.ts --step whatsapp-auth --pairing-code --phone <phone-number-no-plus>
 
 # Register your chat (JID = your phone number + @s.whatsapp.net)
 pnpm exec tsx setup/index.ts --step register \
@@ -267,7 +267,7 @@ pnpm exec tsx setup/index.ts --step register \
   --no-trigger-required
 ```
 
-**Important:** The WhatsApp skill files (`src/channels/whatsapp.ts` and `src/whatsapp-auth.ts`) also need proxy patches — add `HttpsProxyAgent` for WebSocket connections and a proxy-aware version fetch. Then rebuild.
+**Important:** The WhatsApp skill files (`src/channels/whatsapp.ts` and `setup/whatsapp-auth.ts`) also need proxy patches — add `HttpsProxyAgent` for WebSocket connections and a proxy-aware version fetch. Then rebuild.
 
 ### Both Channels
 
@@ -355,5 +355,5 @@ Run the auth command interactively inside the sandbox (not piped through `docker
 ```bash
 docker sandbox run shell-nanoclaw-workspace
 # Then inside:
-pnpm exec tsx src/whatsapp-auth.ts
+pnpm exec tsx setup/index.ts --step whatsapp-auth
 ```

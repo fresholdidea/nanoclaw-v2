@@ -260,12 +260,12 @@ nanoclaw/
 │   ├── router.ts                  # Message formatting and outbound routing
 │   ├── config.ts                  # Configuration constants
 │   ├── types.ts                   # TypeScript interfaces (includes Channel)
-│   ├── logger.ts                  # Pino logger setup
-│   ├── db.ts                      # SQLite database initialization and queries
-│   ├── group-queue.ts             # Per-group queue with global concurrency limit
-│   ├── mount-security.ts          # Mount allowlist validation for containers
-│   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
-│   ├── task-scheduler.ts          # Runs scheduled tasks when due
+│   ├── log.ts                     # Pino logger setup
+│   ├── db/                        # SQLite database initialization and queries
+│   ├── session-manager.ts         # Session and group queues
+│   ├── modules/
+│   │   ├── mount-security/        # Mount allowlist validation for containers
+│   │   └── scheduling/            # Runs scheduled tasks when due
 │   └── container-runner.ts        # Spawns agents in containers
 │
 ├── container/

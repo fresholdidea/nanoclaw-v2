@@ -495,7 +495,7 @@ async function buildContainerArgs(
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-  provider: string,
+  _provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {

@@ -46,3 +46,4 @@ agents-sdk-docs
 nanoclaw-v2/
 falcone-spawn.mjs
 .upgrade-worktree/
+.retired/

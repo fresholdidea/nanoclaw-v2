@@ -17,6 +17,7 @@ import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { readEnvFile } from './env.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
+import { stopWebhookServer } from './webhook-server.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -196,6 +197,7 @@ async function shutdown(signal: string): Promise<void> {
   stopDeliveryPolls();
   stopHostSweep();
   await stopCliServer();
+  await stopWebhookServer();
   await teardownChannelAdapters();
   process.exit(0);
 }

@@ -76,6 +76,7 @@ function postJson(config: PusherConfig, urlPath: string, data: unknown): void {
   req.end();
 }
 
+/* eslint-disable-next-line no-control-regex */
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
 function startLogTail(config: PusherConfig): void {
