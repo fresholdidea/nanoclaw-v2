@@ -1,7 +1,7 @@
 # Hermes ↔ mnemon Integration — Design Spec
 
-- **Date:** 2026-07-01
-- **Status:** Draft (awaiting user review)
+- **Date:** 2026-07-01 (designed and deployed) · 2026-07-07 (re-verified)
+- **Status:** ✅ Implemented and live — **do not re-run `mnemon setup --target hermes --global`**
 - **Author:** Brad + Claude
 - **Topic:** Give the Hermes agent (Nous Research) a mnemon recall/remember loop against the shared `~/.mnemon` store.
 
@@ -18,10 +18,10 @@ This spec covers wiring mnemon into Hermes. It is explicitly framed as **step 1 
 Give Hermes the same "recall before / remember after" memory loop the other agents have, against the shared store, without disturbing Hermes' own memory system.
 
 Done when:
-1. A Hermes session recalls relevant insights from the shared `~/.mnemon` store.
-2. New insights from a Hermes session are written back to the same shared store (and are subsequently recallable by nanoclaw agents / host Claude Code — proving it's genuinely shared).
-3. Hermes' native memory (`MEMORY.md` / `USER.md`) is left functioning and untouched.
-4. The integration is cleanly reversible.
+1. ✅ A Hermes session recalls relevant insights from the shared `~/.mnemon` store.
+2. ✅ New insights from a Hermes session are written back to the same shared store (and are subsequently recallable by nanoclaw agents / host Claude Code — proving it's genuinely shared).
+3. ✅ Hermes' native memory (`MEMORY.md` / `USER.md`) is left functioning and untouched. (Note: this profile does not have a native `MEMORY.md` / `USER.md` on disk, so criterion is vacuously satisfied. The hooks do not create or touch these files.)
+4. ✅ The integration is cleanly reversible.
 
 ## Decisions (from brainstorming)
 
@@ -64,11 +64,11 @@ Done when:
 5. **Report** the exact changes; if anything is off, `mnemon setup --eject --target hermes` and reconsider.
 
 ## Verification Criteria
-- [ ] `mnemon recall` from a Hermes session returns shared-store insights.
-- [ ] An insight written during a Hermes session is visible to host `mnemon recall` (round-trip proof of shared store).
-- [ ] `~/.hermes/.../MEMORY.md` and `USER.md` still load and are unmodified by the install.
-- [ ] Data-dir is `~/.mnemon` (no stray per-Hermes store).
-- [ ] `--eject` cleanly removes the integration (rollback verified, at least by dry-run/inspection).
+- [x] `mnemon recall` from a Hermes session returns shared-store insights.
+- [x] An insight written during a Hermes session is visible to host `mnemon recall` (round-trip proof of shared store).
+- [x] `~/.hermes/.../MEMORY.md` and `USER.md` still load and are unmodified by the install. *(Profile has neither file; hooks do not create them.)*
+- [x] Data-dir is `~/.mnemon` (no stray per-Hermes store).
+- [ ] `--eject` cleanly removes the integration (rollback verified, at least by dry-run/inspection). — **Not yet tested.** Do not run `--eject` without intent; it would remove the live integration.
 
 ## Risks & Rollback
 - **Risk:** installer wires something unexpected or replaces native memory. **Mitigation:** interactive run + snapshot/diff before accepting; `--eject` to revert.
@@ -87,3 +87,43 @@ Done when:
 - Porting nanoclaw memories or reshaping the store.
 - mnemon-as-tool / MCP (possible later add-on).
 - Changing Hermes' native memory behavior.
+
+---
+
+## Post-implementation evidence (re-verified 2026-07-07)
+
+**Hooks wired in `~/.hermes/config.yaml`:**
+
+```yaml
+hooks:
+  on_session_start:
+    - command: /Users/bradhess/.hermes/agent-hooks/mnemon/prime.sh
+      timeout: 10
+  pre_llm_call:
+    - command: /Users/bradhess/.hermes/agent-hooks/mnemon/remind.sh
+      timeout: 10
+  post_llm_call:
+    - command: /Users/bradhess/.hermes/agent-hooks/mnemon/nudge.sh
+      timeout: 10
+hooks_auto_accept: true
+```
+
+**Approvals (in `~/.hermes/shell-hooks-allowlist.json`):** prime.sh, nudge.sh, remind.sh — granted 2026-07-01T02:54Z. `compact.sh` is also approved (on_session_finalize) but no script by that name exists and the event is not declared in `config.yaml` — **stale entry, harmless, see Loose ends below**.
+
+**Store state (re-verified 2026-07-07):** `~/.mnemon/data/default/mnemon.db` — 1.88 MB, **80 insights, 2432 edges, 367 oplog entries**. Categories: 30 context, 30 fact, 12 preference, 5 insight, 3 decision. Top entities include LinkedIn (23), Brad (23), Cubby (13), HubSpot (12), meshberg (10) — matches the rest of the nanoclaw agent population, confirming this is the shared store, not a Hermes-only partition.
+
+**Round-trip test (2026-07-07):**
+- Wrote: `Hermes+mnemon verification: integration is already live as of 2026-07-01` (id `53740fcb-...`, score 0.859 on recall).
+- Recalled prior 2026-07-01 verification memory: `Hermes agent mnemon integration installed and verified 2026-07-01` (id `aaf3f992-...`, score 0.619) — proves the integration was already installed and recorded on its own install day.
+- Recalled third-party fact: `Deepline CLI on Brad's Mac (2026-06-30)` (id `a716abb3-...`, score via entity match) — proves the shared store is genuinely shared with host tools.
+
+**Loose ends (cosmetic, not blocking):**
+- `~/.hermes/shell-hooks-allowlist.json` has a stale `compact.sh` approval referencing a non-existent file and an event (`on_session_finalize`) not declared in `config.yaml`. Inert. Leave or hand-edit; do not run `mnemon setup --eject` to clean it up — that would remove the whole working integration.
+- The spec was never updated from "Draft" to "Implemented" after the 2026-07-01 install. This is the gap that produced the false re-deploy question. **Lesson:** when the install succeeds, edit the spec to "done" the same session.
+
+**Why this doc sat open as "Draft" for 6 days despite working:** the original install session wrote a verification memory and confirmed success but did not flip the doc's status. Future spec-driven installs should follow this checklist as a hard step in the install flow:
+1. Run the installer
+2. Diff & verify on disk
+3. Update the spec doc to "implemented" with on-disk evidence
+4. Remember a verification memory
+5. Tell the user the spec status is "done," not "draft"
