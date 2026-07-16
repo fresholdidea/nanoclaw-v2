@@ -10,6 +10,8 @@ import { promisify } from 'util';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
+import { readEnvFile } from './env.js';
+
 import {
   CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
@@ -141,9 +143,9 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contributions } = resolveProviderContribution(session, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution);
+  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contributions);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -154,7 +156,7 @@ async function spawnContainer(session: Session): Promise<void> {
     agentGroup,
     containerConfig,
     provider,
-    contribution,
+    contributions,
     agentIdentifier,
   );
 
@@ -249,19 +251,35 @@ function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
-  const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
-  const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
-        selectedSkills: selectedSkillNames(containerConfig),
-        hostEnv: process.env,
-      })
-    : {};
-  return { provider, contribution };
+): { provider: string; contributions: ProviderContainerContribution[] } {
+  const provider = (containerConfig.provider || 'claude').toLowerCase();
+  const ctx = {
+    sessionDir: sessionDir(agentGroup.id, session.id),
+    agentGroupId: agentGroup.id,
+    groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
+    selectedSkills: selectedSkillNames(containerConfig),
+    hostEnv: process.env,
+  };
+  const contributions: ProviderContainerContribution[] = [];
+
+  const baseFn = getProviderContainerConfig(provider);
+  if (baseFn) contributions.push(baseFn(ctx));
+
+  // Layer agy tooling enabler
+  if (containerConfig.enableAgyTooling && provider !== 'agy') {
+    const agyFn = getProviderContainerConfig('agy');
+    if (agyFn) contributions.push(agyFn(ctx));
+    else log.warn('enableAgyTooling=true but agy provider is not registered. Run /add-agy.', { agentGroupId: agentGroup.id });
+  }
+
+  // Layer opencode tooling enabler
+  if (containerConfig.enableOpencodeTooling && provider !== 'opencode') {
+    const opencodeFn = getProviderContainerConfig('opencode');
+    if (opencodeFn) contributions.push(opencodeFn(ctx));
+    else log.warn('enableOpencodeTooling=true but opencode provider is not registered. Run /add-opencode.', { agentGroupId: agentGroup.id });
+  }
+
+  return { provider, contributions };
 }
 
 export function buildMounts(
@@ -269,7 +287,7 @@ export function buildMounts(
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
-  providerContribution: ProviderContainerContribution,
+  providerContributions: ProviderContainerContribution[],
 ): VolumeMount[] {
   const projectRoot = process.cwd();
 
@@ -351,9 +369,13 @@ export function buildMounts(
   }
 
   // Provider-contributed mounts (e.g. opencode-xdg)
-  if (providerContribution.mounts) {
-    mounts.push(...providerContribution.mounts);
+  const mergedMountsMap = new Map<string, VolumeMount>();
+  for (const c of providerContributions) {
+    for (const m of c.mounts ?? []) {
+      mergedMountsMap.set(m.containerPath, m);
+    }
   }
+  mounts.push(...mergedMountsMap.values());
 
   return mounts;
 }
@@ -431,13 +453,34 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
     : [];
 }
 
+function collectMcpEnvPassthrough(
+  containerConfig: import('./container-config.js').ContainerConfig,
+): Record<string, string> {
+  const placeholderRe = /\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g;
+  const wanted = new Set<string>();
+  for (const server of Object.values(containerConfig.mcpServers ?? {})) {
+    if (!('command' in server) || !server.env) continue;
+    for (const value of Object.values(server.env)) {
+      if (typeof value !== 'string') continue;
+      for (const m of value.matchAll(placeholderRe)) wanted.add(m[1] || m[2]);
+    }
+  }
+  if (wanted.size === 0) return {};
+  const values = readEnvFile([...wanted]);
+  const missing = [...wanted].filter((k) => !values[k]);
+  if (missing.length > 0) {
+    log.warn('MCP env passthrough: missing keys in .env', { missing, groupName: containerConfig.groupName });
+  }
+  return values;
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
   _provider: string,
-  providerContribution: ProviderContainerContribution,
+  providerContributions: ProviderContainerContribution[],
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
@@ -454,10 +497,17 @@ async function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
-  if (providerContribution.env) {
-    for (const [key, value] of Object.entries(providerContribution.env)) {
-      args.push('-e', `${key}=${value}`);
-    }
+  const mergedEnv: Record<string, string> = {};
+  for (const c of providerContributions) {
+    Object.assign(mergedEnv, c.env ?? {});
+  }
+  for (const [key, value] of Object.entries(mergedEnv)) {
+    args.push('-e', `${key}=${value}`);
+  }
+
+  // MCP env passthrough
+  for (const [key, value] of Object.entries(collectMcpEnvPassthrough(containerConfig))) {
+    args.push('-e', `${key}=${value}`);
   }
 
   // Egress lockdown when enabled — throws if it can't be established, aborting
@@ -491,18 +541,20 @@ async function buildContainerArgs(
   // any credential stubs the gateway serves (e.g. a sentinel auth file).
   // Runs AFTER the volume mounts so a stub nested inside one of our mounts
   // (a parent dir mounted RW above it) lands later in the args and isn't
-  // shadowed by it. Treated as a transient hard failure: if we can't wire
-  // the gateway, we don't spawn. The caller (router or host-sweep) catches
-  // the throw, leaves the inbound message pending, and the next sweep tick
-  // retries.
-  if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+  // shadowed by it.
+  try {
+    if (agentIdentifier) {
+      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    }
+    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    if (onecliApplied) {
+      log.info('OneCLI gateway applied', { containerName });
+    } else {
+      log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
+    }
+  } catch (err) {
+    log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
   }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-  if (!onecliApplied) {
-    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-  }
-  log.info('OneCLI gateway applied', { containerName });
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');

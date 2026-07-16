@@ -16,6 +16,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { readEnvFile } from './env.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
@@ -47,7 +48,6 @@ import './modules/index.js';
 
 // CLI command barrel — populates the `ncl` registry before the CLI server
 // accepts connections.
-import './cli/commands/index.js';
 import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
@@ -155,7 +155,24 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7. Start the `ncl` CLI socket server (data/ncl.sock).
+  // 7. Dashboard (optional)
+  const dashboardEnv = readEnvFile(['DASHBOARD_SECRET', 'DASHBOARD_PORT']);
+  const dashboardSecret = process.env.DASHBOARD_SECRET || dashboardEnv.DASHBOARD_SECRET;
+  const dashboardPort = parseInt(process.env.DASHBOARD_PORT || dashboardEnv.DASHBOARD_PORT || '3100', 10);
+  if (dashboardSecret) {
+    try {
+      const { startDashboard } = await import('@nanoco/nanoclaw-dashboard');
+      const { startDashboardPusher } = await import('./dashboard-pusher.js');
+      startDashboard({ port: dashboardPort, secret: dashboardSecret });
+      startDashboardPusher({ port: dashboardPort, secret: dashboardSecret, intervalMs: 60000 });
+    } catch (err) {
+      log.error('Failed to start dashboard', { err });
+    }
+  } else {
+    log.info('Dashboard disabled (no DASHBOARD_SECRET)');
+  }
+
+  // 8. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
   log.info('NanoClaw running');
@@ -170,6 +187,12 @@ async function shutdown(signal: string): Promise<void> {
     } catch (err) {
       log.error('Shutdown callback threw', { err });
     }
+  }
+  try {
+    const { stopDashboardPusher } = await import('./dashboard-pusher.js');
+    stopDashboardPusher();
+  } catch {
+    /* ignore if not started or not installed */
   }
   stopDeliveryPolls();
   stopHostSweep();

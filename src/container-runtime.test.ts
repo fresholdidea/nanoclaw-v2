@@ -91,14 +91,14 @@ describe('cleanupOrphans', () => {
     cleanupOrphans();
 
     expect(mockExecSync).toHaveBeenCalledWith(
-      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+      `${CONTAINER_RUNTIME_BIN} ps --filter "name=^nanoclaw-v2-" --format "{{.Names}}\t{{.Label \"nanoclaw-install\"}}"`,
       expect.any(Object),
     );
   });
 
   it('stops orphaned nanoclaw containers', () => {
-    // docker ps returns container names, one per line
-    mockExecSync.mockReturnValueOnce('nanoclaw-group1-111\nnanoclaw-group2-222\n');
+    // docker ps returns container names and labels, tab-separated, one per line
+    mockExecSync.mockReturnValueOnce(`nanoclaw-group1-111\t${CONTAINER_INSTALL_LABEL}\nnanoclaw-group2-222\t\n`);
     // stop calls succeed
     mockExecSync.mockReturnValue('');
 

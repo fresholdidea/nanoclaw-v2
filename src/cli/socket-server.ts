@@ -14,6 +14,7 @@ import { log } from '../log.js';
 import { dispatch } from './dispatch.js';
 import type { CallerContext, RequestFrame, ResponseFrame } from './frame.js';
 import { DEFAULT_SOCKET_PATH } from './socket-client.js';
+import './commands/index.js';
 
 let server: net.Server | null = null;
 

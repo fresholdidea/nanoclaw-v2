@@ -251,10 +251,15 @@ export async function run(args: string[]): Promise<void> {
       }
       engage = {
         engage_mode: parsed.engageMode,
-        engage_pattern: parsed.engageMode === 'pattern' ? parsed.trigger : null,
+        engage_pattern: parsed.engageMode === 'pattern'
+          ? (parsed.requiresTrigger ? parsed.trigger : `(${parsed.trigger}|.*)`)
+          : null,
       };
     } else if (parsed.trigger) {
-      engage = { engage_mode: 'pattern', engage_pattern: parsed.trigger };
+      engage = {
+        engage_mode: 'pattern',
+        engage_pattern: parsed.requiresTrigger ? parsed.trigger : `(${parsed.trigger}|.*)`,
+      };
     } else if (hasDeclaredChannelDefaults(channelKey, messagingGroup.channel_type)) {
       engage = resolveWiringDefaults(channelKey, isGroup, agentGroup.name, messagingGroup.channel_type);
     } else {

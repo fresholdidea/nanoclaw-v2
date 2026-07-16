@@ -21,6 +21,21 @@ function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
 
+function resolveClaudeBinary(): string {
+  // Bun: /home/node/.bun/bin/claude. npm global: /usr/local/bin/claude.
+  // pnpm: /pnpm/claude. Fallback to /pnpm/claude if none found.
+  const paths = [
+    '/home/node/.bun/bin/claude',
+    '/usr/local/bin/claude',
+    '/pnpm/claude',
+  ];
+  for (const p of paths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return '/pnpm/claude';
+}
+const CLAUDE_BIN = resolveClaudeBinary();
+
 // Deferred SDK builtins that either sidestep nanoclaw's own scheduling or
 // don't fit our async message-passing model (they're designed for Claude
 // Code's interactive UI and would hang here).
@@ -492,7 +507,7 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        pathToClaudeCodeExecutable: CLAUDE_BIN,
         systemPrompt: instructions
           ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions }
           : undefined,

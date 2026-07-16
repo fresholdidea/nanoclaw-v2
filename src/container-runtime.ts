@@ -66,14 +66,20 @@ export function ensureContainerRuntimeRunning(): void {
  */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
-      {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        encoding: 'utf-8',
-      },
-    );
-    const orphans = output.trim().split('\n').filter(Boolean);
+    const list = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter "name=^nanoclaw-v2-" --format "{{.Names}}\t{{.Label \"nanoclaw-install\"}}"`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' }
+    ).trim().split('\n').filter(Boolean);
+
+    const orphans: string[] = [];
+    for (const line of list) {
+      const [name, label] = line.split('\t');
+      // Pass 1: exact label match. Pass 2: pre-label-fix zombies (empty label)
+      if (label === CONTAINER_INSTALL_LABEL || !label) {
+        orphans.push(name);
+      }
+    }
+
     for (const name of orphans) {
       try {
         stopContainer(name);

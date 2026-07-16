@@ -46,3 +46,16 @@ AGENTS.md
 docs/maintainer-guide.md
 docs/drafts/
 forks.md
+
+# Local-only scratch
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+nanoclaw-v2/
+falcone-spawn.mjs
+.upgrade-worktree/
+.retired/
+
+# Migration backups + provider spike artifacts (incl. large binaries) — never committed
+.agents.backup/
+AGENTS.md.backup
+scripts/spike/

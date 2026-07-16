@@ -48,6 +48,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         git \
+        python3 \
         tini \
         unzip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
@@ -61,6 +62,27 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Belt-and-braces: prevent Playwright's postinstall from downloading its own
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# ---- mnemon — persistent agent memory ----------------------------------------
+# Shared store across host CC and all nanoclaw groups. The host mounts
+# ~/.mnemon (RW) at /workspace/extra/mnemon via each group's container.json
+# `additionalMounts`, and MNEMON_DATA_DIR below points the binary at it.
+ARG MNEMON_VERSION=0.1.14
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://github.com/mnemon-dev/mnemon/releases/download/v${MNEMON_VERSION}/mnemon_${MNEMON_VERSION}_linux_${ARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin mnemon && \
+    chmod +x /usr/local/bin/mnemon
+
+ENV MNEMON_DATA_DIR=/workspace/extra/mnemon
+
+# ---- deepline CLI ------------------------------------------------------------
+# Download the Python binary directly — the full install script runs `npx
+# skills add` at the end to install Claude Code host skills, which hangs in
+# Docker build context. Write the shim manually instead.
+RUN curl -fsSL "https://code.deepline.com/api/v2/cli/python" -o /usr/local/bin/deepline-real && \
+    chmod +x /usr/local/bin/deepline-real && \
+    printf '#!/usr/bin/env sh\nexport DEEPLINE_API_BASE_URL="https://code.deepline.com"\nexport DEEPLINE_CONFIG_SCOPE="code-deepline-com"\nexport DEEPLINE_REAL_BINARY="/usr/local/bin/deepline-real"\nexport DEEPLINE_INSTALL_METHOD="shiv"\nexec "$DEEPLINE_REAL_BINARY" "$@"\n' > /usr/local/bin/deepline && \
+    chmod +x /usr/local/bin/deepline
 
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
@@ -89,7 +111,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+ENV PATH="$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 # Pin pnpm to match the host (package.json packageManager). pnpm 11 stopped
 # honoring `only-built-dependencies[]=` in .npmrc for global installs, which
 # silently skips claude-code's native-binary postinstall and agent-browser's

@@ -1,0 +1,96 @@
+#!/bin/bash
+# gws-account: Run gws CLI as a specific Google Workspace account.
+#
+# Usage: gws-account <email> <gws-command> [args...]
+# Example: gws-account jaybhess@gmail.com calendar events list --params '{"maxResults":5}'
+#
+# Reads credentials from the read-only mount at /workspace/extra/gws-config/.
+# Writes a temp credentials file (chmod 600) for the requested account, exec's
+# `gws`, and deletes the temp file when the command exits.
+#
+# Per-account ACL is enforced by which account JSON files are present in the
+# mount — host-side per-agent allowlist controls which accounts are visible.
+
+set -e
+
+GWS_DIR="/workspace/extra/gws-config"
+ACCOUNTS_DIR="$GWS_DIR/accounts"
+CLIENT_FILE="$GWS_DIR/client_secret.json"
+
+usage() {
+  echo "Usage: gws-account <email> <gws-command> [args...]"
+  echo ""
+  echo "Available accounts:"
+  if [ -d "$ACCOUNTS_DIR" ]; then
+    for f in "$ACCOUNTS_DIR"/*.json; do
+      [ -f "$f" ] || continue
+      node -e "try{const d=require('$f');if(d.email)console.log('  '+d.email);}catch(e){}" 2>/dev/null
+    done
+  else
+    echo "  (gws-config not mounted at $GWS_DIR)"
+  fi
+}
+
+if [ -z "$1" ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  usage
+  exit 1
+fi
+
+if [ ! -d "$GWS_DIR" ]; then
+  echo "Error: GWS config not mounted at $GWS_DIR." >&2
+  echo "       Add ~/.config/gws as an additionalMount in this group's container.json." >&2
+  exit 1
+fi
+
+if [ ! -f "$CLIENT_FILE" ]; then
+  echo "Error: $CLIENT_FILE missing." >&2
+  exit 1
+fi
+
+EMAIL="$1"
+shift
+
+# Find the account file whose .email field matches.
+ACCT_FILE=""
+for f in "$ACCOUNTS_DIR"/*.json; do
+  [ -f "$f" ] || continue
+  match=$(node -e "try{const d=require('$f');console.log(d.email||'')}catch(e){}")
+  if [ "$match" = "$EMAIL" ]; then
+    ACCT_FILE="$f"
+    break
+  fi
+done
+
+if [ -z "$ACCT_FILE" ]; then
+  echo "Error: no account file for $EMAIL in $ACCOUNTS_DIR." >&2
+  echo "       Available accounts:" >&2
+  usage >&2
+  exit 1
+fi
+
+CRED_FILE=$(mktemp /tmp/gws-creds-XXXXXX.json)
+chmod 600 "$CRED_FILE"
+trap 'rm -f "$CRED_FILE"' EXIT
+
+node -e "
+  const acct = require('$ACCT_FILE');
+  const client = require('$CLIENT_FILE');
+  const c = client.installed || client.web;
+  if (!c || !c.client_id || !c.client_secret) {
+    console.error('client_secret.json missing client_id/client_secret');
+    process.exit(1);
+  }
+  if (!acct.refresh_token) {
+    console.error('Account file missing refresh_token: $ACCT_FILE');
+    process.exit(1);
+  }
+  require('fs').writeFileSync('$CRED_FILE', JSON.stringify({
+    client_id: c.client_id,
+    client_secret: c.client_secret,
+    refresh_token: acct.refresh_token,
+    type: 'authorized_user',
+  }));
+"
+
+export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="$CRED_FILE"
+exec gws "$@"

@@ -30,6 +30,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { ensureMemoryScaffold } from './memory/scaffold.js';
 import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
+import type { McpServerConfig } from './providers/types.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -41,6 +42,24 @@ function log(msg: string): void {
 }
 
 const CWD = '/workspace/agent';
+
+/**
+ * Expand `${VAR}` / `$VAR` placeholders in a stdio MCP's `env` block against
+ * the container's `process.env`. Used for stdio MCPs that read their API key
+ * directly (e.g. SERPER_API_KEY) — the host forwards the value via `-e` and
+ * we wire it into the SDK-spawned MCP child here.
+ *
+ * HTTP/SSE MCP configs pass through unchanged.
+ */
+function expandMcpEnvPlaceholders(server: McpServerConfig): McpServerConfig {
+  if (!('command' in server) || !server.env) return server;
+  const placeholderRe = /\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g;
+  const expanded: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(server.env)) {
+    expanded[key] = raw.replace(placeholderRe, (_, braced, bare) => process.env[braced || bare] ?? '');
+  }
+  return { ...server, env: expanded };
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -84,7 +103,7 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
   // Build MCP servers config: nanoclaw built-in + any from container.json
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+  const mcpServers: Record<string, McpServerConfig> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
@@ -93,8 +112,9 @@ async function main(): Promise<void> {
   };
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    mcpServers[name] = expandMcpEnvPlaceholders(serverConfig);
+    const label = 'command' in serverConfig ? serverConfig.command : `${serverConfig.type} ${serverConfig.url}`;
+    log(`Additional MCP server: ${name} (${label})`);
   }
 
   const provider = createProvider(providerName, {

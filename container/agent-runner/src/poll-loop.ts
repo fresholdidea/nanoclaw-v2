@@ -26,6 +26,7 @@ import {
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import { clearTurnDedup, wasSentThisTurn, recordTurnSend } from './turn-dedup.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -348,6 +349,7 @@ export async function processQuery(
   initialPrompt: string,
   initialContinuation: string | undefined,
 ): Promise<QueryResult> {
+  clearTurnDedup();
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
@@ -436,6 +438,7 @@ export async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        clearTurnDedup();
         unwrappedNudged = false;
         taskBlockNudged = false;
         query.push(prompt);
@@ -678,7 +681,16 @@ export function dispatchResultText(
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
     }
+    // Dedup against anything already sent this turn — most commonly the
+    // agent acked via send_message mid-turn and then re-said the same line
+    // at end-of-turn inside a <message to="..."> wrap. See turn-dedup.ts.
+    const destKey = dest.type === 'channel' ? `${dest.channelType}:${dest.platformId}` : `agent:${dest.agentGroupId}`;
+    if (wasSentThisTurn(destKey, body)) {
+      log(`Skipping <message to="${toName}"> — same body already delivered this turn`);
+      continue;
+    }
     sendToDestination(dest, body, routing);
+    recordTurnSend(destKey, body);
     sent++;
   }
   if (lastIndex < text.length) {

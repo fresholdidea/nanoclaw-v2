@@ -256,7 +256,7 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope.',
+        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --enable-agy-tooling, --enable-opencode-tooling.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -266,7 +266,15 @@ registerResource({
         const updates: Partial<
           Pick<
             ContainerConfigRow,
-            'provider' | 'model' | 'effort' | 'image_tag' | 'assistant_name' | 'max_messages_per_prompt' | 'cli_scope'
+            | 'provider'
+            | 'model'
+            | 'effort'
+            | 'image_tag'
+            | 'assistant_name'
+            | 'max_messages_per_prompt'
+            | 'cli_scope'
+            | 'enable_agy_tooling'
+            | 'enable_opencode_tooling'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
@@ -283,10 +291,18 @@ registerResource({
           }
           updates.cli_scope = scope;
         }
+        if (args.enable_agy_tooling !== undefined || args['enable-agy-tooling'] !== undefined) {
+          const raw = args.enable_agy_tooling ?? args['enable-agy-tooling'];
+          updates.enable_agy_tooling = raw === 'true' || raw === true || raw === 1 || raw === '1' ? 1 : 0;
+        }
+        if (args.enable_opencode_tooling !== undefined || args['enable-opencode-tooling'] !== undefined) {
+          const raw = args.enable_opencode_tooling ?? args['enable-opencode-tooling'];
+          updates.enable_opencode_tooling = raw === 'true' || raw === true || raw === 1 || raw === '1' ? 1 : 0;
+        }
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --enable-agy-tooling, --enable-opencode-tooling',
           );
         }
 

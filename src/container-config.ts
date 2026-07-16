@@ -16,11 +16,21 @@ import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
-export interface McpServerConfig {
+export type McpServerConfig = (McpStdioConfig | McpHttpConfig) & {
+  instructions?: string;
+};
+
+export interface McpStdioConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  instructions?: string;
+  type?: 'stdio';
+}
+
+export interface McpHttpConfig {
+  type: 'http' | 'sse';
+  url: string;
+  headers?: Record<string, string>;
 }
 
 export interface AdditionalMountConfig {
@@ -37,6 +47,8 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
+  enableAgyTooling?: boolean;
+  enableOpencodeTooling?: boolean;
   groupName?: string;
   assistantName?: string;
   agentGroupId?: string;
@@ -57,6 +69,8 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
     skills: JSON.parse(row.skills) as string[] | 'all',
     provider: row.provider ?? undefined,
+    enableAgyTooling: row.enable_agy_tooling === 1,
+    enableOpencodeTooling: row.enable_opencode_tooling === 1,
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,
