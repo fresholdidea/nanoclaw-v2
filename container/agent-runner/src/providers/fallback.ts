@@ -20,6 +20,8 @@ export class FallbackProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
   private children = new Map<string, AgentProvider>();
   private memoryHook: MemorySessionHookRegistration | null = null;
+  private recent: Array<{ prompt: string; result: string }> = [];
+  private static RECAP_MAX = 3;
 
   constructor(private chain: string[], private deps: FallbackDeps) {
     if (chain.length < 2) throw new Error('FallbackProvider requires at least 2 providers');
@@ -46,10 +48,23 @@ export class FallbackProvider implements AgentProvider {
     return false;
   }
 
-  onExchangeComplete(_exchange: ProviderExchange): void {
-    // Forward to the child that produced the exchange is not knowable here;
-    // recap capture (Task 6) records exchanges. Child archiving happens inside
-    // the child query path via its own hook, so nothing to do by default.
+  onExchangeComplete(exchange: ProviderExchange): void {
+    if (exchange.result && exchange.result.trim()) {
+      this.recent.push({ prompt: exchange.prompt, result: exchange.result });
+      if (this.recent.length > FallbackProvider.RECAP_MAX) this.recent.shift();
+    }
+  }
+
+  private buildRecap(currentPrompt: string): string | null {
+    if (this.recent.length === 0) return null;
+    const lines = this.recent
+      .map((x) => `  User: ${x.prompt.slice(0, 400)}\n  Assistant: ${x.result.slice(0, 400)}`)
+      .join('\n');
+    return (
+      `<system>You're continuing an ongoing conversation that was being handled by another ` +
+      `assistant. Recent context:\n${lines}\n  User: ${currentPrompt.slice(0, 400)}\n` +
+      `Continue naturally. Full history is in conversations/ and shared memory if you need it.</system>`
+    );
   }
 
   query(input: QueryInput): AgentQuery {
@@ -67,6 +82,15 @@ export class FallbackProvider implements AgentProvider {
         if (aborted) return;
         const name = self.chain[i];
         const childInput: QueryInput = { ...input, continuation: work.children[name] };
+        if (i > startIndex) {
+          const recap = self.buildRecap(input.prompt);
+          if (recap) {
+            childInput.systemContext = {
+              ...input.systemContext,
+              instructions: `${recap}\n${input.systemContext?.instructions ?? ''}`.trim(),
+            };
+          }
+        }
         const q = self.child(name).query(childInput);
         currentChild = q;
         let committed = false;
@@ -103,6 +127,10 @@ export class FallbackProvider implements AgentProvider {
             yield { type: 'init', continuation: encodeState(work) };
           } else {
             if (e.type === 'result' && e.isError !== true) committed = true;
+            if (e.type === 'result' && e.isError !== true && e.text) {
+              self.recent.push({ prompt: input.prompt, result: e.text });
+              if (self.recent.length > FallbackProvider.RECAP_MAX) self.recent.shift();
+            }
             yield e;
           }
         }

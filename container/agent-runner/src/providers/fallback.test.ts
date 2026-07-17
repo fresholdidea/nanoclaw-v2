@@ -107,3 +107,34 @@ test('all links fail: last child error is surfaced', async () => {
   const error = events.find((e) => e.type === 'error');
   expect(error && 'message' in error ? error.message : null).toBe('codex down');
 });
+
+test('switch injects a recap into the fallback child systemContext', async () => {
+  let codexSawInstructions = '';
+  const claude = scriptedChild('claude', () => [
+    { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' },
+  ]);
+  const codex: AgentProvider = {
+    supportsNativeSlashCommands: false,
+    registerMemorySessionHook() {},
+    isSessionInvalid() { return false; },
+    query(input: QueryInput): AgentQuery {
+      codexSawInstructions = input.systemContext?.instructions ?? '';
+      return {
+        push() {}, end() {}, abort() {},
+        events: (async function* () {
+          yield { type: 'init', continuation: 'codex-x' } as ProviderEvent;
+          yield { type: 'result', text: 'ok', isError: false } as ProviderEvent;
+        })(),
+      };
+    },
+  };
+  const deps = makeDeps({ claude, codex });
+  const provider = new FallbackProvider(['claude', 'codex'], deps);
+  // Seed a prior exchange so the buffer is non-empty.
+  provider.onExchangeComplete({ prompt: 'earlier question', result: 'earlier answer', status: 'completed' });
+
+  await collect(provider.query({ prompt: 'current question', cwd: '/tmp' }));
+  expect(codexSawInstructions).toContain('continuing an ongoing conversation');
+  expect(codexSawInstructions).toContain('earlier question');
+  expect(codexSawInstructions).toContain('current question');
+});
