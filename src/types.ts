@@ -25,6 +25,7 @@ export interface ContainerConfigRow {
   packages_npm: string; // JSON: string[]
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
+  provider_chain: string | null; // JSON: string[] | null — ordered fallback list; null = instance default
   updated_at: string;
 }
 
