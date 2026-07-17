@@ -34,7 +34,8 @@ import type { McpServerConfig } from './providers/types.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
-import { createProvider, type ProviderName } from './providers/factory.js';
+import { type ProviderName } from './providers/factory.js';
+import { buildProvider } from './providers/build-provider.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -117,14 +118,15 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${label})`);
   }
 
-  const provider = createProvider(providerName, {
+  const providerOptions = {
     assistantName: config.assistantName || undefined,
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     model: config.model,
     effort: config.effort,
-  });
+  };
+  const provider = buildProvider(config, providerOptions);
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
 
   await runPollLoop({

@@ -20,6 +20,8 @@ export interface RunnerConfig {
   mcpServers: Record<string, McpServerConfig>;
   model?: string;
   effort?: string;
+  providerChain?: string[];
+  providerChainCooldownMinutes?: number;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -49,6 +51,8 @@ export function loadConfig(): RunnerConfig {
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
+    providerChain: Array.isArray(raw.providerChain) ? (raw.providerChain as string[]) : undefined,
+    providerChainCooldownMinutes: (raw.providerChainCooldownMinutes as number) || undefined,
   };
 
   return _config;
