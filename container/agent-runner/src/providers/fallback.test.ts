@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test';
 import { FallbackProvider, type FallbackDeps } from './fallback.js';
+import { encodeState, decodeState } from './fallback-state.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput } from './types.js';
 
 /** A scripted child provider: each query yields the given event sequence. */
@@ -48,4 +49,61 @@ test('primary quota error advances to next child; result comes from fallback', a
   expect(events.some((e) => e.type === 'error')).toBe(false);
   const result = events.find((e) => e.type === 'result');
   expect(result && 'text' in result ? result.text : null).toBe('answer from codex');
+});
+
+test('sticky: within cooldown, starts on the fallback link, not primary', async () => {
+  let claudeCalled = false;
+  const claude = scriptedChild('claude', () => { claudeCalled = true; return [
+    { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' },
+  ]; });
+  const codex = scriptedChild('codex', () => [
+    { type: 'init', continuation: 'codex-thread-2' },
+    { type: 'result', text: 'sticky codex', isError: false },
+  ]);
+  const now = 2_000_000;
+  const deps = { createChild: (n: string) => ({ claude, codex }[n]!), now: () => now, cooldownMs: 30 * 60 * 1000 };
+  const provider = new FallbackProvider(['claude', 'codex'], deps);
+
+  // Prior state: active codex, cooldown still in the future.
+  const token = encodeState({ v: 1, active: 'codex', children: { codex: 'codex-thread-2' },
+    cooldownUntil: new Date(now + 60_000).toISOString() });
+
+  const events = await collect(provider.query({ prompt: 'again', cwd: '/tmp', continuation: token }));
+  expect(claudeCalled).toBe(false); // primary NOT probed while in cooldown
+  const result = events.find((e) => e.type === 'result');
+  expect(result && 'text' in result ? result.text : null).toBe('sticky codex');
+});
+
+test('cooldown expired: re-probes primary; success clears cooldown', async () => {
+  const claude = scriptedChild('claude', () => [
+    { type: 'init', continuation: 'claude-sess-9' },
+    { type: 'result', text: 'claude recovered', isError: false },
+  ]);
+  const codex = scriptedChild('codex', () => [{ type: 'result', text: 'should not run', isError: false }]);
+  const now = 3_000_000;
+  const deps = { createChild: (n: string) => ({ claude, codex }[n]!), now: () => now, cooldownMs: 30 * 60 * 1000 };
+  const provider = new FallbackProvider(['claude', 'codex'], deps);
+
+  const token = encodeState({ v: 1, active: 'codex', children: { codex: 'codex-thread-2' },
+    cooldownUntil: new Date(now - 1000).toISOString() }); // expired
+
+  const events = await collect(provider.query({ prompt: 'back?', cwd: '/tmp', continuation: token }));
+  const init = events.find((e) => e.type === 'init');
+  expect(init && 'continuation' in init ? decodeState(init.continuation) : null).toMatchObject({
+    active: 'claude', cooldownUntil: null,
+  });
+  const result = events.find((e) => e.type === 'result');
+  expect(result && 'text' in result ? result.text : null).toBe('claude recovered');
+});
+
+test('all links fail: last child error is surfaced', async () => {
+  const err = (name: string): ProviderEvent => ({ type: 'error', message: `${name} down`, retryable: false, classification: 'quota' });
+  const claude = scriptedChild('claude', () => [err('claude')]);
+  const codex = scriptedChild('codex', () => [err('codex')]);
+  const deps = makeDeps({ claude, codex });
+  const provider = new FallbackProvider(['claude', 'codex'], deps);
+
+  const events = await collect(provider.query({ prompt: 'x', cwd: '/tmp' }));
+  const error = events.find((e) => e.type === 'error');
+  expect(error && 'message' in error ? error.message : null).toBe('codex down');
 });
