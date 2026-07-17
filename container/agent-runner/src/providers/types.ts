@@ -139,6 +139,15 @@ export type ProviderEvent =
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**
+   * A harness-generated file to deliver to the turn's channel. Providers whose
+   * underlying harness produces files the model itself never sends (e.g. Codex
+   * saves built-in image generations into CODEX_HOME/generated_images/ and its
+   * native client renders them, so the model believes delivery already
+   * happened) yield this so the poll-loop delivers the file. `path` is an
+   * absolute path inside the container.
+   */
+  | { type: 'file'; path: string }
+  /**
    * Liveness signal. Providers MUST yield this on every underlying SDK
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.

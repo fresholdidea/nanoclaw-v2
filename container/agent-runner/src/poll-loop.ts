@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
@@ -496,6 +499,10 @@ export async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'file') {
+        // A harness-generated file (e.g. a Codex built-in image generation the
+        // model itself never send_files). Deliver it to the turn's channel.
+        deliverGeneratedFile(event.path, routing);
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -626,6 +633,40 @@ function deliverErrorResult(text: string, routing: RoutingContext): void {
     thread_id: routing.threadId,
     content: JSON.stringify({ text }),
   });
+}
+
+/**
+ * Deliver a harness-generated file to the turn's channel. Mirrors the
+ * `send_file` MCP tool (copy into the outbox, reference by filename), but
+ * targets the routing context directly rather than a named destination —
+ * the model never addressed this file, the harness produced it. Skipped when
+ * the batch has no attached chat (e.g. a task run with no channel) or the
+ * file has vanished.
+ */
+function deliverGeneratedFile(filePath: string, routing: RoutingContext): void {
+  if (!routing.channelType || !routing.platformId) {
+    log(`Generated file ${filePath} — no attached destination, not delivering`);
+    return;
+  }
+  if (!fs.existsSync(filePath)) {
+    log(`Generated file ${filePath} missing — not delivering`);
+    return;
+  }
+  const id = generateId();
+  const filename = path.basename(filePath);
+  const outboxDir = path.join('/workspace/outbox', id);
+  fs.mkdirSync(outboxDir, { recursive: true });
+  fs.copyFileSync(filePath, path.join(outboxDir, filename));
+  writeMessageOut({
+    id,
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text: '', files: [filename] }),
+  });
+  log(`Delivered generated file ${filename} → ${routing.channelType}:${routing.platformId} (id: ${id})`);
 }
 
 /**
