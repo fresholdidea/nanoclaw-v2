@@ -143,6 +143,51 @@ test('recap dedup: same exchange arriving via both onExchangeComplete and in-tur
   expect(occurrences).toBe(1);
 });
 
+test('unregistered middle link is skipped; result comes from next registered link', async () => {
+  const claude = scriptedChild('claude', () => [
+    { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' },
+  ]);
+  const opencode = scriptedChild('opencode', () => [
+    { type: 'init', continuation: 'opencode-thread-1' },
+    { type: 'result', text: 'answer from opencode', isError: false },
+  ]);
+  // codex createChild throws (not registered on this install)
+  const deps: FallbackDeps = {
+    createChild: (n) => {
+      if (n === 'codex') throw new Error('Unknown provider: codex');
+      return ({ claude, opencode } as Record<string, AgentProvider>)[n]!;
+    },
+    now: () => 1_000_000,
+    cooldownMs: 30 * 60 * 1000,
+  };
+  const provider = new FallbackProvider(['claude', 'codex', 'opencode'], deps);
+
+  const events = await collect(provider.query({ prompt: 'hi', cwd: '/tmp' }));
+  expect(events.some((e) => e.type === 'error')).toBe(false);
+  const result = events.find((e) => e.type === 'result');
+  expect(result && 'text' in result ? result.text : null).toBe('answer from opencode');
+});
+
+test('unregistered last link + prior real failure: surfaces prior failure, does not throw', async () => {
+  const claude = scriptedChild('claude', () => [
+    { type: 'error', message: 'quota exceeded', retryable: false, classification: 'quota' },
+  ]);
+  // opencode createChild throws (not registered)
+  const deps: FallbackDeps = {
+    createChild: (n) => {
+      if (n === 'opencode') throw new Error('Unknown provider: opencode');
+      return ({ claude } as Record<string, AgentProvider>)[n]!;
+    },
+    now: () => 1_000_000,
+    cooldownMs: 30 * 60 * 1000,
+  };
+  const provider = new FallbackProvider(['claude', 'opencode'], deps);
+
+  const events = await collect(provider.query({ prompt: 'hi', cwd: '/tmp' }));
+  const error = events.find((e) => e.type === 'error');
+  expect(error && 'message' in error ? error.message : null).toBe('quota exceeded');
+});
+
 test('switch injects a recap into the fallback child systemContext', async () => {
   let codexSawInstructions = '';
   const claude = scriptedChild('claude', () => [

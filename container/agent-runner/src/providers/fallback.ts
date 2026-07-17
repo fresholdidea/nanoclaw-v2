@@ -83,6 +83,7 @@ export class FallbackProvider implements AgentProvider {
     async function* run(): AsyncGenerator<ProviderEvent> {
       // Working copy of state (or fresh from primary).
       const work: FallbackState = state ?? { v: 1, active: self.chain[0], children: {}, cooldownUntil: null };
+      let lastFailure: ProviderEvent | null = null;
       for (let i = startIndex; i < self.chain.length; i++) {
         if (aborted) return;
         const name = self.chain[i];
@@ -96,7 +97,13 @@ export class FallbackProvider implements AgentProvider {
             };
           }
         }
-        const q = self.child(name).query(childInput);
+        let q: AgentQuery;
+        try {
+          q = self.child(name).query(childInput);
+        } catch (err) {
+          log(`skipping unavailable provider ${name}: ${err instanceof Error ? err.message : String(err)}`);
+          continue;
+        }
         currentChild = q;
         let committed = false;
         let failed = false;
@@ -106,7 +113,7 @@ export class FallbackProvider implements AgentProvider {
           if (!committed) {
             const cls = classifyFailure(e);
             if (cls) {
-              // Advance: record cooldown, log, do NOT emit this failure.
+              // Advance: record cooldown, log, defer emitting the failure.
               failed = true;
               const from = name;
               const to = self.chain[i + 1];
@@ -115,10 +122,9 @@ export class FallbackProvider implements AgentProvider {
                 work.active = to;
                 work.cooldownUntil = new Date(self.deps.now() + self.deps.cooldownMs).toISOString();
               } else {
-                // Last link failed — surface the failure downstream unchanged.
                 log(`${from} failed (classification=${cls}); no further links — surfacing error`);
-                yield e;
               }
+              lastFailure = e;
               break;
             }
           }
@@ -139,6 +145,13 @@ export class FallbackProvider implements AgentProvider {
           }
         }
         if (!failed) return; // committed to this child; turn complete
+      }
+      // All links exhausted (either failed or skipped as unregistered).
+      // Surface the last real failure, or a synthetic error if every link was skipped.
+      if (lastFailure) {
+        yield lastFailure;
+      } else {
+        yield { type: 'error', message: 'All fallback providers are unavailable', retryable: false };
       }
     }
 
