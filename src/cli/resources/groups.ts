@@ -9,6 +9,7 @@ import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
   getContainerConfig,
+  updateContainerConfig,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
@@ -256,12 +257,19 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --enable-agy-tooling, --enable-opencode-tooling.',
+        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --enable-agy-tooling, --enable-opencode-tooling, --provider-chain <p1,p2,...>, --no-fallback.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const hasProviderChain = args['provider-chain'] !== undefined || args.provider_chain !== undefined;
+        const hasNoFallback = args['no-fallback'] !== undefined || args.no_fallback !== undefined;
+
+        if (hasProviderChain && hasNoFallback) {
+          throw new Error('--provider-chain and --no-fallback are mutually exclusive — use one or the other');
+        }
 
         const updates: Partial<
           Pick<
@@ -300,13 +308,27 @@ registerResource({
           updates.enable_opencode_tooling = raw === 'true' || raw === true || raw === 1 || raw === '1' ? 1 : 0;
         }
 
-        if (Object.keys(updates).length === 0) {
+        if (Object.keys(updates).length === 0 && !hasProviderChain && !hasNoFallback) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --enable-agy-tooling, --enable-opencode-tooling',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --enable-agy-tooling, --enable-opencode-tooling, --provider-chain, --no-fallback',
           );
         }
 
-        updateContainerConfigScalars(id, updates);
+        if (Object.keys(updates).length > 0) {
+          updateContainerConfigScalars(id, updates);
+        }
+
+        if (hasProviderChain) {
+          const raw = (args['provider-chain'] ?? args.provider_chain) as string;
+          const chain = raw
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+          updateContainerConfig(id, { providerChain: chain });
+        } else if (hasNoFallback) {
+          const primary = (updates.provider ?? row.provider ?? 'claude') as string;
+          updateContainerConfig(id, { providerChain: [primary] });
+        }
 
         const updated = getContainerConfig(id)!;
         return presentConfig(updated);
