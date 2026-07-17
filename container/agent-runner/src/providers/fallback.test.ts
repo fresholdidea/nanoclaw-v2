@@ -108,6 +108,41 @@ test('all links fail: last child error is surfaced', async () => {
   expect(error && 'message' in error ? error.message : null).toBe('codex down');
 });
 
+test('recap dedup: same exchange arriving via both onExchangeComplete and in-turn result path is injected only once', async () => {
+  let codexSawInstructions = '';
+  const claude = scriptedChild('claude', () => [
+    { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' },
+  ]);
+  const codex: AgentProvider = {
+    supportsNativeSlashCommands: false,
+    registerMemorySessionHook() {},
+    isSessionInvalid() { return false; },
+    query(input: QueryInput): AgentQuery {
+      codexSawInstructions = input.systemContext?.instructions ?? '';
+      return {
+        push() {}, end() {}, abort() {},
+        events: (async function* () {
+          yield { type: 'init', continuation: 'codex-dedup' } as ProviderEvent;
+          yield { type: 'result', text: 'ok', isError: false } as ProviderEvent;
+        })(),
+      };
+    },
+  };
+  const deps = makeDeps({ claude, codex });
+  const provider = new FallbackProvider(['claude', 'codex'], deps);
+
+  // Simulate the poll loop calling onExchangeComplete for a prior exchange.
+  provider.onExchangeComplete({ prompt: 'dup-prompt', result: 'dup-answer', status: 'completed' });
+  // Simulate the same exchange arriving again (as if the in-turn path already pushed it).
+  provider.onExchangeComplete({ prompt: 'dup-prompt', result: 'dup-answer', status: 'completed' });
+
+  await collect(provider.query({ prompt: 'new question', cwd: '/tmp' }));
+
+  // 'dup-prompt' must appear exactly once in the injected instructions.
+  const occurrences = (codexSawInstructions.match(/dup-prompt/g) ?? []).length;
+  expect(occurrences).toBe(1);
+});
+
 test('switch injects a recap into the fallback child systemContext', async () => {
   let codexSawInstructions = '';
   const claude = scriptedChild('claude', () => [

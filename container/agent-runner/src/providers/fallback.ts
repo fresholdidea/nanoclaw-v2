@@ -48,11 +48,16 @@ export class FallbackProvider implements AgentProvider {
     return false;
   }
 
+  private pushRecent(prompt: string, result: string): void {
+    if (!result.trim()) return;
+    const last = this.recent[this.recent.length - 1];
+    if (last && last.prompt === prompt && last.result === result) return; // dedup consecutive duplicate
+    this.recent.push({ prompt, result });
+    if (this.recent.length > FallbackProvider.RECAP_MAX) this.recent.shift();
+  }
+
   onExchangeComplete(exchange: ProviderExchange): void {
-    if (exchange.result && exchange.result.trim()) {
-      this.recent.push({ prompt: exchange.prompt, result: exchange.result });
-      if (this.recent.length > FallbackProvider.RECAP_MAX) this.recent.shift();
-    }
+    this.pushRecent(exchange.prompt, exchange.result ?? '');
   }
 
   private buildRecap(currentPrompt: string): string | null {
@@ -128,8 +133,7 @@ export class FallbackProvider implements AgentProvider {
           } else {
             if (e.type === 'result' && e.isError !== true) committed = true;
             if (e.type === 'result' && e.isError !== true && e.text) {
-              self.recent.push({ prompt: input.prompt, result: e.text });
-              if (self.recent.length > FallbackProvider.RECAP_MAX) self.recent.shift();
+              self.pushRecent(input.prompt, e.text);
             }
             yield e;
           }
