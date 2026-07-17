@@ -19,7 +19,9 @@ const JSON_COLUMNS = new Set([
   'packages_apt',
   'packages_npm',
   'additional_mounts',
-  'provider_chain',
+  // provider_chain is intentionally excluded: the dedicated updateContainerConfig fn
+  // handles it with proper null-vs-"null" semantics, and getContainerConfig returns it
+  // as a raw JSON string (or SQL NULL) for resolveProviderChain to parse itself.
 ]);
 
 export function getContainerConfig(agentGroupId: string): ContainerConfigRow | undefined {
