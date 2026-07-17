@@ -13,7 +13,14 @@ const SCALAR_COLUMNS = new Set([
   'enable_agy_tooling',
   'enable_opencode_tooling',
 ]);
-const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
+const JSON_COLUMNS = new Set([
+  'skills',
+  'mcp_servers',
+  'packages_apt',
+  'packages_npm',
+  'additional_mounts',
+  'provider_chain',
+]);
 
 export function getContainerConfig(agentGroupId: string): ContainerConfigRow | undefined {
   return getDb().prepare('SELECT * FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
@@ -112,10 +119,10 @@ export function updateContainerConfigScalars(
     .run(values);
 }
 
-/** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts. */
+/** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts, provider_chain. */
 export function updateContainerConfigJson(
   agentGroupId: string,
-  column: 'skills' | 'mcp_servers' | 'packages_apt' | 'packages_npm' | 'additional_mounts',
+  column: 'skills' | 'mcp_servers' | 'packages_apt' | 'packages_npm' | 'additional_mounts' | 'provider_chain',
   value: unknown,
 ): void {
   if (!JSON_COLUMNS.has(column)) throw new Error(`Invalid JSON column: ${column}`);
@@ -123,6 +130,29 @@ export function updateContainerConfigJson(
   getDb()
     .prepare(`UPDATE container_configs SET ${column} = ?, updated_at = ? WHERE agent_group_id = ?`)
     .run(JSON.stringify(value), now, agentGroupId);
+}
+
+/**
+ * Update the provider_chain column. Pass `null` to clear (revert to instance default).
+ * The chain is stored as a JSON-encoded array string.
+ */
+export function updateContainerConfig(agentGroupId: string, updates: { providerChain?: string[] | null }): void {
+  const fields: string[] = [];
+  const values: Record<string, unknown> = { agent_group_id: agentGroupId };
+
+  if ('providerChain' in updates) {
+    fields.push('provider_chain = @provider_chain');
+    values.provider_chain = updates.providerChain != null ? JSON.stringify(updates.providerChain) : null;
+  }
+
+  if (fields.length === 0) return;
+
+  fields.push('updated_at = @updated_at');
+  values.updated_at = new Date().toISOString();
+
+  getDb()
+    .prepare(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`)
+    .run(values);
 }
 
 export function deleteContainerConfig(agentGroupId: string): void {

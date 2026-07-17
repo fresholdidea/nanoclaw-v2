@@ -27,6 +27,8 @@ export interface ContainerConfigRow {
   cli_scope: string; // 'disabled' | 'group' | 'global'
   enable_agy_tooling: number;
   enable_opencode_tooling: number;
+  /** JSON array of provider names, or NULL to derive from instance default. Added by migration 021. */
+  provider_chain: string | null;
   updated_at: string;
 }
 
