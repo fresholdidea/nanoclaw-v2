@@ -449,3 +449,90 @@ describe('groups config add-mount readonly intent (--ro / --rw)', () => {
     expect(await stored('explicit-false')).not.toHaveProperty('readonly');
   });
 });
+
+describe('groups config update --provider-chain / --no-fallback', () => {
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await runMigrations(await initTestDb());
+  });
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('sets provider_chain via --provider-chain (comma-separated)', async () => {
+    const GID = 'ag-chain';
+    await createAgentGroup({ id: GID, name: 'chain', folder: 'chain', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      {
+        id: 'r-chain-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'provider-chain': 'claude,codex,opencode' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    const stored = (await getContainerConfig(GID))!.provider_chain;
+    expect(JSON.parse(stored!)).toEqual(['claude', 'codex', 'opencode']);
+  });
+
+  it('collapses chain to [primary] via --no-fallback', async () => {
+    const GID = 'ag-nofallback';
+    await createAgentGroup({ id: GID, name: 'nofb', folder: 'nofb', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID, 'codex');
+
+    const resp = await dispatch(
+      {
+        id: 'r-nofb-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'no-fallback': true },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    const stored = (await getContainerConfig(GID))!.provider_chain;
+    expect(JSON.parse(stored!)).toEqual(['codex']);
+  });
+
+  it('does NOT throw "Nothing to update" when only --provider-chain is given', async () => {
+    const GID = 'ag-chain-only';
+    await createAgentGroup({ id: GID, name: 'co', folder: 'co', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      {
+        id: 'r-co-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'provider-chain': 'claude,codex' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+  });
+
+  it('throws when --no-fallback and --provider-chain are both given', async () => {
+    const GID = 'ag-conflict';
+    await createAgentGroup({ id: GID, name: 'cf', folder: 'cf', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      {
+        id: 'r-cf-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'provider-chain': 'claude,codex', 'no-fallback': true },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(false);
+    expect((resp as { ok: false; error: { code: string; message: string } }).error.message).toMatch(
+      /mutually exclusive/i,
+    );
+  });
+});
