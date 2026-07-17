@@ -39,6 +39,29 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+export const DEFAULT_PROVIDER_CHAIN = ['claude', 'codex', 'opencode'];
+
+export function resolveProviderChain(provider: string | undefined, providerChainJson: string | null): string[] {
+  const primary = provider ?? 'claude';
+  let chain: string[];
+  if (providerChainJson) {
+    try {
+      const parsed = JSON.parse(providerChainJson) as unknown;
+      chain = Array.isArray(parsed) && parsed.every((x) => typeof x === 'string') ? (parsed as string[]) : [];
+    } catch {
+      chain = [];
+    }
+  } else {
+    chain = primary === 'claude' ? [...DEFAULT_PROVIDER_CHAIN] : [primary];
+  }
+  if (chain.length === 0) chain = primary === 'claude' ? [...DEFAULT_PROVIDER_CHAIN] : [primary];
+  if (chain[0] !== primary) {
+    console.warn(`[container-config] providerChain[0] (${chain[0]}) != primary (${primary}); prepending primary`);
+    chain = [primary, ...chain.filter((p) => p !== primary)];
+  }
+  return chain;
+}
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -47,6 +70,7 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
+  providerChain?: string[];
   enableAgyTooling?: boolean;
   enableOpencodeTooling?: boolean;
   groupName?: string;
@@ -69,6 +93,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
     skills: JSON.parse(row.skills) as string[] | 'all',
     provider: row.provider ?? undefined,
+    providerChain: resolveProviderChain(row.provider ?? undefined, row.provider_chain ?? null),
     enableAgyTooling: row.enable_agy_tooling === 1,
     enableOpencodeTooling: row.enable_opencode_tooling === 1,
     groupName: group.name,
