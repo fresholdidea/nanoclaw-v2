@@ -67,7 +67,10 @@ export function ensureContainerRuntimeRunning(): void {
 export function cleanupOrphans(): void {
   try {
     const list = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter "name=^nanoclaw-v2-" --format "{{.Names}}\t{{.Label \"nanoclaw-install\"}}"`,
+      // The format arg must be single-quoted for the shell: the Go template's own
+      // double quotes around the label key would otherwise terminate the shell
+      // quoting and docker sees a mangled template ("bad character U+002D").
+      `${CONTAINER_RUNTIME_BIN} ps --filter "name=^nanoclaw-v2-" --format '{{.Names}}\t{{.Label "nanoclaw-install"}}'`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     )
       .trim()
