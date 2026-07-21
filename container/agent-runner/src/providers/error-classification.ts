@@ -21,6 +21,10 @@ export function classifyFailure(event: ProviderEvent): FailureClass | null {
     if (event.classification && FALLBACK_CLASSES.has(event.classification as FailureClass)) {
       return event.classification as FailureClass;
     }
+    // The claude provider emits 'rate_limit' for a rejected transient window
+    // limit (distinct from 'quota' = out of credits). Both should advance the
+    // fallback chain — the whole point is to keep serving through a window.
+    if (event.classification === 'rate_limit') return 'quota';
     return classifyMessage(event.message);
   }
   if (event.type === 'result' && event.isError === true) {
