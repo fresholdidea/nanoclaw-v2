@@ -67,11 +67,20 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # Shared store across host CC and all nanoclaw groups. The host mounts
 # ~/.mnemon (RW) at /workspace/extra/mnemon via each group's container.json
 # `additionalMounts`, and MNEMON_DATA_DIR below points the binary at it.
+#
+# The live store is WAL-mode SQLite, which cannot be opened across the macOS
+# Docker mount, so the real binary installs as mnemon-real and `mnemon` is a
+# shim: reads go to the host-refreshed snapshot, writes queue for host replay
+# (drained by src/mnemon-sync.ts). See container/mnemon-shim.sh.
 ARG MNEMON_VERSION=0.1.14
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://github.com/mnemon-dev/mnemon/releases/download/v${MNEMON_VERSION}/mnemon_${MNEMON_VERSION}_linux_${ARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin mnemon && \
-    chmod +x /usr/local/bin/mnemon
+    mv /usr/local/bin/mnemon /usr/local/bin/mnemon-real && \
+    chmod +x /usr/local/bin/mnemon-real
+COPY mnemon-shim.sh /usr/local/bin/mnemon
+COPY mnemon-queue.mjs /usr/local/lib/mnemon-queue.mjs
+RUN chmod +x /usr/local/bin/mnemon
 
 ENV MNEMON_DATA_DIR=/workspace/extra/mnemon
 

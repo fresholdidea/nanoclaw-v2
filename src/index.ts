@@ -172,6 +172,15 @@ async function main(): Promise<void> {
     log.info('Dashboard disabled (no DASHBOARD_SECRET)');
   }
 
+  // 7b. mnemon sync — snapshot refresh + container write-queue replay.
+  // No-ops (with a log line) when no ~/.mnemon store exists.
+  try {
+    const { startMnemonSync } = await import('./mnemon-sync.js');
+    startMnemonSync();
+  } catch (err) {
+    log.error('Failed to start mnemon sync', { err });
+  }
+
   // 8. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
@@ -193,6 +202,12 @@ async function shutdown(signal: string): Promise<void> {
     stopDashboardPusher();
   } catch {
     /* ignore if not started or not installed */
+  }
+  try {
+    const { stopMnemonSync } = await import('./mnemon-sync.js');
+    stopMnemonSync();
+  } catch {
+    /* ignore if not started */
   }
   stopDeliveryPolls();
   stopHostSweep();

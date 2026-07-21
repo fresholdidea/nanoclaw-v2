@@ -131,6 +131,18 @@ docker exec $(docker ps --filter name=nanoclaw-v2 --format '{{.Names}}' | head -
 
 Have a conversation with the agent, then start a new session and reference something from the earlier one. Mnemon should surface the relevant context automatically without you restating it.
 
+## This Install: Shared Store + Shim Architecture (customized 2026-07-21)
+
+This install diverges from the stock skill. All groups share one store (`~/.mnemon`, mounted RW at `/workspace/extra/mnemon`), and mnemon >= 0.1.14 forces SQLite WAL mode on every read-write open. WAL needs mmap'd shared memory, which fails across the macOS Docker file-sharing mount (`SQLITE_CANTOPEN (14)`), so containers can never open the live DB directly — in either RW or `--readonly` mode.
+
+The working architecture:
+
+- **Container**: `/usr/local/bin/mnemon` is a shim (`container/mnemon-shim.sh`); the release binary lives at `mnemon-real`. Read verbs (`recall`, `search`, `related`, `status`, `log`, `viz`, `receipt`) run `mnemon-real --readonly` against `/workspace/extra/mnemon/snapshot/`. Write verbs (`remember`, `link`, `forget`) queue their argv as a JSON file in `/workspace/extra/mnemon/queue/` via `container/mnemon-queue.mjs`.
+- **Host**: `src/mnemon-sync.ts` (started from `src/index.ts`) replays queued argv through the host mnemon CLI every 60s and refreshes the snapshot (`VACUUM INTO`, DELETE journal, atomic rename) every 5 minutes or after a drain.
+- Failed/invalid queue files are parked as `*.err` in `~/.mnemon/queue/` — check there if agent memories go missing.
+
+Agents notice nothing: the hook-installed `mnemon recall` / `mnemon remember` commands work unchanged, with recall up to ~5 min stale and remembers landing on the next drain.
+
 ## Memory Storage
 
 Mnemon writes to `/home/node/.claude/mnemon/` inside the container, which maps to the per-agent-group `.claude/` directory on the host. To find the exact host path:
