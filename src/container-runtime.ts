@@ -68,8 +68,11 @@ export function cleanupOrphans(): void {
   try {
     const list = execSync(
       `${CONTAINER_RUNTIME_BIN} ps --filter "name=^nanoclaw-v2-" --format "{{.Names}}\t{{.Label \"nanoclaw-install\"}}"`,
-      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' }
-    ).trim().split('\n').filter(Boolean);
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    )
+      .trim()
+      .split('\n')
+      .filter(Boolean);
 
     const orphans: string[] = [];
     for (const line of list) {

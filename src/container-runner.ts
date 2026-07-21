@@ -269,14 +269,20 @@ function resolveProviderContribution(
   if (containerConfig.enableAgyTooling && provider !== 'agy') {
     const agyFn = getProviderContainerConfig('agy');
     if (agyFn) contributions.push(agyFn(ctx));
-    else log.warn('enableAgyTooling=true but agy provider is not registered. Run /add-agy.', { agentGroupId: agentGroup.id });
+    else
+      log.warn('enableAgyTooling=true but agy provider is not registered. Run /add-agy.', {
+        agentGroupId: agentGroup.id,
+      });
   }
 
   // Layer opencode tooling enabler
   if (containerConfig.enableOpencodeTooling && provider !== 'opencode') {
     const opencodeFn = getProviderContainerConfig('opencode');
     if (opencodeFn) contributions.push(opencodeFn(ctx));
-    else log.warn('enableOpencodeTooling=true but opencode provider is not registered. Run /add-opencode.', { agentGroupId: agentGroup.id });
+    else
+      log.warn('enableOpencodeTooling=true but opencode provider is not registered. Run /add-opencode.', {
+        agentGroupId: agentGroup.id,
+      });
   }
 
   return { provider, contributions };

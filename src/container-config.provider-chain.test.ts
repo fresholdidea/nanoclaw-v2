@@ -15,7 +15,11 @@ describe('resolveProviderChain', () => {
     expect(resolveProviderChain('claude', JSON.stringify(['claude']))).toEqual(['claude']);
   });
   it('primary mismatch is corrected by prepending', () => {
-    expect(resolveProviderChain('claude', JSON.stringify(['codex', 'opencode']))).toEqual(['claude', 'codex', 'opencode']);
+    expect(resolveProviderChain('claude', JSON.stringify(['codex', 'opencode']))).toEqual([
+      'claude',
+      'codex',
+      'opencode',
+    ]);
   });
   it('undefined provider defaults to claude chain', () => {
     expect(resolveProviderChain(undefined, null)).toEqual(DEFAULT_PROVIDER_CHAIN);

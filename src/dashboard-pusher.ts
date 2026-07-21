@@ -176,12 +176,14 @@ function collectAgentGroups() {
       agent_provider: g.agent_provider,
       container_config: (() => {
         const row = getContainerConfig(g.id);
-        return row ? configFromDb(row, g) : {
-          mcpServers: {},
-          packages: { apt: [], npm: [] },
-          additionalMounts: [],
-          skills: 'all' as const,
-        };
+        return row
+          ? configFromDb(row, g)
+          : {
+              mcpServers: {},
+              packages: { apt: [], npm: [] },
+              additionalMounts: [],
+              skills: 'all' as const,
+            };
       })(),
       sessionCount: sessions.length,
       runningSessions: running.length,
