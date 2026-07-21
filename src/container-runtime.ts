@@ -77,11 +77,14 @@ export function cleanupOrphans(): void {
       .split('\n')
       .filter(Boolean);
 
+    // `{{.Label "nanoclaw-install"}}` prints the label VALUE (the bare slug),
+    // not the key=value pair that CONTAINER_INSTALL_LABEL holds.
+    const installSlug = CONTAINER_INSTALL_LABEL.split('=')[1];
     const orphans: string[] = [];
     for (const line of list) {
       const [name, label] = line.split('\t');
-      // Pass 1: exact label match. Pass 2: pre-label-fix zombies (empty label)
-      if (label === CONTAINER_INSTALL_LABEL || !label) {
+      // Pass 1: exact slug match. Pass 2: pre-label-fix zombies (empty label)
+      if (label === installSlug || !label) {
         orphans.push(name);
       }
     }
