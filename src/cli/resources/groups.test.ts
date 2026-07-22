@@ -12,6 +12,7 @@
  * with the host caller — same code path a real approval would take.
  */
 import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../container-runner.js', () => ({
@@ -22,9 +23,19 @@ vi.mock('../../container-runner.js', () => ({
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The allowlist path is a module-level const in production; route it through a
+// getter so the mount tests can point it at a per-test temp file.
+const mockState = vi.hoisted(() => ({ allowlistPath: '' }));
+
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-groups' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-cli-groups',
+    get MOUNT_ALLOWLIST_PATH() {
+      return mockState.allowlistPath;
+    },
+  };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-groups';
@@ -33,6 +44,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../
 import { createSession } from '../../db/sessions.js';
 import { dispatch } from '../dispatch.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
+import { validateMount } from '../../modules/mount-security/index.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
 
@@ -235,12 +247,15 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
     const GID = 'ag-mount';
     createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
     ensureContainerConfig(GID);
-    const args = { id: GID, host: '/data/.gmail-mcp', container: '/home/node/.gmail-mcp', ro: true };
+    // containerPath is relative: the validator rejects absolute paths and
+    // mounts every entry under /workspace/extra/, so an absolute fixture here
+    // would model a mount that can never take effect.
+    const args = { id: GID, host: '/data/.gmail-mcp', container: '.gmail-mcp', ro: true };
 
     const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
     expect(add.ok).toBe(true);
     expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([
-      { hostPath: '/data/.gmail-mcp', containerPath: '/home/node/.gmail-mcp', readonly: true },
+      { hostPath: '/data/.gmail-mcp', containerPath: '.gmail-mcp', readonly: true },
     ]);
 
     // idempotent: a second add does not duplicate
@@ -251,11 +266,136 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
       {
         id: 'r3',
         command: 'groups-config-remove-mount',
-        args: { id: GID, host: '/data/.gmail-mcp', container: '/home/node/.gmail-mcp' },
+        args: { id: GID, host: '/data/.gmail-mcp', container: '.gmail-mcp' },
       },
       { caller: 'host' },
     );
     expect(rm.ok).toBe(true);
     expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+  });
+});
+
+/**
+ * Regression: `add-mount` could not express read-write intent.
+ *
+ * The validator grants read-write only on an explicit `readonly: false`
+ * (mount-security/index.ts) — an omitted key is forced read-only. The handler
+ * only ever emitted `readonly: true` (with --ro) or omitted the key, so every
+ * mount created through the CLI came out read-only and RW mounts had to be
+ * hand-written into `container_configs`. Live symptom: a group with ~/.mnemon
+ * mounted could read the store but every write failed with "Read-only file
+ * system".
+ *
+ * These tests run the CLI intent all the way through the validator, because
+ * the JSON shape alone is not the contract that broke.
+ */
+describe('groups config add-mount readonly intent (--ro / --rw)', () => {
+  const GID = 'ag-mount-rw';
+  let hostRoot: string;
+  let seq = 0;
+
+  /** Point the validator at a fresh allowlist granting (or refusing) RW under `hostRoot`. */
+  function writeAllowlist(allowReadWrite: boolean): void {
+    // A new file per call: the loader caches on path + mtime, and mtime alone
+    // is too coarse to distinguish rewrites within a test run.
+    const file = path.join(TEST_DIR, `mount-allowlist-${seq++}.json`);
+    fs.writeFileSync(file, JSON.stringify({ allowedRoots: [{ path: hostRoot, allowReadWrite }], blockedPatterns: [] }));
+    mockState.allowlistPath = file;
+  }
+
+  async function addMount(dir: string, extra: Record<string, unknown>): Promise<{ ok: boolean }> {
+    fs.mkdirSync(path.join(hostRoot, dir), { recursive: true });
+    return dispatch(
+      {
+        id: `r-${dir}`,
+        command: 'groups-config-add-mount',
+        args: { id: GID, host: path.join(hostRoot, dir), container: dir, ...extra },
+      },
+      { caller: 'host' },
+    );
+  }
+
+  /** The mount as stored, looked up by its container path. */
+  function stored(dir: string): { hostPath: string; containerPath: string; readonly?: boolean } {
+    const mounts = JSON.parse(getContainerConfig(GID)!.additional_mounts) as Array<{
+      hostPath: string;
+      containerPath: string;
+      readonly?: boolean;
+    }>;
+    const found = mounts.find((m) => m.containerPath === dir);
+    if (!found) throw new Error(`no mount stored for ${dir}`);
+    return found;
+  }
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    hostRoot = path.join(TEST_DIR, 'hostroot');
+    fs.mkdirSync(hostRoot, { recursive: true });
+
+    runMigrations(initTestDb());
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('writes readonly: false for --rw and read-write survives to the validator', async () => {
+    writeAllowlist(true);
+    expect((await addMount('rw', { rw: true })).ok).toBe(true);
+
+    expect(stored('rw').readonly).toBe(false);
+    const result = validateMount(stored('rw'));
+    expect(result.allowed).toBe(true);
+    expect(result.effectiveReadonly).toBe(false);
+  });
+
+  it('writes readonly: true for --ro', async () => {
+    writeAllowlist(true);
+    expect((await addMount('ro', { ro: true })).ok).toBe(true);
+
+    expect(stored('ro').readonly).toBe(true);
+    expect(validateMount(stored('ro')).effectiveReadonly).toBe(true);
+  });
+
+  it('omits the key with no flag, which the validator forces to read-only', async () => {
+    // Same allowlist as the --rw case: only the CLI intent differs.
+    writeAllowlist(true);
+    expect((await addMount('plain', {})).ok).toBe(true);
+
+    expect(stored('plain')).not.toHaveProperty('readonly');
+    expect(validateMount(stored('plain')).effectiveReadonly).toBe(true);
+  });
+
+  it('downgrades --rw to read-only when the allowlist root refuses read-write', async () => {
+    writeAllowlist(false);
+    expect((await addMount('denied', { rw: true })).ok).toBe(true);
+
+    // The CLI records the intent; the allowlist is what actually decides.
+    expect(stored('denied').readonly).toBe(false);
+    const result = validateMount(stored('denied'));
+    expect(result.allowed).toBe(true);
+    expect(result.effectiveReadonly).toBe(true);
+  });
+
+  it('rejects --ro and --rw together instead of silently picking one', async () => {
+    writeAllowlist(true);
+    const resp = await addMount('both', { ro: true, rw: true });
+
+    expect(resp.ok).toBe(false);
+    const err = (resp as { ok: false; error: { code: string; message: string } }).error;
+    expect(err.code).toBe('handler-error');
+    expect(err.message).toMatch(/mutually exclusive/i);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+  });
+
+  it('reads --rw false as false rather than as a truthy string', async () => {
+    writeAllowlist(true);
+    expect((await addMount('explicit-false', { rw: 'false' })).ok).toBe(true);
+
+    expect(stored('explicit-false')).not.toHaveProperty('readonly');
   });
 });

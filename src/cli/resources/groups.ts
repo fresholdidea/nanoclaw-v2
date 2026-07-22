@@ -37,6 +37,16 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
   };
 }
 
+/** `--ro` / `--rw` are presence flags. The client parses a value-less flag as
+ *  boolean true, but accept an explicit true/false too so `--rw false` reads as
+ *  false rather than as the non-empty (truthy) string "false". */
+function mountAccessFlag(v: unknown, flag: string): boolean {
+  if (v === undefined) return false;
+  if (v === true || v === 'true' || v === '1') return true;
+  if (v === false || v === 'false' || v === '0') return false;
+  throw new Error(`--${flag} takes no value, or true/false — got "${v}"`);
+}
+
 registerResource({
   name: 'group',
   plural: 'groups',
@@ -416,9 +426,17 @@ registerResource({
       access: 'approval',
       hostOnly: true,
       description:
-        "Mount a host directory into a group's containers. OPERATOR-ONLY — never runnable from " +
-        'inside a container (mounting host paths is a filesystem-access boundary). Requires ' +
-        '`ncl groups restart` to take effect. Use --id <group-id> --host <host-path> --container <container-path> [--ro].',
+        "Mount a host directory into a group's containers — read-only unless --rw.\n" +
+        'OPERATOR-ONLY — never runnable from inside a container (mounting host paths is a ' +
+        'filesystem-access boundary). Requires `ncl groups restart` to take effect.\n' +
+        'Use --id <group-id> --host <host-path> --container <container-path> [--ro | --rw].\n' +
+        '--rw only expresses intent: the mount allowlist (~/.config/nanoclaw/mount-allowlist.json) ' +
+        'still decides. A --rw mount under a root that does not set allowReadWrite is downgraded ' +
+        'to read-only at spawn time.',
+      examples: [
+        'ncl groups config add-mount --id ag-123 --host ~/Documents/notes --container notes',
+        'ncl groups config add-mount --id ag-123 --host ~/.mnemon --container mnemon --rw',
+      ],
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -426,14 +444,19 @@ registerResource({
         const containerPath = (args.container ?? args['container-path']) as string | undefined;
         if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
 
+        const ro = mountAccessFlag(args.ro ?? args.readonly, 'ro');
+        const rw = mountAccessFlag(args.rw, 'rw');
+        if (ro && rw) throw new Error('--ro and --rw are mutually exclusive');
+
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
-        const mount: AdditionalMountConfig = {
-          hostPath,
-          containerPath,
-          ...(args.ro || args.readonly ? { readonly: true } : {}),
-        };
+        const mount: AdditionalMountConfig = { hostPath, containerPath };
+        // The validator grants read-write only on an explicit `readonly: false`
+        // (src/modules/mount-security/index.ts) — an omitted key is forced
+        // read-only. So --rw has to write the key, not merely leave it out.
+        if (rw) mount.readonly = false;
+        else if (ro) mount.readonly = true;
         const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
         if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
           existing.push(mount);
