@@ -14,6 +14,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { migrateLegacyTaskSeries } from './modules/scheduling/migrate-legacy.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { readEnvFile } from './env.js';
@@ -81,6 +82,13 @@ async function main(): Promise<void> {
   // 2. Container runtime
   ensureContainerRuntimeRunning();
   cleanupOrphans();
+
+  // 2b. Move legacy task series (living in chat/system sessions, where
+  // group-scoped `ncl tasks` can't see them) into per-series task sessions.
+  // Idempotent. Ordering is load-bearing: after cleanupOrphans (no leftover
+  // container can fire a due row mid-move) and before adapters, delivery
+  // polls, and the sweep (nothing else touches session DBs during the move).
+  await migrateLegacyTaskSeries();
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
