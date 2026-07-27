@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { isCorruptionError, processQuery } from './poll-loop.js';
+import { emitProviderError, isCorruptionError, processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -220,7 +220,13 @@ describe('origin metadata (from= attribute)', () => {
       .run(name, name, channelType, platformId);
   }
 
-  function insertWithRouting(id: string, kind: string, content: object, channelType: string | null, platformId: string | null): void {
+  function insertWithRouting(
+    id: string,
+    kind: string,
+    content: object,
+    channelType: string | null,
+    platformId: string | null,
+  ): void {
     getInboundDb()
       .prepare(
         `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
@@ -438,6 +444,61 @@ describe('error result with no <message> envelope', () => {
   });
 });
 
+// The batch that triggered the observed runaway was a self-addressed system
+// note (an approval follow-up / restart note), which the host writes with
+// channel_type='agent' and platform_id=<the group's own id>.
+const AGENT_ROUTING = {
+  platformId: 'ag-1779729652625-n3m1xl',
+  channelType: 'agent',
+  threadId: null,
+  inReplyTo: 'restart-1',
+};
+
+describe('emitProviderError', () => {
+  it('writes the error to a channel batch', () => {
+    const wrote = emitProviderError('Error: boom', ERR_ROUTING, null);
+
+    expect(wrote).toBe(true);
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Error: boom');
+    expect(out[0].channel_type).toBe('discord');
+  });
+
+  it('does not write the error to an agent-channel batch', () => {
+    // A provider error is an infrastructure failure of this runner, not
+    // content addressed to a peer agent. Emitting it on the agent channel
+    // turns a failing turn into fresh inbound work for an agent — the fuel
+    // for the observed self-feeding loop.
+    const wrote = emitProviderError(
+      'Error: Reconnecting... 2/5: unexpected status 401 Unauthorized',
+      AGENT_ROUTING,
+      null,
+    );
+
+    expect(wrote).toBe(false);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});
+
+describe('regression: provider errors never re-enter the agent mesh', () => {
+  it('an isError result on an agent-channel batch produces no outbound row', async () => {
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'Error: {"status":400,"message":"The \'gpt-5.6-terra\' model requires a newer version of Codex."}',
+      isError: true,
+    });
+
+    await processQuery(query, AGENT_ROUTING, ['restart-1'], 'codex', undefined, 'prompt', undefined);
+
+    // Nothing to route back — without this the host would write it into the
+    // emitting group's own session and wake the container, which fails
+    // identically, forever.
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(pushes).toHaveLength(0);
+  });
+});
+
 describe('isCorruptionError', () => {
   it('matches the Docker Desktop macOS torn-read symptom', () => {
     expect(isCorruptionError('database disk image is malformed')).toBe(true);
@@ -470,9 +531,9 @@ const TASK_ROUTING = {
 
 function taskLogRows(): Array<{ text: string }> {
   return (
-    getOutboundDb()
-      .prepare("SELECT content FROM messages_out WHERE kind = 'task_log' ORDER BY seq")
-      .all() as Array<{ content: string }>
+    getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log' ORDER BY seq").all() as Array<{
+      content: string;
+    }>
   ).map((r) => JSON.parse(r.content) as { text: string });
 }
 

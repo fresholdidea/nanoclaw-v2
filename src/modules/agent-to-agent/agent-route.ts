@@ -11,8 +11,12 @@
  * The target agent can then forward the file onward via its own `send_file`
  * call using the absolute `/workspace/inbox/<a2a-msg-id>/<filename>` path.
  *
- * Self-messages are always allowed (used for system notes injected back into
- * an agent's own session, e.g. post-approval follow-up prompts).
+ * Self-routes are refused. System notes injected back into an agent's own
+ * session (post-approval follow-ups, restart notes) never travel this path —
+ * the host writes them straight into the session's inbound DB via
+ * `writeSessionMessage`. An outbound row addressed to its own group is
+ * therefore always a routing echo, and routing it self-feeds forever; see the
+ * self-route check in `guard.ts`.
  *
  * Core delivery.ts dispatches into this via a dynamic import guarded by a
  * `channel_type === 'agent'` check. When the module is absent the check in
@@ -242,9 +246,8 @@ export async function routeAgentMessage(
     throw new Error(`agent-to-agent message ${msg.id} is missing a target agent group id`);
   }
 
-  // The a2a.send decision (guard.ts) carries the checks verbatim in their
-  // original order: destination ACL deny, target-exists deny, self-send
-  // allow, agent_message_policies hold. An approved replay carries the
+  // The a2a.send decision (guard.ts) runs: self-route deny, destination ACL
+  // deny, target-exists deny, agent_message_policies hold. An approved replay carries the
   // grant — the hold is satisfied but the structure is re-checked live, so
   // revoking a destination between hold and approve blocks delivery.
   const decision = guard(a2aSend, {

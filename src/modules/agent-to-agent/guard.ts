@@ -8,14 +8,13 @@
  * default `group` scope, and unknown/missing config, fail-closed — holds for
  * the requesting group's admin chain.
  *
- * a2a.send — the decision moved verbatim out of routeAgentMessage, in its
- * original check order: a missing destination row denies; a missing target
- * group denies; self-sends allow without a destination row; an
+ * a2a.send — a self-route (source group == target group) denies first; then a
+ * missing destination row denies; a missing target group denies; an
  * agent_message_policies row for the (from, to) pair holds for the row's
  * named approver. The ghost-policy edge (policy row with no destination row)
- * denies — the destination check precedes the policy check, exactly today's
- * outcome. Policy rows can only tighten (hold), never allow: absence of a
- * row falls through to the structural checks.
+ * denies — the destination check precedes the policy check. Policy rows can
+ * only tighten (hold), never allow: absence of a row falls through to the
+ * structural checks.
  */
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig } from '../../db/container-configs.js';
@@ -71,14 +70,34 @@ export const a2aSend = defineGuardedAction({
     if (input.actor.kind !== 'agent') return DENY('agent-to-agent send requires an agent actor');
     const from = input.actor.agentGroupId;
     const to = input.resource?.to ?? '';
-    const isSelf = to === from;
-    if (!isSelf && !hasDestination(from, 'agent', to)) {
+    // Self-route deny — the loop breaker. Checked first so no later branch
+    // (destination ACL, policy hold) can reach a self-addressed message.
+    //
+    // A self-route has no legitimate producer: every host-side "note to self"
+    // (approval follow-ups in approvals/finalize.ts + primitive.ts, restart
+    // notes in container-restart.ts, self-mod apply notes) is written straight
+    // into the group's own inbound.db via writeSessionMessage and never
+    // travels through delivery. What does reach here is the container echoing
+    // an inbound's routing back onto an outbound row: `platform_id` means the
+    // *source* group on an inbound a2a row but the *target* group on an
+    // outbound one, so reflecting a self-addressed system note's routing
+    // produces a message addressed to the emitting group. Routing it writes it
+    // into the same session and wakes the container, which reproduces it —
+    // self-feeding forever (observed: reviewer-1 on provider=codex, 401 on
+    // every turn, 108 messages in 4 minutes).
+    //
+    // An earlier fix (63746df) allowed self-sends to stop those system notes
+    // being dropped — but they never passed through this code path, so the
+    // allowance only ever admitted the loop.
+    if (to === from) {
+      return DENY(`self-route refused: ${from} cannot route an agent message to itself`);
+    }
+    if (!hasDestination(from, 'agent', to)) {
       return DENY(`unauthorized agent-to-agent: ${from} has no destination for ${to}`);
     }
     if (!getAgentGroup(to)) {
       return DENY(`target agent group ${to} not found for message ${String(input.payload.id)}`);
     }
-    if (isSelf) return ALLOW('self-send');
     const policy = getMessagePolicy(from, to);
     if (policy) {
       return HOLD(`a2a message policy ${from}→${to} holds for ${policy.approver}`, policy.approver);

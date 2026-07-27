@@ -277,14 +277,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
 
       // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      emitProviderError(`Error: ${errMsg}`, routing, null);
 
       // The batch is still acked completed below (no redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
@@ -613,16 +606,51 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * `Error:` prefix — the provider's text is already a user-facing message.
  */
 function deliverErrorResult(text: string, routing: RoutingContext): void {
-  log('Error result with no <message> envelope — delivering to channel');
+  if (emitProviderError(text, routing, routing.inReplyTo)) {
+    log('Error result with no <message> envelope — delivered to channel');
+  }
+}
+
+/**
+ * Write a provider-failure notice back on the batch's own routing.
+ *
+ * A provider error (401, model-not-available, gateway 5xx) is an
+ * infrastructure failure of *this runner*, not content anyone addressed to a
+ * peer. On a channel batch the notice is user-facing and worth delivering — a
+ * human reads "Error: ..." and knows their message failed. On an agent batch
+ * it is not: `channel_type='agent'` rows are routed by the host into another
+ * agent's inbound DB as fresh work, so a failing turn manufactures its own
+ * next turn.
+ *
+ * That is exactly the observed runaway. The host writes self-addressed system
+ * notes (approval follow-ups, restart notes) with channel_type='agent' and
+ * platform_id=<the group's own id>; echoing that routing onto an error row
+ * produced a message the host routed straight back into the emitting session,
+ * waking the container, which hit the same 401 and re-emitted — ~3s per cycle,
+ * indefinitely. Agent-to-agent error echo between two distinct groups can
+ * ping-pong the same way.
+ *
+ * So provider errors stop at the log on the agent channel. The host's
+ * self-route guard (`a2aSend` in src/modules/agent-to-agent/guard.ts) is the
+ * second, independent line of defense.
+ *
+ * Returns whether a row was written.
+ */
+export function emitProviderError(text: string, routing: RoutingContext, inReplyTo: string | null): boolean {
+  if (routing.channelType === 'agent') {
+    log(`Provider error on an agent-channel batch — logged, not delivered (would re-enter the agent mesh): ${text}`);
+    return false;
+  }
   writeMessageOut({
     id: generateId(),
-    in_reply_to: routing.inReplyTo,
+    in_reply_to: inReplyTo,
     kind: 'chat',
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,
     content: JSON.stringify({ text }),
   });
+  return true;
 }
 
 /**
