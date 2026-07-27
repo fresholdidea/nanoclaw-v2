@@ -44,7 +44,11 @@ export function materializeTemplateSkills(agentGroupId: string, destSkillsDir: s
 
   fs.mkdirSync(destSkillsDir, { recursive: true });
   for (const name of fs.readdirSync(src)) {
-    if (!fs.statSync(path.join(src, name)).isDirectory()) continue;
+    // lstat, not stat: the source also holds shared-skill symlinks pointing at
+    // container paths (/app/skills/<name>), which dangle on the host — stat
+    // follows them and throws ENOENT, killing the whole spawn. lstat sees the
+    // link itself (isDirectory() === false), so only real template dirs copy.
+    if (!fs.lstatSync(path.join(src, name)).isDirectory()) continue;
     const dest = path.join(destSkillsDir, name);
     fs.rmSync(dest, { recursive: true, force: true });
     fs.cpSync(path.join(src, name), dest, { recursive: true });
