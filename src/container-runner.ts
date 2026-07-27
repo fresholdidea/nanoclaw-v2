@@ -56,8 +56,18 @@ import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
-/** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+/**
+ * Active containers tracked by session ID.
+ *
+ * `deliberate` marks a kill this host issued itself (idle ceiling, `ncl
+ * groups restart`, shutdown). It exists because the exit code cannot tell us:
+ * `killContainer` shells out to `stopContainer`, so the *docker CLI* exits
+ * 137 and the signal never reaches the tracked child — the `code === null`
+ * signal check in the close handler never matches. Keying on our own
+ * intent instead of the code keeps an *external* SIGKILL (a Docker OOM kill,
+ * say) loud, which an exit-code allowlist would have silenced.
+ */
+const activeContainers = new Map<string, { process: ChildProcess; containerName: string; deliberate?: boolean }>();
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -195,14 +205,19 @@ async function spawnContainer(session: Session): Promise<void> {
   // on a wall-clock timer.
 
   container.on('close', (code) => {
+    // Read intent before dropping the entry — killContainer records it there.
+    const deliberate = activeContainers.get(session.id)?.deliberate === true;
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     // code null = killed by signal (normal shutdown path), not a boot failure.
-    if (code !== 0 && code !== null && stderrTail.length > 0) {
+    // A kill we issued is equally routine, but arrives as 137 via the docker
+    // CLI — without this the idle-ceiling reaper alone accounted for ~40% of
+    // the error log, burying real failures.
+    if (!deliberate && code !== 0 && code !== null && stderrTail.length > 0) {
       log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
     } else {
-      log.info('Container exited', { sessionId: session.id, code, containerName });
+      log.info('Container exited', { sessionId: session.id, code, containerName, deliberate });
     }
   });
 
@@ -222,6 +237,10 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   if (onExit) {
     entry.process.once('close', onExit);
   }
+
+  // Record intent before the kill lands — the close handler races us and
+  // reads this to decide whether the exit is routine or a real failure.
+  entry.deliberate = true;
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
   try {

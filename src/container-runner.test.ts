@@ -96,6 +96,35 @@ describe('container boot-failure tripwire (structural)', () => {
   });
 });
 
+describe('deliberate-kill exit logging (structural)', () => {
+  // killContainer shells out to `stopContainer`, so the docker CLI exits 137
+  // and the signal never reaches the tracked child — the `code === null`
+  // signal check never matches. Every idle-ceiling reap therefore logged
+  // "Container exited non-zero" at warn; that pair alone was ~40% of the
+  // error log, burying real failures. Intent must be recorded on the entry
+  // and consulted on close. Driving a real kill needs a container runtime,
+  // so guard the wiring structurally like the tripwire above.
+  it('records kill intent and consults it before warning on exit', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    // killContainer marks the entry before the kill lands.
+    expect(src).toMatch(/entry\.deliberate = true;[\s\S]*stopContainer\(entry\.containerName\)/);
+    // The close handler reads intent BEFORE deleting the entry, or it always
+    // reads undefined and the suppression silently never applies.
+    expect(src).toMatch(
+      /const deliberate = activeContainers\.get\(session\.id\)\?\.deliberate === true;[\s\S]*activeContainers\.delete\(session\.id\)/,
+    );
+    expect(src).toMatch(/if \(!deliberate && code !== 0/);
+  });
+
+  // The suppression must key on our own intent, never on the exit code: a
+  // container SIGKILLed by Docker itself (OOM) also exits 137 and must stay
+  // loud. An allowlist like `code !== 137` would silence it.
+  it('does not suppress by exit code', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    expect(src).not.toMatch(/code !== 137|code === 137/);
+  });
+});
+
 describe('syncSkillSymlinks blocked-entry warning (structural)', () => {
   // Real directories in .claude-shared/skills/ block the managed symlinks:
   // the prune loop only removes symlinks and the create loop skips any
