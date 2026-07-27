@@ -4,6 +4,7 @@ import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 import { forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
+import { GuardDenyError } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { createDestination } from './db/agent-destinations.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
@@ -374,17 +375,44 @@ describe('routeAgentMessage return-path', () => {
     expect(s2Rows).toHaveLength(1);
   });
 
-  it('self-message is allowed without a destination row', async () => {
-    // A targets itself — no agent_destinations row exists for A→A.
-    await routeAgentMessage(
-      { id: 'self-msg', platform_id: A, content: JSON.stringify({ text: 'self-note' }), in_reply_to: null },
-      S1,
-    );
+  it('self-route is denied — an agent group cannot route a message to itself', async () => {
+    // A targets itself. This is never a legitimate outbound: every host-side
+    // "note to self" (approval follow-ups, restart notes) is written straight
+    // into the target's inbound.db via writeSessionMessage and never passes
+    // through delivery. The only way an outbound row carries
+    // platform_id === source group is the container echoing the routing of a
+    // self-addressed system note back out — which self-feeds forever.
+    await expect(
+      routeAgentMessage(
+        { id: 'self-msg', platform_id: A, content: JSON.stringify({ text: 'self-note' }), in_reply_to: null },
+        S1,
+      ),
+    ).rejects.toThrow(/self/i);
 
-    // Lands in S2 (newest active session of A via resolveSession fallback).
-    const s2Rows = readInbound(A, S2.id);
-    expect(s2Rows).toHaveLength(1);
-    expect(JSON.parse(s2Rows[0].content).text).toBe('self-note');
+    expect(readInbound(A, S1.id)).toHaveLength(0);
+    expect(readInbound(A, S2.id)).toHaveLength(0);
+  });
+
+  it('regression: a self-addressed provider error cannot re-enter its own session (loop breaker)', async () => {
+    // Reproduces the observed runaway: reviewer-1 switched to provider=codex,
+    // codex 401'd, the runner wrote "Error: ... 401 ..." to outbound carrying
+    // the routing of the self-addressed restart note (platform_id = own
+    // group), and the host routed it back into the same session — waking the
+    // container, which failed identically, every ~3s.
+    const errorText = 'Error: Reconnecting... 2/5: unexpected status 401 Unauthorized';
+
+    for (let i = 0; i < 5; i++) {
+      await expect(
+        routeAgentMessage(
+          { id: `err-${i}`, platform_id: A, content: JSON.stringify({ text: errorText }), in_reply_to: null },
+          S1,
+        ),
+      ).rejects.toThrow(GuardDenyError);
+    }
+
+    // Nothing re-entered any session of A — the loop has no fuel.
+    expect(readInbound(A, S1.id)).toHaveLength(0);
+    expect(readInbound(A, S2.id)).toHaveLength(0);
   });
 
   it('BUG: no volume cap on a2a routing — unbounded ping-pong is allowed (#2063)', async () => {
