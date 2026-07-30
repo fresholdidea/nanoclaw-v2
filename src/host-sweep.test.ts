@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
 import { deleteOrphanProcessingClaims, getProcessingClaims } from './db/session-db.js';
+import { IDLE_CHAT_SHUTDOWN_MS, IDLE_TASK_SHUTDOWN_MS } from './config.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
@@ -23,10 +24,19 @@ function claim(id: string, offsetMs: number) {
   return { message_id: id, status_changed: new Date(BASE - offsetMs).toISOString() };
 }
 
+/**
+ * decideStuckAction with the idle-shutdown inputs defaulted. Cases that care
+ * about idle behavior pass them explicitly; the stuck-detection cases below
+ * predate idle shutdown and shouldn't have to restate it.
+ */
+function decide(args: Omit<Parameters<typeof decideStuckAction>[0], 'idleMs' | 'hasDueWork'>) {
+  return decideStuckAction({ idleMs: IDLE_CHAT_SHUTDOWN_MS, hasDueWork: false, ...args });
+}
+
 describe('decideStuckAction', () => {
   it('returns ok when heartbeat is fresh and no claims', () => {
     expect(
-      decideStuckAction({
+      decide({
         now: BASE,
         heartbeatMtimeMs: BASE - 5_000,
         containerState: null,
@@ -37,7 +47,7 @@ describe('decideStuckAction', () => {
 
   it('returns kill-ceiling when heartbeat older than 30 min', () => {
     const heartbeatMtimeMs = BASE - ABSOLUTE_CEILING_MS - 1_000;
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       heartbeatMtimeMs,
       containerState: null,
@@ -54,7 +64,7 @@ describe('decideStuckAction', () => {
     // heartbeat. Prior behavior treated this as infinitely stale and killed
     // every container within seconds of spawn. With no claims either, we
     // should conclude everything is fine.
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       heartbeatMtimeMs: 0,
       containerState: null,
@@ -68,7 +78,7 @@ describe('decideStuckAction', () => {
     // in processing_ack), but never wrote a heartbeat. Falls through the
     // skipped ceiling check into claim-stuck — which correctly fires.
     const claimedAgeMs = CLAIM_STUCK_MS + 5_000;
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       heartbeatMtimeMs: 0,
       containerState: null,
@@ -79,7 +89,7 @@ describe('decideStuckAction', () => {
 
   it('extends the ceiling when Bash has a declared timeout longer than 30 min', () => {
     const twoHrMs = 2 * 60 * 60 * 1000;
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       // 45 min — over the default ceiling, but under the Bash timeout
       heartbeatMtimeMs: BASE - 45 * 60 * 1000,
@@ -95,7 +105,7 @@ describe('decideStuckAction', () => {
 
   it('returns kill-claim when a claim is past 60s and heartbeat has not moved', () => {
     const claimedAgeMs = CLAIM_STUCK_MS + 10_000;
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       heartbeatMtimeMs: BASE - claimedAgeMs - 5_000, // older than the claim
       containerState: null,
@@ -109,7 +119,7 @@ describe('decideStuckAction', () => {
 
   it('does not kill when heartbeat has been touched since the claim', () => {
     const claimedAgeMs = CLAIM_STUCK_MS + 10_000;
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       heartbeatMtimeMs: BASE - 2_000, // fresh, updated after the claim
       containerState: null,
@@ -119,7 +129,7 @@ describe('decideStuckAction', () => {
   });
 
   it('does not kill when claim age is below tolerance', () => {
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       heartbeatMtimeMs: BASE - CLAIM_STUCK_MS - 10_000, // old, but claim is recent
       containerState: null,
@@ -130,7 +140,7 @@ describe('decideStuckAction', () => {
 
   it('widens per-claim tolerance for a running Bash with long timeout', () => {
     const tenMinMs = 10 * 60 * 1000;
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       // 5 min since claim, over the 60s default but under the declared Bash timeout
       heartbeatMtimeMs: BASE - 5 * 60 * 1000 - 5_000,
@@ -145,11 +155,123 @@ describe('decideStuckAction', () => {
   });
 
   it('ignores claims with unparseable timestamps', () => {
-    const res = decideStuckAction({
+    const res = decide({
       now: BASE,
       heartbeatMtimeMs: BASE - 5_000,
       containerState: null,
       claims: [{ message_id: 'x', status_changed: 'not-a-date' }],
+    });
+    expect(res.action).toBe('ok');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Idle shutdown.
+//
+// The agent-runner has no self-shutdown: after a turn ends it keeps polling
+// forever, and only the heartbeat going stale ever reaps it. Before this
+// branch existed, that reaping was done by the 30-minute stuck ceiling, so
+// every finished container held RAM for half an hour. These cases pin the
+// separation: idle means "no claims, nothing due, no tool in flight", which
+// is never true of a container that is merely slow.
+describe('decideStuckAction — idle shutdown', () => {
+  it('kills an idle container past the chat window', () => {
+    const res = decide({
+      now: BASE,
+      heartbeatMtimeMs: BASE - IDLE_CHAT_SHUTDOWN_MS - 1_000,
+      containerState: null,
+      claims: [],
+    });
+    expect(res.action).toBe('kill-idle');
+    if (res.action !== 'kill-idle') return;
+    expect(res.idleMs).toBe(IDLE_CHAT_SHUTDOWN_MS);
+    expect(res.heartbeatAgeMs).toBeGreaterThan(IDLE_CHAT_SHUTDOWN_MS);
+  });
+
+  it('keeps an idle container inside the chat window (the reply grace period)', () => {
+    const res = decide({
+      now: BASE,
+      heartbeatMtimeMs: BASE - IDLE_CHAT_SHUTDOWN_MS + 30_000,
+      containerState: null,
+      claims: [],
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('kills a task session on the shorter task window', () => {
+    // Same heartbeat age that a chat session would survive — nobody replies to
+    // a scheduled task, so its window is much tighter.
+    const heartbeatMtimeMs = BASE - IDLE_TASK_SHUTDOWN_MS - 1_000;
+    expect(decide({ now: BASE, heartbeatMtimeMs, containerState: null, claims: [] }).action).toBe('ok');
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs,
+      containerState: null,
+      claims: [],
+      idleMs: IDLE_TASK_SHUTDOWN_MS,
+      hasDueWork: false,
+    });
+    expect(res.action).toBe('kill-idle');
+  });
+
+  it('does not kill as idle while a claim is in flight', () => {
+    // A turn in progress holds its claim until the provider `result` event.
+    // Claim is recent, so claim-stuck doesn't fire either — this must be 'ok'.
+    const res = decide({
+      now: BASE,
+      heartbeatMtimeMs: BASE - IDLE_CHAT_SHUTDOWN_MS - 60_000,
+      containerState: null,
+      claims: [claim('msg-1', 5_000)],
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('does not kill as idle when work is due this tick', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - IDLE_CHAT_SHUTDOWN_MS - 60_000,
+      containerState: null,
+      claims: [],
+      idleMs: IDLE_CHAT_SHUTDOWN_MS,
+      hasDueWork: true,
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('does not kill as idle while a tool is in flight', () => {
+    // A long MCP or Bash call emits no provider events, so the heartbeat can
+    // age past the idle window mid-work. container_state is the guard.
+    const res = decide({
+      now: BASE,
+      heartbeatMtimeMs: BASE - IDLE_CHAT_SHUTDOWN_MS - 60_000,
+      containerState: {
+        current_tool: 'Bash',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(BASE - IDLE_CHAT_SHUTDOWN_MS).toISOString(),
+      },
+      claims: [],
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('still prefers the ceiling verdict over idle when both apply', () => {
+    // Past 30 min with no claims satisfies both branches. Ceiling wins so the
+    // louder warn-level log and its reason string are preserved.
+    const res = decide({
+      now: BASE,
+      heartbeatMtimeMs: BASE - ABSOLUTE_CEILING_MS - 1_000,
+      containerState: null,
+      claims: [],
+    });
+    expect(res.action).toBe('kill-ceiling');
+  });
+
+  it('never kills as idle without a heartbeat file (fresh container)', () => {
+    const res = decide({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerState: null,
+      claims: [],
     });
     expect(res.action).toBe('ok');
   });

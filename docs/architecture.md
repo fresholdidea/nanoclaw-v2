@@ -849,8 +849,19 @@ stopped → running → idle → stopped
 
 - **stopped**: No container. Swept at 60s for due scheduled messages.
 - **running**: Actively processing. Polled at 1s for messages_out.
-- **idle**: Done processing, container still warm (up to 30 min timeout). Polled at 1s so new messages are picked up quickly.
-- After idle timeout → host kills container → stopped.
+- **idle**: Done processing, container still warm. Polled at 1s so new messages are picked up quickly.
+- After the idle window → host kills container → stopped.
+
+The idle window is per session kind, enforced by the host sweep (`decideStuckAction` in `src/host-sweep.ts`), since the runner has no self-shutdown of its own:
+
+| Session kind | Default | Env override |
+|---|---|---|
+| Chat threads | 10 min | `NANOCLAW_IDLE_CHAT_MS` |
+| Task threads | 2 min | `NANOCLAW_IDLE_TASK_MS` |
+
+Task threads get a tighter window because nothing ever replies to a scheduled run. A container is only idle when it holds no `processing` claim, has no messages due, and has no tool in flight — a turn in progress fails all three, so slow work is never mistaken for idleness. Genuinely stuck containers are a separate path: `ABSOLUTE_CEILING_MS` (30 min, extended while Bash declares a longer timeout) still kills a container that holds a claim and goes silent.
+
+Keeping a container warm does not improve prompt-cache hit rate — the Anthropic cache is server-side and keyed on prefix hash, so a cold container resuming the same transcript hits the same entries. The idle window only trades reply latency (~5–12s respawn) against RAM.
 
 ## Agent-Runner Architecture
 

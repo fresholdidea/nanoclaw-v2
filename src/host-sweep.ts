@@ -20,6 +20,13 @@
  *        only while Bash is declared as running longer, honouring the
  *        user's own timeout directive. Kill then resets processing rows.
  *
+ *     1b. Idle shutdown: nothing claimed, nothing due, no tool in flight, and
+ *        quiet past the session's idle window → kill. This is the *not stuck,
+ *        just done* case, which the ceiling used to absorb by accident: the
+ *        runner has no self-shutdown, so a finished container idled until the
+ *        30-minute ceiling reaped it. Distinguished from stuck by the claims
+ *        list — a turn in flight always holds a 'processing' claim.
+ *
  *     2. Message-scoped stuck: for each 'processing' row, tolerance =
  *        max(60s, current_bash_timeout_ms_if_Bash_running). If
  *        (claim_age > tolerance) AND (heartbeat_mtime <= status_changed)
@@ -29,6 +36,7 @@
 import type Database from 'better-sqlite3';
 import fs from 'fs';
 
+import { IDLE_CHAT_SHUTDOWN_MS, IDLE_TASK_SHUTDOWN_MS } from './config.js';
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -73,6 +81,7 @@ const BACKOFF_BASE_MS = 5000;
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
+  | { action: 'kill-idle'; heartbeatAgeMs: number; idleMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
 /**
@@ -85,8 +94,12 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
+  /** Idle window for this session kind — see IDLE_*_SHUTDOWN_MS in config.ts. */
+  idleMs: number;
+  /** True when messages are due this tick; due work means "not idle". */
+  hasDueWork: boolean;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerState, claims, idleMs, hasDueWork } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
@@ -102,6 +115,24 @@ export function decideStuckAction(args: {
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
     if (heartbeatAge > ceiling) {
       return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
+    }
+
+    // Idle shutdown. Every condition here says "no work is happening":
+    //   - no 'processing' claims → no turn in flight (a turn holds its claim
+    //     until the provider's `result` event)
+    //   - nothing due this tick → no work waiting to be picked up
+    //   - no tool in flight → not mid-Bash/MCP call. Only the claude provider
+    //     writes container_state, so this is a belt-and-braces guard on top of
+    //     the heartbeat age, not the primary signal.
+    //   - quiet past the idle window → the last provider event was a while ago
+    //
+    // A container that claimed a message microseconds after countDueMessages
+    // ran can still be killed here. That costs a retry, not a message: the
+    // caller resets the claim to pending and the next tick wakes a fresh
+    // container.
+    const toolInFlight = containerState?.current_tool != null;
+    if (claims.length === 0 && !hasDueWork && !toolInFlight && heartbeatAge > idleMs) {
+      return { action: 'kill-idle', heartbeatAgeMs: heartbeatAge, idleMs };
     }
   }
 
@@ -227,7 +258,7 @@ async function sweepSession(session: Session): Promise<void> {
     // yet. Without this grace period, stale claims cause an immediate
     // spawn-kill loop.
     if (alive && outDb && !justWoke) {
-      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
+      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id, dueCount);
     }
 
     // 4. Crashed-container cleanup: processing rows left behind get retried.
@@ -286,12 +317,15 @@ function enforceRunningContainerSla(
   outDb: Database.Database,
   session: Session,
   agentGroupId: string,
+  dueCount: number,
 ): void {
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
     claims: getProcessingClaims(outDb),
+    idleMs: isTaskThread(session.thread_id) ? IDLE_TASK_SHUTDOWN_MS : IDLE_CHAT_SHUTDOWN_MS,
+    hasDueWork: dueCount > 0,
   });
 
   if (decision.action === 'ok') return;
@@ -304,6 +338,22 @@ function enforceRunningContainerSla(
     });
     killContainer(session.id, 'absolute-ceiling');
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
+    return;
+  }
+
+  if (decision.action === 'kill-idle') {
+    // Info, not warn: this is the normal end of a container's life, not a
+    // fault. The old absolute-ceiling path logged every one of these as a
+    // warning, which is why the error log was nothing but ceiling kills.
+    log.info('Stopping idle container', {
+      sessionId: session.id,
+      heartbeatAgeMs: decision.heartbeatAgeMs,
+      idleMs: decision.idleMs,
+    });
+    killContainer(session.id, 'idle');
+    // No claims by definition — but a message can be claimed between the
+    // decision and the kill, so reset anyway. Idempotent.
+    resetStuckProcessingRows(inDb, outDb, session, 'idle');
     return;
   }
 

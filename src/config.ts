@@ -18,6 +18,8 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
+  'NANOCLAW_IDLE_CHAT_MS',
+  'NANOCLAW_IDLE_TASK_MS',
 ]);
 
 /**
@@ -78,6 +80,38 @@ export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API
 // Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
 export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
 export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '';
+
+/**
+ * Idle-shutdown windows for a running container with nothing in flight.
+ *
+ * A container that finishes a turn keeps polling forever — nothing in the
+ * runner shuts it down. Before these knobs existed, the only thing that
+ * eventually reaped it was the host sweep's 30-minute stuck-detector ceiling,
+ * so every idle container held its RAM for half an hour after its last turn.
+ *
+ * Keeping a container warm does NOT improve prompt-cache hit rate: the
+ * Anthropic cache is server-side, ~5-minute TTL, keyed on prefix hash (see the
+ * comment block in container/agent-runner/src/poll-loop.ts). A cold container
+ * resuming the same transcript hits the same cache entries. The only thing a
+ * warm container buys is the ~5–12s respawn, so these windows trade a little
+ * reply latency for RAM, and nothing else.
+ *
+ * Two windows because the two session kinds differ: a chat thread may get a
+ * human follow-up, a task thread never does — a scheduled run fires, does its
+ * turn, and no one replies to it.
+ */
+function idleWindowMs(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+export const IDLE_CHAT_SHUTDOWN_MS = idleWindowMs(
+  process.env.NANOCLAW_IDLE_CHAT_MS || envConfig.NANOCLAW_IDLE_CHAT_MS,
+  10 * 60 * 1000,
+);
+export const IDLE_TASK_SHUTDOWN_MS = idleWindowMs(
+  process.env.NANOCLAW_IDLE_TASK_MS || envConfig.NANOCLAW_IDLE_TASK_MS,
+  2 * 60 * 1000,
+);
 
 // Egress lockdown — force all agent traffic through the OneCLI gateway on a
 // no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.
