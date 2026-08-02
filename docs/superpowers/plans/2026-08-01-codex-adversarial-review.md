@@ -143,12 +143,12 @@ its array appears somewhere in the reply.
     {
       "id": "grain",
       "label": "Outer GROUP BY omits g.campaign_id, collapsing same-named campaigns",
-      "markers": ["group by", "campaign_id"]
+      "markers": ["g.campaign_id"]
     },
     {
       "id": "fanout",
       "label": "Dimension join before aggregation multiplies spend",
-      "markers": ["join", "campaign"]
+      "markers": ["duplicat"]
     }
   ]
 }
