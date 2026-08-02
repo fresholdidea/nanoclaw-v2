@@ -1,0 +1,21 @@
+{
+  "fixture": "reviewer-golden-case.md",
+  "minimumDetected": 2,
+  "expected": [
+    {
+      "id": "boundary",
+      "label": "End-date bound excludes the final day on the PostHog side",
+      "markers": ["end_date", "timestamp"]
+    },
+    {
+      "id": "grain",
+      "label": "Outer GROUP BY omits g.campaign_id, collapsing same-named campaigns",
+      "markers": ["group by", "campaign_id"]
+    },
+    {
+      "id": "fanout",
+      "label": "Dimension join before aggregation multiplies spend",
+      "markers": ["join", "campaign"]
+    }
+  ]
+}
