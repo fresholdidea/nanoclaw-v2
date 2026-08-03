@@ -106,15 +106,6 @@ async function main(): Promise<void> {
   ) as Manifest;
   const payload = readFileSync(path.join(FIXTURE_DIR, manifest.fixture), 'utf8');
 
-  // `ncl --json` wraps every payload in an envelope: { id, ok, data }.
-  // Verified 2026-08-01 — do not parse the output as a bare array.
-  const sessionEnv = JSON.parse(ncl(['sessions', 'list', '--json'])) as {
-    ok: boolean;
-    data: Array<{ id: string; agent_group_id: string }>;
-  };
-  const session = sessionEnv.data.find((s) => s.agent_group_id === GROUP_ID);
-  if (!session) throw new Error(`no session found for ${GROUP_ID}`);
-
   const startedAt = new Date().toISOString();
 
   const createEnv = JSON.parse(
@@ -139,18 +130,57 @@ async function main(): Promise<void> {
   try {
     ncl(['tasks', 'run', '--id', seriesId, '--group', GROUP_ID]);
 
+    // `ncl tasks create` + `ncl tasks run` cause the host to spin up a
+    // brand-new task session per task (thread_id `system:tasks:<seriesId>`);
+    // the reply lands there, never in the group's long-lived system session.
+    // Confirmed from host logs: the task session does not exist at `tasks
+    // create` time — it's created only when the task fires — so this poll
+    // must tolerate the session being absent for the first several seconds.
+    // Both polls below share the one overall deadline; no second timeout.
     const deadline = Date.now() + timeoutSec * 1000;
-    let reply: string | null = null;
+    const expectedThreadId = `system:tasks:${seriesId}`;
+
+    // `ncl --json` wraps every payload in an envelope: { id, ok, data }.
+    // Verified 2026-08-01 — do not parse the output as a bare array.
+    let taskSessionId: string | null = null;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 5000));
-      reply = latestReply(session.id, startedAt);
-      if (reply) break;
+      const sessionEnv = JSON.parse(ncl(['sessions', 'list', '--json'])) as {
+        ok: boolean;
+        data: Array<{ id: string; agent_group_id: string; thread_id: string | null }>;
+      };
+      const match = sessionEnv.data.find(
+        (s) => s.agent_group_id === GROUP_ID && s.thread_id === expectedThreadId,
+      );
+      if (match) {
+        taskSessionId = match.id;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 3000));
     }
 
-    if (!reply) {
-      console.error(`FAIL: no reply within ${timeoutSec}s.`);
-      console.error('Check: docker ps for the container, logs/nanoclaw.error.log,');
-      console.error(`and groups/reviewer-1/conversations/ for an archived error.`);
+    let reply: string | null = null;
+    if (taskSessionId) {
+      while (Date.now() < deadline) {
+        reply = latestReply(taskSessionId, startedAt);
+        if (reply) break;
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
+
+    if (!taskSessionId) {
+      console.error(
+        `FAIL: task session for ${expectedThreadId} never appeared within ${timeoutSec}s.`,
+      );
+      console.error(
+        'The task never fired — check scheduling / logs/nanoclaw.error.log for the host side.',
+      );
+      exitCode = 1;
+    } else if (!reply) {
+      console.error(
+        `FAIL: task session ${taskSessionId} appeared but produced no reply within ${timeoutSec}s.`,
+      );
+      console.error('The container likely ran and died silently. Check: docker ps,');
+      console.error(`logs/nanoclaw.error.log, and groups/reviewer-1/conversations/ for an archived error.`);
       exitCode = 1;
     } else {
       const result = scoreReview(reply, manifest);
