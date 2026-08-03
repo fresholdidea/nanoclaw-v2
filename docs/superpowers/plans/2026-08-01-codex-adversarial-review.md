@@ -419,6 +419,7 @@ async function main(): Promise<void> {
   const seriesId = createEnv.data.series_id ?? createEnv.data.id;
   if (!seriesId) throw new Error(`tasks create returned no series id`);
 
+  let exitCode = 0;
   try {
     ncl(['tasks', 'run', '--id', seriesId, '--group', GROUP_ID]);
 
@@ -434,15 +435,15 @@ async function main(): Promise<void> {
       console.error(`FAIL: no reply within ${timeoutSec}s.`);
       console.error('Check: docker ps for the container, logs/nanoclaw.error.log,');
       console.error(`and groups/reviewer-1/conversations/ for an archived error.`);
-      process.exit(1);
+      exitCode = 1;
+    } else {
+      const result = scoreReview(reply, manifest);
+      console.log(`detected: ${result.detected.join(', ') || '(none)'}`);
+      console.log(`missed:   ${result.missed.join(', ') || '(none)'}`);
+      if (result.blocked) console.log('reviewer replied BLOCKED');
+      console.log('\n--- reply ---\n' + reply);
+      exitCode = result.passed ? 0 : 1;
     }
-
-    const result = scoreReview(reply, manifest);
-    console.log(`detected: ${result.detected.join(', ') || '(none)'}`);
-    console.log(`missed:   ${result.missed.join(', ') || '(none)'}`);
-    if (result.blocked) console.log('reviewer replied BLOCKED');
-    console.log('\n--- reply ---\n' + reply);
-    process.exit(result.passed ? 0 : 1);
   } finally {
     if (!keepTask) {
       try {
@@ -452,6 +453,7 @@ async function main(): Promise<void> {
       }
     }
   }
+  process.exit(exitCode);
 }
 
 // Entrypoint guard — REQUIRED, not optional. `scripts/reviewer-smoke.test.ts`
