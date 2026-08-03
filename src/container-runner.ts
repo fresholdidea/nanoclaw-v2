@@ -56,6 +56,99 @@ import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
+const CODEX_AUTH_CONTAINER_PATH = '/home/node/.codex/auth.json';
+
+export interface CodexAuthOverride {
+  authFilePath: string;
+  cleanupDir: string;
+}
+
+/**
+ * Replace OneCLI's shared, read-only Codex auth stub with a private writable
+ * copy for this container. The original mount remains in the argument list;
+ * this override is appended later so Docker resolves the exact target to the
+ * private file. Only the gateway-provided placeholder is copied — credential
+ * contents are never inspected or logged here.
+ */
+export function prepareCodexAuthOverride(
+  args: string[],
+  provider: string,
+  privateAuthRoot: string,
+): CodexAuthOverride | null {
+  if (provider !== 'codex') return null;
+
+  const expectedSuffix = `:${CODEX_AUTH_CONTAINER_PATH}:ro`;
+  const targetMarker = `:${CODEX_AUTH_CONTAINER_PATH}`;
+  const matchingMounts: string[] = [];
+  let malformedExpectedMount = false;
+
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] !== '-v') continue;
+    const mountSpec = args[i + 1];
+    if (typeof mountSpec !== 'string') continue;
+    if (mountSpec.endsWith(expectedSuffix)) {
+      matchingMounts.push(mountSpec);
+    } else {
+      const targetIndex = mountSpec.lastIndexOf(targetMarker);
+      const remainder = targetIndex >= 0 ? mountSpec.slice(targetIndex + targetMarker.length) : null;
+      if (remainder === '' || (remainder?.startsWith(':') && !remainder.slice(1).includes(':'))) {
+        malformedExpectedMount = true;
+      }
+    }
+  }
+
+  if (malformedExpectedMount || matchingMounts.length !== 1) {
+    throw new Error(`Codex spawn requires exactly one read-only OneCLI stub mount at ${CODEX_AUTH_CONTAINER_PATH}`);
+  }
+
+  const sharedStubPath = matchingMounts[0].slice(0, -expectedSuffix.length);
+  if (!path.isAbsolute(sharedStubPath)) {
+    throw new Error(`Codex OneCLI stub mount at ${CODEX_AUTH_CONTAINER_PATH} has an invalid host path`);
+  }
+
+  let sharedStubStat: fs.Stats;
+  try {
+    sharedStubStat = fs.lstatSync(sharedStubPath);
+  } catch (err) {
+    throw new Error(`Codex OneCLI stub for ${CODEX_AUTH_CONTAINER_PATH} is unavailable`, { cause: err });
+  }
+  if (!sharedStubStat.isFile() || sharedStubStat.isSymbolicLink()) {
+    throw new Error(`Codex OneCLI stub for ${CODEX_AUTH_CONTAINER_PATH} is not a regular file`);
+  }
+
+  let cleanupDir: string | undefined;
+  try {
+    fs.mkdirSync(privateAuthRoot, { recursive: true, mode: 0o700 });
+    fs.chmodSync(privateAuthRoot, 0o700);
+    cleanupDir = fs.mkdtempSync(path.join(privateAuthRoot, 'container-'));
+    fs.chmodSync(cleanupDir, 0o700);
+
+    const authFilePath = path.join(cleanupDir, 'auth.json');
+    fs.copyFileSync(sharedStubPath, authFilePath, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(authFilePath, 0o600);
+
+    // OneCLI's shared :ro mount stays unchanged. This per-container mount is
+    // deliberately appended after it so Docker's final exact-target mount wins.
+    args.push('-v', `${authFilePath}:${CODEX_AUTH_CONTAINER_PATH}:rw`);
+    return { authFilePath, cleanupDir };
+  } catch (err) {
+    if (cleanupDir) fs.rmSync(cleanupDir, { recursive: true, force: true });
+    throw new Error(`Could not prepare private writable Codex auth file at ${CODEX_AUTH_CONTAINER_PATH}`, {
+      cause: err,
+    });
+  }
+}
+
+function cleanupPrivateMountDirs(paths: string[]): void {
+  for (const privateDir of paths) {
+    try {
+      fs.rmSync(privateDir, { recursive: true, force: true });
+    } catch (err) {
+      log.warn('Could not clean up private container mount directory', { privateDir, err });
+    }
+  }
+}
+
 /**
  * Active containers tracked by session ID.
  *
@@ -160,7 +253,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(
+  const { args, cleanupPaths } = await buildContainerArgs(
     mounts,
     containerName,
     agentGroup,
@@ -176,9 +269,14 @@ async function spawnContainer(session: Session): Promise<void> {
   // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
   // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
   // immediate kill before the new container touches the file itself.
-  fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
-
-  const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let container: ChildProcess;
+  try {
+    fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
+    container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (err) {
+    cleanupPrivateMountDirs(cleanupPaths);
+    throw err;
+  }
 
   activeContainers.set(session.id, { process: container, containerName });
   markContainerRunning(session.id);
@@ -208,6 +306,7 @@ async function spawnContainer(session: Session): Promise<void> {
     // Read intent before dropping the entry — killContainer records it there.
     const deliberate = activeContainers.get(session.id)?.deliberate === true;
     activeContainers.delete(session.id);
+    cleanupPrivateMountDirs(cleanupPaths);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     // code null = killed by signal (normal shutdown path), not a boot failure.
@@ -504,11 +603,12 @@ async function buildContainerArgs(
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-  _provider: string,
+  provider: string,
   providerContributions: ProviderContainerContribution[],
   agentIdentifier?: string,
-): Promise<string[]> {
+): Promise<{ args: string[]; cleanupPaths: string[] }> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  const cleanupPaths: string[] = [];
 
   // Per-container resource caps (opt-in; empty = unbounded, today's behavior).
   // Only --memory is set. Whether that's a hard cap depends on the host having no
@@ -566,18 +666,34 @@ async function buildContainerArgs(
   // any credential stubs the gateway serves (e.g. a sentinel auth file).
   // Runs AFTER the volume mounts so a stub nested inside one of our mounts
   // (a parent dir mounted RW above it) lands later in the args and isn't
-  // shadowed by it.
+  // shadowed by it. Codex then gets one final exact-target writable override,
+  // prepared from that gateway stub below.
   try {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
     }
     const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
     if (onecliApplied) {
+      const authOverride = prepareCodexAuthOverride(
+        args,
+        provider,
+        path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.codex-auth-containers'),
+      );
+      if (authOverride) cleanupPaths.push(authOverride.cleanupDir);
       log.info('OneCLI gateway applied', { containerName });
     } else {
+      if (provider === 'codex') {
+        throw new Error('Codex spawn requires OneCLI container configuration and an auth stub');
+      }
       log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
     }
   } catch (err) {
+    cleanupPrivateMountDirs(cleanupPaths);
+    if (provider === 'codex') {
+      throw new Error('Codex container spawn aborted because writable OneCLI auth could not be prepared', {
+        cause: err,
+      });
+    }
     log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
   }
 
@@ -590,7 +706,7 @@ async function buildContainerArgs(
 
   args.push('-c', 'exec bun run /app/src/index.ts');
 
-  return args;
+  return { args, cleanupPaths };
 }
 
 const execAsync = promisify(exec);

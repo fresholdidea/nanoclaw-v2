@@ -599,10 +599,11 @@ What each rules in or out:
   `pnpm exec tsx scripts/q.ts data/v2.db "SELECT image_tag FROM container_configs WHERE agent_group_id='ag-1779729652625-n3m1xl'"`.
 - `Read-only file system (os error 30)` in the newest conversation archive
   confirms the original fault. The write is **not** to `.codex-shared` — that is
-  mounted `readonly: false` at [src/providers/codex.ts:69](../../../src/providers/codex.ts)
-  and `config.toml` was written successfully at the exact failure timestamp.
-  Look instead at paths the container mounts read-only: `/app`,
-  `/workspace/agent/AGENTS.md`, `/home/node/.agents`.
+  mounted `readonly: false` at [src/providers/codex.ts:73](../../../src/providers/codex.ts)
+  and `config.toml` was written successfully at the exact failure timestamp —
+  but OneCLI overlays `/home/node/.codex/auth.json` with a nested `:ro` bind.
+  The 401 → successful OAuth refresh → auth-recovery EROFS sequence identifies
+  that exact nested auth-file mount as the failing write target.
 - A `401` or a model-availability error is an auth or version problem, not a
   filesystem one. Check `onecli agents list` for the reviewer's secret mode and
   `codex --version` inside the image.
@@ -620,6 +621,17 @@ back for a follow-up plan.
 git add docs/superpowers/2026-08-01-reviewer-1-reliability-findings.md
 git commit -m "docs(reviewer): record reliability findings from baseline smoke run"
 ```
+
+---
+
+### Task 3A: Fix Codex auth-refresh EROFS — reliability gate prerequisite
+
+Task 3A supersedes the earlier assumption that the EROFS fix was out of scope.
+Keep OneCLI's shared credential stub read-only; on every Codex spawn, seed a
+private per-container `0600` file from that exact stub and append a writable
+mount over `/home/node/.codex/auth.json`. Codex must fail closed if the expected
+stub or private location cannot be prepared. Do not begin prompt or evaluator
+changes until this fix is reviewed and the controller reruns the live gate.
 
 ---
 
