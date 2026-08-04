@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { applyOneCLIContainerConfigWithCodexAuth, prepareCodexAuthOverride } from './container-runner.js';
 
 const CODEX_AUTH_TARGET = '/home/node/.codex/auth.json';
+const CODEX_AUTH_STAGING_TARGET = '/tmp/onecli-codex-auth-stub.json';
 const OTHER_AUTH_TARGET = '/home/node/.config/example/auth.json';
 const ONECLI_ARGS_START = 1;
 const testRoots: string[] = [];
@@ -29,6 +30,19 @@ function rwOverrideSpec(args: string[]): string {
   return spec;
 }
 
+function volumeSpecsForTarget(args: string[], target: string): string[] {
+  const targetMarker = `:${target}`;
+  const specs: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] !== '-v' || typeof args[i + 1] !== 'string') continue;
+    const spec = args[i + 1];
+    const targetIndex = spec.lastIndexOf(targetMarker);
+    const remainder = targetIndex >= 0 ? spec.slice(targetIndex + targetMarker.length) : null;
+    if (remainder === '' || (remainder?.startsWith(':') && !remainder.slice(1).includes(':'))) specs.push(spec);
+  }
+  return specs;
+}
+
 afterEach(() => {
   for (const root of testRoots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
@@ -46,8 +60,13 @@ describe('prepareCodexAuthOverride', () => {
 
     expect(result).not.toBeNull();
     expect(fs.readFileSync(result!.authFilePath, 'utf8')).toBe(fs.readFileSync(sharedStub, 'utf8'));
-    expect(args).toContain(originalMount);
+    expect(args).not.toContain(originalMount);
+    expect(args).toContain(`${sharedStub}:${CODEX_AUTH_STAGING_TARGET}:ro`);
     expect(rwOverrideSpec(args)).toBe(`${result!.authFilePath}:${CODEX_AUTH_TARGET}:rw`);
+    expect(volumeSpecsForTarget(args, CODEX_AUTH_TARGET)).toEqual([`${result!.authFilePath}:${CODEX_AUTH_TARGET}:rw`]);
+    expect(volumeSpecsForTarget(args, CODEX_AUTH_STAGING_TARGET)).toEqual([
+      `${sharedStub}:${CODEX_AUTH_STAGING_TARGET}:ro`,
+    ]);
   });
 
   it('leaves non-Codex providers unchanged', () => {
@@ -142,7 +161,33 @@ describe('prepareCodexAuthOverride', () => {
 
     prepareCodexAuthOverride(args, 'codex', path.join(root, 'private'), ONECLI_ARGS_START);
 
-    expect(args.indexOf(rwOverrideSpec(args))).toBeGreaterThan(args.indexOf(readOnlyMount));
+    const stagingMount = `${sharedStub}:${CODEX_AUTH_STAGING_TARGET}:ro`;
+    expect(args).not.toContain(readOnlyMount);
+    expect(args.indexOf(rwOverrideSpec(args))).toBeGreaterThan(args.indexOf(stagingMount));
+  });
+
+  it('emits production Docker args with one exact auth target and a distinct read-only staging target', async () => {
+    const root = makeTestRoot();
+    const sharedStub = writeStub(root);
+    const args = ['run', '--rm'];
+
+    const result = await applyOneCLIContainerConfigWithCodexAuth(
+      args,
+      'codex',
+      path.join(root, 'private'),
+      async () => {
+        args.push('-v', `${sharedStub}:${CODEX_AUTH_TARGET}:ro`);
+        return true;
+      },
+    );
+
+    expect(volumeSpecsForTarget(args, CODEX_AUTH_TARGET)).toEqual([
+      `${result.authOverride!.authFilePath}:${CODEX_AUTH_TARGET}:rw`,
+    ]);
+    expect(volumeSpecsForTarget(args, CODEX_AUTH_STAGING_TARGET)).toEqual([
+      `${sharedStub}:${CODEX_AUTH_STAGING_TARGET}:ro`,
+    ]);
+    expect(fs.statSync(result.authOverride!.authFilePath).mode & 0o777).toBe(0o600);
   });
 
   it('rejects an exact-target mount that existed before OneCLI applied its config', async () => {

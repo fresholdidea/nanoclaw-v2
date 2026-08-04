@@ -31,10 +31,10 @@ describe('resolveProviderName', () => {
 describe('buildContainerArgs ordering invariant (structural)', () => {
   // The OneCLI gateway apply (SDK applyContainerConfig) appends credential-stub
   // mounts — e.g. the codex auth.json sentinel nested INSIDE our RW
-  // /home/node/.codex mount. Docker applies binds in argument order, so that
-  // stub (and the private writable Codex override derived from it) must land
-  // AFTER the parent mount or the parent shadows auth and the agent silently
-  // degrades to loginless auth. Driving the real
+  // /home/node/.codex mount. The runner retargets that shared source to a
+  // distinct RO staging path and appends the private writable auth mount.
+  // OneCLI must still run AFTER the parent mount so the private exact-target
+  // bind lands after it and isn't shadowed. Driving the real
   // buildContainerArgs needs a live gateway + container runtime, so this
   // guards the invariant structurally: the gateway apply must appear after
   // the volume-mounts loop in the source.

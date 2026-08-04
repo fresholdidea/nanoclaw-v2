@@ -57,6 +57,7 @@ import type { AgentGroup, Session } from './types.js';
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 const CODEX_AUTH_CONTAINER_PATH = '/home/node/.codex/auth.json';
+const CODEX_AUTH_STAGING_CONTAINER_PATH = '/tmp/onecli-codex-auth-stub.json';
 
 export interface CodexAuthOverride {
   authFilePath: string;
@@ -92,11 +93,11 @@ async function withOneCLIApplyLock<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Replace OneCLI's shared, read-only Codex auth stub with a private writable
- * copy for this container. The original mount remains in the argument list;
- * this override is appended later so Docker resolves the exact target to the
- * private file. Only the gateway-provided placeholder is copied — credential
- * contents are never inspected or logged here.
+ * Replace OneCLI's shared, read-only Codex auth target with a private writable
+ * copy for this container. The shared source remains mounted read-only at a
+ * distinct staging path, while the private file becomes the sole mount at the
+ * exact Codex auth target. Only the gateway-provided placeholder is copied —
+ * credential contents are never inspected or logged here.
  */
 export function prepareCodexAuthOverride(
   args: string[],
@@ -112,7 +113,7 @@ export function prepareCodexAuthOverride(
 
   const expectedSuffix = `:${CODEX_AUTH_CONTAINER_PATH}:ro`;
   const targetMarker = `:${CODEX_AUTH_CONTAINER_PATH}`;
-  const matchingMounts: string[] = [];
+  const matchingMounts: Array<{ specIndex: number; mountSpec: string }> = [];
   let malformedExpectedMount = false;
   let conflictingEarlierMount = false;
 
@@ -128,7 +129,7 @@ export function prepareCodexAuthOverride(
     if (i < onecliArgsStart) {
       conflictingEarlierMount = true;
     } else if (mountSpec.endsWith(expectedSuffix)) {
-      matchingMounts.push(mountSpec);
+      matchingMounts.push({ specIndex: i + 1, mountSpec });
     } else {
       malformedExpectedMount = true;
     }
@@ -141,7 +142,8 @@ export function prepareCodexAuthOverride(
     throw new Error(`Codex spawn requires exactly one read-only OneCLI stub mount at ${CODEX_AUTH_CONTAINER_PATH}`);
   }
 
-  const sharedStubPath = matchingMounts[0].slice(0, -expectedSuffix.length);
+  const onecliMount = matchingMounts[0];
+  const sharedStubPath = onecliMount.mountSpec.slice(0, -expectedSuffix.length);
   if (!path.isAbsolute(sharedStubPath)) {
     throw new Error(`Codex OneCLI stub mount at ${CODEX_AUTH_CONTAINER_PATH} has an invalid host path`);
   }
@@ -167,8 +169,10 @@ export function prepareCodexAuthOverride(
     fs.copyFileSync(sharedStubPath, authFilePath, fs.constants.COPYFILE_EXCL);
     fs.chmodSync(authFilePath, 0o600);
 
-    // OneCLI's shared :ro mount stays unchanged. This per-container mount is
-    // deliberately appended after it so Docker's final exact-target mount wins.
+    // Docker rejects duplicate destinations even when a later mount would win.
+    // Keep OneCLI's shared source mounted :ro, but retarget it away from Codex's
+    // auth path before appending the sole exact-target private :rw mount.
+    args[onecliMount.specIndex] = `${sharedStubPath}:${CODEX_AUTH_STAGING_CONTAINER_PATH}:ro`;
     args.push('-v', `${authFilePath}:${CODEX_AUTH_CONTAINER_PATH}:rw`);
     return { authFilePath, cleanupDir };
   } catch (err) {

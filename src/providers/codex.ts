@@ -41,10 +41,12 @@ registerProviderContainerConfig(
     // Per-group codex state (config.toml, thread metadata).
     const codexDir = path.join(DATA_DIR, 'v2-sessions', ctx.agentGroupId, '.codex-shared');
     fs.mkdirSync(codexDir, { recursive: true });
-    // OneCLI first bind-mounts its shared auth stub at ~/.codex/auth.json,
-    // nested inside this dir mount. container-runner then appends a private,
-    // writable per-container copy at that exact target so Codex can persist a
-    // gateway-rewritten refresh response without mutating the shared stub.
+    // OneCLI contributes its shared auth stub for ~/.codex/auth.json.
+    // container-runner validates that exact contribution, retargets the shared
+    // source read-only to a staging path, then mounts a private writable
+    // per-container copy at auth.json so Codex can persist a gateway-rewritten
+    // refresh response without mutating the shared stub or giving Docker a
+    // duplicate destination.
     // Docker on macOS still requires the nested mountpoint to exist inside the
     // virtiofs parent (otherwise runc exits 125), so create and harden it on
     // every spawn. The 'a' flag never truncates an existing mountpoint file.
