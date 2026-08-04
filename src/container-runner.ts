@@ -63,6 +63,34 @@ export interface CodexAuthOverride {
   cleanupDir: string;
 }
 
+export interface AppliedOneCLIContainerConfig {
+  applied: boolean;
+  authOverride: CodexAuthOverride | null;
+}
+
+type ApplyOneCLIContainerConfig = () => Promise<boolean>;
+
+// The OneCLI SDK writes credential stubs to shared basename-derived paths.
+// Serialize every apply (not only Codex applies) until a Codex caller has made
+// its private copy, so another provider cannot overwrite the shared source in
+// the gap between SDK return and copy.
+let onecliApplyTail: Promise<void> = Promise.resolve();
+
+async function withOneCLIApplyLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = onecliApplyTail;
+  let release!: () => void;
+  onecliApplyTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
 /**
  * Replace OneCLI's shared, read-only Codex auth stub with a private writable
  * copy for this container. The original mount remains in the argument list;
@@ -74,29 +102,41 @@ export function prepareCodexAuthOverride(
   args: string[],
   provider: string,
   privateAuthRoot: string,
+  onecliArgsStart: number,
 ): CodexAuthOverride | null {
   if (provider !== 'codex') return null;
+
+  if (!Number.isInteger(onecliArgsStart) || onecliArgsStart < 0 || onecliArgsStart > args.length) {
+    throw new Error('Codex spawn received an invalid OneCLI argument boundary');
+  }
 
   const expectedSuffix = `:${CODEX_AUTH_CONTAINER_PATH}:ro`;
   const targetMarker = `:${CODEX_AUTH_CONTAINER_PATH}`;
   const matchingMounts: string[] = [];
   let malformedExpectedMount = false;
+  let conflictingEarlierMount = false;
 
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] !== '-v') continue;
     const mountSpec = args[i + 1];
     if (typeof mountSpec !== 'string') continue;
-    if (mountSpec.endsWith(expectedSuffix)) {
+    const targetIndex = mountSpec.lastIndexOf(targetMarker);
+    const remainder = targetIndex >= 0 ? mountSpec.slice(targetIndex + targetMarker.length) : null;
+    const isExactTarget = remainder === '' || (remainder?.startsWith(':') && !remainder.slice(1).includes(':'));
+    if (!isExactTarget) continue;
+
+    if (i < onecliArgsStart) {
+      conflictingEarlierMount = true;
+    } else if (mountSpec.endsWith(expectedSuffix)) {
       matchingMounts.push(mountSpec);
     } else {
-      const targetIndex = mountSpec.lastIndexOf(targetMarker);
-      const remainder = targetIndex >= 0 ? mountSpec.slice(targetIndex + targetMarker.length) : null;
-      if (remainder === '' || (remainder?.startsWith(':') && !remainder.slice(1).includes(':'))) {
-        malformedExpectedMount = true;
-      }
+      malformedExpectedMount = true;
     }
   }
 
+  if (conflictingEarlierMount) {
+    throw new Error(`Codex auth target ${CODEX_AUTH_CONTAINER_PATH} was mounted before OneCLI applied its config`);
+  }
   if (malformedExpectedMount || matchingMounts.length !== 1) {
     throw new Error(`Codex spawn requires exactly one read-only OneCLI stub mount at ${CODEX_AUTH_CONTAINER_PATH}`);
   }
@@ -139,13 +179,30 @@ export function prepareCodexAuthOverride(
   }
 }
 
+/**
+ * Apply OneCLI's container configuration under the shared-stub lock. The args
+ * boundary is captured before the SDK call so Codex accepts only the exact auth
+ * mount introduced by that call, never an earlier lookalike mount.
+ */
+export async function applyOneCLIContainerConfigWithCodexAuth(
+  args: string[],
+  provider: string,
+  privateAuthRoot: string,
+  applyContainerConfig: ApplyOneCLIContainerConfig,
+): Promise<AppliedOneCLIContainerConfig> {
+  return withOneCLIApplyLock(async () => {
+    const onecliArgsStart = args.length;
+    const applied = await applyContainerConfig();
+    const authOverride = applied ? prepareCodexAuthOverride(args, provider, privateAuthRoot, onecliArgsStart) : null;
+    return { applied, authOverride };
+  });
+}
+
 function cleanupPrivateMountDirs(paths: string[]): void {
   for (const privateDir of paths) {
-    try {
-      fs.rmSync(privateDir, { recursive: true, force: true });
-    } catch (err) {
-      log.warn('Could not clean up private container mount directory', { privateDir, err });
-    }
+    fs.rm(privateDir, { recursive: true, force: true }, (err) => {
+      if (err) log.warn('Could not clean up private container mount directory', { privateDir, err });
+    });
   }
 }
 
@@ -672,13 +729,13 @@ async function buildContainerArgs(
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
     }
-    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    const { applied: onecliApplied, authOverride } = await applyOneCLIContainerConfigWithCodexAuth(
+      args,
+      provider,
+      path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.codex-auth-containers'),
+      () => onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier }),
+    );
     if (onecliApplied) {
-      const authOverride = prepareCodexAuthOverride(
-        args,
-        provider,
-        path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.codex-auth-containers'),
-      );
       if (authOverride) cleanupPaths.push(authOverride.cleanupDir);
       log.info('OneCLI gateway applied', { containerName });
     } else {
