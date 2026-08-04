@@ -5,17 +5,51 @@
     {
       "id": "boundary",
       "label": "End-date bound excludes the final day on the PostHog side",
-      "markers": ["end_date", "timestamp"]
+      "signalGroups": [
+        ["end_date", "end date", "upper bound", "final day"],
+        ["timestamp", "midnight", "inclusive", "calendar date"]
+      ],
+      "evidence": ["exclude", "drop", "miss", "midnight", "non-inclusive", "not inclusive"],
+      "denials": ["no boundary defect", "end date is correctly inclusive"]
     },
     {
       "id": "grain",
       "label": "Outer GROUP BY omits g.campaign_id, collapsing same-named campaigns",
-      "markers": ["g.campaign_id"]
+      "signalGroups": [
+        ["g.campaign_id", "g campaign id", "google-only", "google only", "campaign grouping"],
+        ["group by", "grouping", "row grain", "one row per campaign"]
+      ],
+      "evidence": ["collapse", "merge", "same name", "same-named", "null campaign", "distinct campaigns"],
+      "denials": ["no grain defect", "grouping preserves distinct campaigns"]
     },
     {
       "id": "fanout",
       "label": "Dimension join before aggregation multiplies spend",
-      "markers": ["duplicat"]
+      "signalGroups": [
+        [
+          "fan-out",
+          "fanout",
+          "scd join",
+          "scd row",
+          "dimension join",
+          "historical dimension row",
+          "join before aggregation",
+          "join inflation",
+          "join emits"
+        ]
+      ],
+      "evidence": [
+        "duplicat",
+        "multipl",
+        "inflation",
+        "inflate",
+        "two copies",
+        "twice",
+        "doubl",
+        "double count",
+        "overcount"
+      ],
+      "denials": ["no fanout", "no fan-out", "join cannot fan out"]
     }
   ]
 }

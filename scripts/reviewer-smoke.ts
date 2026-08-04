@@ -19,7 +19,12 @@ import { DATA_DIR } from '../src/config.js';
 export interface ExpectedFinding {
   id: string;
   label: string;
-  markers: string[];
+  /** Every group must contribute at least one semantic alternative. */
+  signalGroups: string[][];
+  /** At least one consequence/mechanism phrase must appear in the same block. */
+  evidence: string[];
+  /** Explicit denials that invalidate an otherwise matching block. */
+  denials?: string[];
 }
 
 export interface Manifest {
@@ -31,6 +36,7 @@ export interface Manifest {
 export interface SmokeResult {
   detected: string[];
   missed: string[];
+  contractFailures: string[];
   passed: boolean;
   blocked: boolean;
 }
@@ -44,21 +50,78 @@ function stripFences(text: string): string {
   return text.replace(/```[\s\S]*?```/g, ' ');
 }
 
+function normalize(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[_.\-/]+/g, ' ')
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Keep evidence tied to one finding paragraph/bullet instead of matching across the whole reply. */
+function reviewBlocks(text: string): string[] {
+  return stripFences(text)
+    .replace(/\r/g, '')
+    .split(/\n\s*\n|(?=\n\s*(?:[-*]|\d+[.)])\s+)/)
+    .map(normalize)
+    .filter(Boolean);
+}
+
+/** Score only FINDINGS when a structured report exists; QUESTIONS must never satisfy the golden defects. */
+function findingsScope(reply: string): string {
+  const findingsHeading = /(?:^|\n|OUTPUT:\s*)(?:#{1,6}\s*)?FINDINGS\s*:?(?:$|\n)/im.exec(reply);
+  if (!findingsHeading || findingsHeading.index === undefined) return reply;
+
+  const bodyStart = findingsHeading.index + findingsHeading[0].length;
+  const remainder = reply.slice(bodyStart);
+  const questionsHeading = /(?:^|\n)(?:#{1,6}\s*)?QUESTIONS\s*:?(?:$|\n)/im.exec(remainder);
+  return questionsHeading?.index === undefined ? remainder : remainder.slice(0, questionsHeading.index);
+}
+
+function matchesFinding(block: string, finding: ExpectedFinding): boolean {
+  const denied = (finding.denials ?? []).some((phrase) => block.includes(normalize(phrase)));
+  if (denied) return false;
+
+  const hasSignals = finding.signalGroups.every((group) =>
+    group.some((phrase) => block.includes(normalize(phrase))),
+  );
+  const hasEvidence = finding.evidence.some((phrase) => block.includes(normalize(phrase)));
+  return hasSignals && hasEvidence;
+}
+
+function reportContractFailures(reply: string): string[] {
+  const failures: string[] = [];
+  const heading = (name: string): RegExp =>
+    new RegExp(`(?:^|\\n|OUTPUT:\\s*)(?:#{1,6}\\s*)?${name}\\s*:?(?:$|\\n)`, 'im');
+
+  if (!heading('FINDINGS').test(reply)) failures.push('missing FINDINGS section');
+  if (!heading('QUESTIONS').test(reply)) failures.push('missing QUESTIONS section');
+  if (!/DONE:\s*reviewer-1\s*\|\s*OUTPUT:/i.test(reply)) failures.push('missing DONE envelope');
+  if (/(?:^|\n)\s*(?:#{1,6}\s*)?(?:STRENGTHS|PRAISE)\s*:?(?:$|\n)/im.test(reply)) {
+    failures.push('forbidden praise/strengths section');
+  }
+  return failures;
+}
+
 export function scoreReview(reply: string, manifest: Manifest): SmokeResult {
   const blocked = /^\s*BLOCKED:\s*reviewer-1/im.test(reply);
-  const prose = stripFences(reply).toLowerCase();
+  const blocks = reviewBlocks(findingsScope(reply));
 
   const detected: string[] = [];
   const missed: string[] = [];
   for (const finding of manifest.expected) {
-    const hit = finding.markers.every((m) => prose.includes(m.toLowerCase()));
+    const hit = blocks.some((block) => matchesFinding(block, finding));
     (hit ? detected : missed).push(finding.id);
   }
+
+  const contractFailures = blocked ? [] : reportContractFailures(reply);
 
   return {
     detected,
     missed,
-    passed: !blocked && detected.length >= manifest.minimumDetected,
+    contractFailures,
+    passed: !blocked && contractFailures.length === 0 && detected.length >= manifest.minimumDetected,
     blocked,
   };
 }
@@ -77,22 +140,35 @@ function sessionDir(sessionId: string): string {
   return path.join(DATA_DIR, 'v2-sessions', GROUP_ID, sessionId);
 }
 
-/** Newest messages_out body written after `sinceIso`, or null. */
-function latestReply(sessionId: string, sinceIso: string): string | null {
-  const dbPath = path.join(sessionDir(sessionId), 'outbound.db');
+export function parseChatContent(content: string): string {
+  try {
+    const parsed = JSON.parse(content) as { text?: unknown };
+    if (typeof parsed.text === 'string') return parsed.text;
+  } catch {
+    // Legacy/plain-text chat rows are already the reply body.
+  }
+  return content;
+}
+
+/** Newest chat reply written after `sinceIso`, ignoring system actions and task logs. */
+export function latestChatReply(dbPath: string, sinceIso: string): string | null {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     const row = db
       .prepare(
         `SELECT content FROM messages_out
-          WHERE datetime(timestamp) > datetime(?)
+          WHERE kind = 'chat' AND datetime(timestamp) > datetime(?)
           ORDER BY seq DESC LIMIT 1`,
       )
       .get(sinceIso) as { content: string } | undefined;
-    return row?.content ?? null;
+    return row ? parseChatContent(row.content) : null;
   } finally {
     db.close();
   }
+}
+
+function latestReply(sessionId: string, sinceIso: string): string | null {
+  return latestChatReply(path.join(sessionDir(sessionId), 'outbound.db'), sinceIso);
 }
 
 async function main(): Promise<void> {
@@ -186,6 +262,9 @@ async function main(): Promise<void> {
       const result = scoreReview(reply, manifest);
       console.log(`detected: ${result.detected.join(', ') || '(none)'}`);
       console.log(`missed:   ${result.missed.join(', ') || '(none)'}`);
+      console.log(
+        `contract: ${result.contractFailures.length === 0 ? 'PASS' : `FAIL — ${result.contractFailures.join('; ')}`}`,
+      );
       if (result.blocked) console.log('reviewer replied BLOCKED');
       console.log('\n--- reply ---\n' + reply);
       exitCode = result.passed ? 0 : 1;
