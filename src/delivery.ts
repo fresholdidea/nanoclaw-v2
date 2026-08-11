@@ -27,6 +27,7 @@ import {
   markDeliveryFailed,
   migrateDeliveredTable,
 } from './db/session-db.js';
+import { isAmbiguousDeliveryError } from './delivery-ambiguity.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
 import { isUnguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
@@ -200,21 +201,26 @@ async function drainSession(session: Session): Promise<void> {
     migrateDeliveredTable(inDb);
 
     for (const msg of undelivered) {
+      let platformMsgId: string | null | undefined;
       try {
-        const platformMsgId = await deliverMessage(msg, session, inDb);
-        markDelivered(inDb, msg.id, platformMsgId ?? null);
-        deliveryAttempts.delete(msg.id);
-
-        // Pause the typing indicator after a real user-facing message
-        // lands on the user's screen, so the client has time to visually
-        // clear the indicator before the next heartbeat tick brings it
-        // back. Skip the pause for internal traffic (system actions,
-        // agent-to-agent routing) — the user doesn't see those and
-        // shouldn't get a gap in their typing indicator for them.
-        if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
-          pauseTypingRefreshAfterDelivery(session.id);
-        }
+        platformMsgId = await deliverMessage(msg, session, inDb);
       } catch (err) {
+        // A transport failure with no usable response leaves it unknown
+        // whether the platform already posted the message. Retrying would
+        // duplicate it on the user's screen, so record it as delivered and
+        // move on — see delivery-ambiguity.ts.
+        if (isAmbiguousDeliveryError(err)) {
+          log.warn('Message delivery outcome unknown, not retrying to avoid a duplicate', {
+            messageId: msg.id,
+            sessionId: session.id,
+            channelType: msg.channel_type,
+            err,
+          });
+          markDelivered(inDb, msg.id, null);
+          deliveryAttempts.delete(msg.id);
+          continue;
+        }
+
         const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
         deliveryAttempts.set(msg.id, attempts);
         if (attempts >= MAX_DELIVERY_ATTEMPTS) {
@@ -235,6 +241,34 @@ async function drainSession(session: Session): Promise<void> {
             err,
           });
         }
+        continue;
+      }
+
+      // The send succeeded. Everything below is bookkeeping — a failure here
+      // must never put the message back in the retry queue, because that
+      // would re-send something the user has already seen.
+      try {
+        markDelivered(inDb, msg.id, platformMsgId ?? null);
+        deliveryAttempts.delete(msg.id);
+
+        // Pause the typing indicator after a real user-facing message
+        // lands on the user's screen, so the client has time to visually
+        // clear the indicator before the next heartbeat tick brings it
+        // back. Skip the pause for internal traffic (system actions,
+        // agent-to-agent routing) — the user doesn't see those and
+        // shouldn't get a gap in their typing indicator for them.
+        if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+          pauseTypingRefreshAfterDelivery(session.id);
+        }
+      } catch (err) {
+        // Typically inbound.db being unwritable. The message is already on
+        // the user's screen; log loudly and leave it. It may be re-sent once
+        // if the DB write never lands, but that beats a tight resend loop.
+        log.error('Message delivered but bookkeeping failed', {
+          messageId: msg.id,
+          sessionId: session.id,
+          err,
+        });
       }
     }
   } finally {

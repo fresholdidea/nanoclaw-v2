@@ -156,6 +156,75 @@ describe('deliverSessionMessages — concurrent invocations', () => {
   });
 });
 
+describe('deliverSessionMessages — ambiguous transport failure', () => {
+  /** The NetworkError @chat-adapter/telegram raises when fetch itself throws. */
+  function telegramFetchFailure(): Error {
+    const cause = new Error('connect ECONNRESET') as Error & { code: string };
+    cause.code = 'ECONNRESET';
+    const err = new Error('Network error calling Telegram sendMessage') as Error & {
+      code: string;
+      originalError: Error;
+    };
+    err.name = 'NetworkError';
+    err.code = 'NETWORK_ERROR';
+    err.originalError = cause;
+    return err;
+  }
+
+  it('does not re-send when the response was lost — Telegram likely posted it already', async () => {
+    // Regression: the retry loop treated a lost response as a failed send and
+    // re-posted, so the user saw the same reply two or three times.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-ambiguous');
+
+    let callCount = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        callCount++;
+        throw telegramFetchFailure();
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(1);
+
+    // Subsequent polls must leave it alone rather than posting a duplicate.
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(1);
+
+    const inDb = openInboundDb('ag-1', session.id);
+    const delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('out-ambiguous')).toBe(true);
+  });
+
+  it('still retries a definite rejection the platform answered with', async () => {
+    // A 4xx means the message did not land, so the retry path must survive.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-rejected');
+
+    let callCount = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        callCount++;
+        const err = new Error('Bad Request: group chat was upgraded to a supergroup chat') as Error & {
+          code: string;
+        };
+        err.name = 'ValidationError';
+        err.code = 'VALIDATION_ERROR';
+        throw err;
+      },
+    });
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(2);
+  });
+});
+
 describe('deliverSessionMessages — retry and permanent failure', () => {
   it('retries on adapter failure and marks failed after MAX_DELIVERY_ATTEMPTS (3)', async () => {
     seedAgentAndChannel();

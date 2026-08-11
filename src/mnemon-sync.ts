@@ -128,6 +128,14 @@ async function tick(): Promise<void> {
 export function startMnemonSync(intervalMs = 60_000): void {
   if (timer) return;
   const base = mnemonBase();
+  // Marker dropped when the authoritative store moved to the Mac Mini
+  // (2026-08-05): a machine-level launchd agent (mnemon-mini-sync) ships the
+  // queue and maintains the snapshot; replaying locally here would write to a
+  // dead store and race the shipper. Delete the marker to restore local mode.
+  if (fs.existsSync(path.join(base, '.remote-authoritative'))) {
+    log.info('mnemon-sync: store is remote-authoritative; local replay/snapshot disabled', { base });
+    return;
+  }
   if (!fs.existsSync(path.join(base, 'data', 'default', 'mnemon.db'))) {
     log.info('mnemon-sync: no mnemon store found, not starting', { base });
     return;

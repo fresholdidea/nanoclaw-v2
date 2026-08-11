@@ -1,5 +1,31 @@
 {
   "sandbox": {
     "enabled": false
+  },
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "S=\"$HOME/.claude/scripts/git-autosync.sh\"; [ -x \"$S\" ] && AUTOSYNC_GROUP_ROOT= AUTOSYNC_SCOPE=wip AUTOSYNC_PUSH=0 AUTOSYNC_GATE='npm run typecheck' \"$S\" || true",
+            "timeout": 300,
+            "statusMessage": "Typechecking and committing session work..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "S=\"$HOME/.claude/scripts/git-autosync.sh\"; [ -x \"$S\" ] && AUTOSYNC_GROUP_ROOT= AUTOSYNC_SCOPE=wip AUTOSYNC_PUSH=0 AUTOSYNC_GATE='npm run typecheck' \"$S\" || true",
+            "timeout": 300,
+            "async": true
+          }
+        ]
+      }
+    ]
   }
 }
