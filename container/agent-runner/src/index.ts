@@ -36,6 +36,8 @@ import type { McpServerConfig } from './providers/types.js';
 import './providers/index.js';
 import { type ProviderName } from './providers/factory.js';
 import { buildProvider } from './providers/build-provider.js';
+import { resolvePluginServer } from './plugin-mcp.js';
+import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -113,9 +115,17 @@ async function main(): Promise<void> {
   };
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    mcpServers[name] = expandMcpEnvPlaceholders(serverConfig);
-    const label = 'command' in serverConfig ? serverConfig.command : `${serverConfig.type} ${serverConfig.url}`;
-    log(`Additional MCP server: ${name} (${label})`);
+    // Plugin-shipped servers get ${PLUGIN_ROOT}/${PLUGIN_DATA} expansion and
+    // the two injected env vars; everything else passes through untouched.
+    // Plugin resolution runs FIRST: it substitutes real container paths for
+    // those two placeholders, which are not in process.env — expanding env
+    // first would blank them out.
+    mcpServers[name] = expandMcpEnvPlaceholders(resolvePluginServer(serverConfig));
+    log(
+      serverConfig.type === 'http'
+        ? `Additional MCP server: ${name} (HTTP)`
+        : `Additional MCP server: ${name} (${serverConfig.command})`,
+    );
   }
 
   const providerOptions = {

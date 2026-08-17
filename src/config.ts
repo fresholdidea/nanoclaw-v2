@@ -15,6 +15,7 @@ const envConfig = readEnvFile([
   'DEFAULT_AGENT_PROVIDER',
   'CONTAINER_CPU_LIMIT',
   'CONTAINER_MEMORY_LIMIT',
+  'CONTAINER_PIDS_LIMIT',
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
@@ -112,6 +113,13 @@ export const IDLE_TASK_SHUTDOWN_MS = idleWindowMs(
   process.env.NANOCLAW_IDLE_TASK_MS || envConfig.NANOCLAW_IDLE_TASK_MS,
   2 * 60 * 1000,
 );
+
+// Fork-bomb backstop. cgroups v2 counts THREADS, not processes, and Chromium is
+// thread-hungry — a browsing agent with several tabs open runs into the high
+// hundreds. Keep well above that; too low a cap kills the container mid-turn or
+// blocks it from spawning subprocesses, and neither is reported as a PID limit.
+// Empty = no cap.
+export const CONTAINER_PIDS_LIMIT = process.env.CONTAINER_PIDS_LIMIT ?? envConfig.CONTAINER_PIDS_LIMIT ?? '2048';
 
 // Egress lockdown — force all agent traffic through the OneCLI gateway on a
 // no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.

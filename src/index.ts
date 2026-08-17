@@ -15,17 +15,19 @@ import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runti
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { migrateLegacyTaskSeries } from './modules/scheduling/migrate-legacy.js';
+import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { readEnvFile } from './env.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
-// Response + shutdown registries live in response-registry.ts to break the
+// Response registry lives in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
-// effects, and the modules call registerResponseHandler/onShutdown at top
-// level — which would hit a TDZ error if the arrays lived here. Re-exported
-// here so existing callers see the same surface.
-import { getResponseHandlers, getShutdownCallbacks, type ResponsePayload } from './response-registry.js';
+// effects, and the modules call registerResponseHandler at top level — which
+// would hit a TDZ error if the array lived here.
+import { getResponseHandlers, type ResponsePayload } from './response-registry.js';
+
+const hostAbortController = new AbortController();
 
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
@@ -154,16 +156,20 @@ async function main(): Promise<void> {
   // createChannelDeliveryAdapter in channels/channel-registry.ts.
   setDeliveryAdapter(createChannelDeliveryAdapter());
 
-  // 5. Start delivery polls
+  // 5. Start registered host modules. Imports only registered callbacks; the
+  // actual work begins here, after DB + delivery are ready and before polls.
+  await startHostModules({ db, signal: hostAbortController.signal });
+
+  // 6. Start delivery polls
   startActiveDeliveryPoll();
   startSweepDeliveryPoll();
   log.info('Delivery polls started');
 
-  // 6. Start host sweep
+  // 7. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7. Dashboard (optional)
+  // 7a. Dashboard (optional)
   const dashboardEnv = readEnvFile(['DASHBOARD_SECRET', 'DASHBOARD_PORT']);
   const dashboardSecret = process.env.DASHBOARD_SECRET || dashboardEnv.DASHBOARD_SECRET;
   const dashboardPort = parseInt(process.env.DASHBOARD_PORT || dashboardEnv.DASHBOARD_PORT || '3100', 10);
@@ -198,13 +204,8 @@ async function main(): Promise<void> {
 /** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
-  for (const cb of getShutdownCallbacks()) {
-    try {
-      await cb();
-    } catch (err) {
-      log.error('Shutdown callback threw', { err });
-    }
-  }
+  // Dashboard and mnemon sync start after startHostModules(), so they stop
+  // first — same LIFO rule stopHostModules() applies to its own registrants.
   try {
     const { stopDashboardPusher } = await import('./dashboard-pusher.js');
     stopDashboardPusher();
@@ -217,6 +218,8 @@ async function shutdown(signal: string): Promise<void> {
   } catch {
     /* ignore if not started */
   }
+  hostAbortController.abort();
+  await stopHostModules();
   stopDeliveryPolls();
   stopHostSweep();
   await stopCliServer();

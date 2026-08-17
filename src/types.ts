@@ -29,10 +29,11 @@ export interface ContainerConfigRow {
   enable_opencode_tooling: number;
   /** JSON array of provider names, or NULL to derive from instance default. Added by migration 021. */
   provider_chain: string | null;
+  timezone: string | null; // IANA id; NULL = follow the install-global timezone
   updated_at: string;
 }
 
-export type UnknownSenderPolicy = 'strict' | 'request_approval' | 'public';
+export type UnknownSenderPolicy = 'strict' | 'request_approval' | 'decline_notify' | 'public';
 
 export interface MessagingGroup {
   id: string;
@@ -59,6 +60,13 @@ export interface MessagingGroup {
    * the column itself defaults to NULL in SQLite.
    */
   denied_at?: string | null;
+  /**
+   * When set, our own bot has LEFT the platform channel this row maps to
+   * (written by a channel membership module, migration 022) — the wiring
+   * survives, but delivery/typing should skip the row until the bot rejoins
+   * (which clears it). Optional on the TS type per the denied_at convention.
+   */
+  detached_at?: string | null;
   created_at: string;
 }
 
@@ -221,6 +229,8 @@ export interface PendingApproval {
   expires_at: string | null;
   status: 'pending' | 'approved' | 'rejected' | 'expired' | 'awaiting_reason';
   title: string;
+  /** Original approval-card body, retained when the card reaches a terminal state. */
+  question: string;
   options_json: string;
   /** When set, only this exact user may resolve the approval. */
   approver_user_id: string | null;
