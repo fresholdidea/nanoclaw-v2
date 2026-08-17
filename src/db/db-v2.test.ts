@@ -478,6 +478,9 @@ describe('container configs', () => {
       additional_mounts: '[]',
       cli_scope: 'global',
       timezone: null,
+      enable_agy_tooling: 0,
+      enable_opencode_tooling: 0,
+      provider_chain: null,
       updated_at: now(),
     });
     const row = getContainerConfig('ag-full');

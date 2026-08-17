@@ -37,7 +37,6 @@ import './providers/index.js';
 import { type ProviderName } from './providers/factory.js';
 import { buildProvider } from './providers/build-provider.js';
 import { resolvePluginServer } from './plugin-mcp.js';
-import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {

@@ -35,10 +35,20 @@ function decide(args: Omit<Parameters<typeof decideStuckAction>[0], 'idleMs' | '
   return decideStuckAction({ idleMs: IDLE_CHAT_SHUTDOWN_MS, hasDueWork: false, ...args });
 }
 
+/**
+ * Ceiling-focused variant with idle shutdown switched off. The ceiling cases
+ * park the heartbeat just inside/outside the 30-minute ceiling, which is far
+ * past the 10-minute idle window — without this they'd return kill-idle and
+ * stop testing the ceiling at all. Idle behavior has its own describe block.
+ */
+function decideCeiling(args: Omit<Parameters<typeof decideStuckAction>[0], 'idleMs' | 'hasDueWork'>) {
+  return decideStuckAction({ idleMs: Number.POSITIVE_INFINITY, hasDueWork: false, ...args });
+}
+
 describe('decideStuckAction', () => {
   it('returns ok when heartbeat is within the absolute ceiling', () => {
     expect(
-      decide({
+      decideCeiling({
         now: BASE,
         heartbeatMtimeMs: BASE - JUST_WITHIN_CEILING_MS,
         containerState: null,
@@ -76,7 +86,7 @@ describe('decideStuckAction', () => {
   });
 
   it('does not kill a spawn within the absolute ceiling when heartbeat is absent', () => {
-    const res = decide({
+    const res = decideCeiling({
       now: BASE,
       heartbeatMtimeMs: 0,
       containerStartedAtMs: BASE - JUST_WITHIN_CEILING_MS,
@@ -105,7 +115,7 @@ describe('decideStuckAction', () => {
   });
 
   it('prefers a heartbeat over the container spawn time', () => {
-    const res = decide({
+    const res = decideCeiling({
       now: BASE,
       heartbeatMtimeMs: BASE - JUST_WITHIN_CEILING_MS,
       containerStartedAtMs: BASE - JUST_OVER_CEILING_MS,
@@ -245,7 +255,7 @@ describe('decideStuckAction — idle shutdown', () => {
     // a scheduled task, so its window is much tighter.
     const heartbeatMtimeMs = BASE - IDLE_TASK_SHUTDOWN_MS - 1_000;
     expect(decide({ now: BASE, heartbeatMtimeMs, containerState: null, claims: [] }).action).toBe('ok');
-    const res = decide({
+    const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs,
       containerState: null,
@@ -269,7 +279,7 @@ describe('decideStuckAction — idle shutdown', () => {
   });
 
   it('does not kill as idle when work is due this tick', () => {
-    const res = decide({
+    const res = decideStuckAction({
       now: BASE,
       heartbeatMtimeMs: BASE - IDLE_CHAT_SHUTDOWN_MS - 60_000,
       containerState: null,

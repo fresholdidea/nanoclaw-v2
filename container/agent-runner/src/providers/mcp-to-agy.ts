@@ -34,10 +34,12 @@ export function mcpServersToAgyConfig(
         ...(cfg.headers ? { headers: cfg.headers } : {}),
       };
     } else {
+      // args/env are optional on the stdio config — default them here rather
+      // than pushing undefined into agy's required fields.
       out[name] = {
         command: cfg.command,
-        args: cfg.args,
-        ...(Object.keys(cfg.env).length > 0 ? { env: cfg.env } : {}),
+        args: cfg.args ?? [],
+        ...(cfg.env && Object.keys(cfg.env).length > 0 ? { env: cfg.env } : {}),
       };
     }
   }

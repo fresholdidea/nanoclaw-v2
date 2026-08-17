@@ -38,8 +38,10 @@ export function mcpServersToOpenCodeConfig(
     } else {
       out[name] = {
         type: 'local',
-        command: [cfg.command, ...cfg.args],
-        ...(Object.keys(cfg.env).length > 0 ? { environment: cfg.env } : {}),
+        // args/env are optional on the stdio config — default them here rather
+        // than spreading undefined into opencode's command array.
+        command: [cfg.command, ...(cfg.args ?? [])],
+        ...(cfg.env && Object.keys(cfg.env).length > 0 ? { environment: cfg.env } : {}),
         enabled: true,
       };
     }
