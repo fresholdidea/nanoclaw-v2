@@ -22,14 +22,11 @@ describe('container mnemon queue writer', () => {
   it('rejects unsupported remember flags instead of creating a replay file', () => {
     const queueDir = makeQueueDir();
 
-    const result = spawnSync(process.execPath, [
-      script,
-      queueDir,
-      'remember',
-      'an SEO research result',
-      '--category',
-      'context',
-    ], { encoding: 'utf8' });
+    const result = spawnSync(
+      process.execPath,
+      [script, queueDir, 'remember', 'an SEO research result', '--category', 'context'],
+      { encoding: 'utf8' },
+    );
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('unsupported flag: --category');
@@ -39,14 +36,11 @@ describe('container mnemon queue writer', () => {
   it('rejects invalid remember categories instead of creating a replay file', () => {
     const queueDir = makeQueueDir();
 
-    const result = spawnSync(process.execPath, [
-      script,
-      queueDir,
-      'remember',
-      'an agent-supervision lesson',
-      '--cat',
-      'methodology/agent-supervision',
-    ], { encoding: 'utf8' });
+    const result = spawnSync(
+      process.execPath,
+      [script, queueDir, 'remember', 'an agent-supervision lesson', '--cat', 'methodology/agent-supervision'],
+      { encoding: 'utf8' },
+    );
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('invalid category "methodology/agent-supervision"');
