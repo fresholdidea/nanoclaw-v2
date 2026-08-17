@@ -28,8 +28,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@chat-adapter/slack": "4.26.0",
-    "@chat-adapter/telegram": "4.26.0",
+    "@chat-adapter/slack": "4.29.0",
+    "@chat-adapter/telegram": "4.29.0",
     "@clack/core": "^1.2.0",
     "@clack/prompts": "^1.2.0",
     "@nanoco/nanoclaw-dashboard": "^0.3.0",
