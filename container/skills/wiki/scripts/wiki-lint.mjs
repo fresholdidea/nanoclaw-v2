@@ -68,7 +68,13 @@ function readFrontmatter(file) {
     if (/^sources:\s*/.test(line)) {
       inSources = true;
       const inline = line.replace(/^sources:\s*/, '').trim();
-      if (inline && inline !== '[]') sources.push(inline.replace(/^['"]|['"]$/g, ''));
+      if (inline && inline !== '[]') {
+        if (inline.startsWith('[')) {
+          for (const match of inline.matchAll(/['"]([^'"]+)['"]/g)) sources.push(match[1]);
+        } else {
+          sources.push(inline.replace(/^['"]|['"]$/g, ''));
+        }
+      }
       continue;
     }
     if (inSources && /^\s*-\s+/.test(line)) {
@@ -158,7 +164,9 @@ for (const file of activeFiles) {
     const sourceTarget = source.replace(/^\[\[|\]\]$/g, '');
     if (sourceTarget.startsWith('http')) continue;
     const resolved = resolveWikiTarget(sourceTarget, file);
-    if (!resolved.files.length) warnings.push(`${rel}: source does not resolve: ${source}`);
+    if (!resolved.files.length && !source.startsWith('[') && !source.includes('](') && !source.includes('*')) {
+      warnings.push(`${rel}: source does not resolve: ${source}`);
+    }
   }
   for (const target of linksIn(fm.text)) {
     if (target.startsWith('http')) continue;
@@ -181,7 +189,11 @@ if (fs.existsSync(indexFile)) {
     if (result.kind === 'direct' || result.kind === 'basename') {
       for (const destination of result.files) {
         const key = noteKey(vaultRel(destination));
-        if (key.startsWith('50-Wiki/')) indexKeys.add(key.replace(/^50-Wiki\//, ''));
+        if (key.startsWith('50-Wiki/')) {
+          const wikiKey = key.replace(/^50-Wiki\//, '');
+          indexKeys.add(wikiKey);
+          if (activeByKey.has(wikiKey)) inbound.set(wikiKey, (inbound.get(wikiKey) ?? 0) + 1);
+        }
       }
     }
   }

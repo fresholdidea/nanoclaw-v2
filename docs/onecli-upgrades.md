@@ -69,7 +69,7 @@ If the NanoClaw update itself is being rolled back, also pin `@onecli-sh/sdk` ba
 The `onecli` host CLI is pinned the same way, under `onecli-cli` in `versions.json`. Setup installs exactly that version by direct release download — it never resolves "latest". When an update moves this pin, replace the binary with the pinned release:
 
 ```bash
-onecli --version                                            # detect: what is installed
+onecli version                                              # detect: what is installed
 V=<onecli-cli pin from versions.json>
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')                 # darwin | linux
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')   # amd64 | arm64
@@ -77,7 +77,7 @@ curl -fsSL -o /tmp/onecli.tgz \
   "https://github.com/onecli/onecli-cli/releases/download/v${V}/onecli_${V}_${OS}_${ARCH}.tar.gz"
 tar -xzf /tmp/onecli.tgz -C /tmp
 install -m 0755 /tmp/onecli "$(command -v onecli || echo ~/.local/bin/onecli)"
-onecli --version                                            # verify: must match versions.json
+onecli version                                              # verify: must match versions.json
 ```
 
 To roll back, run the same block after reverting `versions.json` (or checking out the previous NanoClaw version). The CLI is stateless — vault data lives in the gateway, so swapping the binary in either direction loses nothing.

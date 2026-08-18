@@ -175,7 +175,11 @@ if (fs.existsSync(indexFile)) {
 
 const logFile = path.join(root, 'log.md');
 if (fs.existsSync(logFile)) {
-  const logEntry = `\n\n## [${date}] update | Wiki hygiene boundaries and backlog normalization\n\nMoved the Wiki role into provider-neutral NanoClaw instructions; preserved the legacy local instructions in migration staging. Added deterministic structural lint, converted the known unwritten methodology references to plain-text backlog candidates, made missing provenance explicit with \\`sources: []\\`, repaired one directory-level source link, and marked duplicate client/person briefs with canonical records.\n`;
+  const logEntry =
+    `\n\n## [${date}] update | Wiki hygiene boundaries and backlog normalization\n\n` +
+    'Moved the Wiki role into provider-neutral NanoClaw instructions; preserved the legacy local instructions in migration staging. ' +
+    'Added deterministic structural lint, converted the known unwritten methodology references to plain-text backlog candidates, ' +
+    'made missing provenance explicit with sources: [], repaired one directory-level source link, and marked duplicate client/person briefs with canonical records.\n';
   const log = fs.readFileSync(logFile, 'utf8');
   if (!log.includes('Wiki hygiene boundaries and backlog normalization')) fs.writeFileSync(logFile, `${log.trimEnd()}${logEntry}`);
 }
