@@ -1,94 +1,86 @@
 ---
 name: slack-formatting
-description: Format messages for Slack using mrkdwn syntax. Use when responding to Slack channels (folder starts with "slack_" or JID contains slack identifiers).
+description: Format replies for Slack. Slack renders standard markdown natively — write normal markdown, not legacy mrkdwn. Use when replying to a Slack destination (currently zed-dm-brad or nanoclaw).
 ---
 
-# Slack Message Formatting (mrkdwn)
+# Slack message formatting
 
-When responding to Slack channels, use Slack's mrkdwn syntax instead of standard Markdown.
+**Write standard markdown.** Slack renders it natively. The legacy mrkdwn dialect
+(`*bold*`, `<url|text>`) is wrong here and renders badly — see the bottom section.
 
-## How to detect Slack context
+## How to tell you are in Slack
 
-Check your group folder name or workspace path:
-- Folder starts with `slack_` (e.g., `slack_engineering`, `slack_general`)
-- Or check `/workspace/group/` path for `slack_` prefix
+You never see `channel_type` or `platform_id` — the formatter strips routing fields
+before messages reach you. The only signal is the `from="…"` attribute on the
+incoming message, which names the destination:
 
-## Formatting reference
+| `from="…"` | Where |
+|---|---|
+| `zed-dm-brad` | Slack DM with Brad |
+| `nanoclaw` | Slack `#nanoclaw` |
+| `telegram-mg-…` | Telegram — not Slack |
 
-### Text styles
+Those Slack names are install-specific. `ncl destinations list` shows the
+`channel_type` column if you need to confirm which destinations are Slack.
 
-| Style | Syntax | Example |
-|-------|--------|---------|
-| Bold | `*text*` | *bold text* |
-| Italic | `_text_` | _italic text_ |
-| Strikethrough | `~text~` | ~strikethrough~ |
-| Code (inline) | `` `code` `` | `inline code` |
-| Code block | ` ```code``` ` | Multi-line code |
+## Why standard markdown
 
-### Links and mentions
+Your reply travels as `{ markdown: … }` → the Slack adapter puts it in Slack's
+`markdown_text` field → Slack parses **standard markdown**. Write exactly what you
+would write anywhere else.
 
-```
-<https://example.com|Link text>     # Named link
-<https://example.com>                # Auto-linked URL
-<@U1234567890>                       # Mention user by ID
-<#C1234567890>                       # Mention channel by ID
-<!here>                              # @here
-<!channel>                           # @channel
-```
+Supported: `**bold**`, `*italic*` / `_italic_`, `~~strikethrough~~`,
+`[text](url)`, ordered lists (`1.`), unordered lists (`- `), headings (`#`…`######`),
+`` `inline code` ``, fenced code blocks with language hints, `> blockquotes`,
+`---` horizontal rules, tables, and task lists (`- [ ]` / `- [x]`).
 
-### Lists
+Three caveats:
 
-Slack supports simple bullet lists but NOT numbered lists:
+- **Nested lists are not supported** — flatten them, or use a heading per group.
+- **Images render as links.** `![alt](url)` degrades to `[alt](url)`. To actually
+  show an image, send it as a file instead of embedding a URL.
+- **Headings all render at the same size**, so heading level conveys structure, not
+  visual hierarchy. Don't rely on `#` vs `###` looking different.
 
-```
-• First item
-• Second item
-• Third item
-```
+## Slack-specific syntax (not markdown)
 
-Use `•` (bullet character) or `- ` or `* ` for bullets.
-
-### Block quotes
+These are Slack entity references and pass through the markdown untouched. They are
+the one place Slack's own syntax is still required:
 
 ```
-> This is a block quote
-> It can span multiple lines
+<@U0B02HS2Z7S>    mention a user — must be the member ID, not a display name
+<#C0BQZJN5BMJ>    link a channel — must be the channel ID
+<!here>           notify active members in the channel
+<!channel>        notify everyone in the channel
+:white_check_mark:  emoji shortcodes work normally
 ```
 
-### Emoji
+Use `<!here>` and `<!channel>` sparingly — they notify real people.
 
-Use standard emoji shortcodes: `:white_check_mark:`, `:x:`, `:rocket:`, `:tada:`
+## Not this skill: direct Web API posts
 
-## What NOT to use
+This skill covers replies in Slack conversations NanoClaw is wired to. Posting to a
+client workspace yourself via `chat.postMessage` with a `text` field is a different
+path with the *opposite* dialect — that one is mrkdwn. See `/slack-api`.
 
-- **NO** `##` headings (use `*Bold text*` for headers instead)
-- **NO** `**double asterisks**` for bold (use `*single asterisks*`)
-- **NO** `[text](url)` links (use `<url|text>` instead)
-- **NO** `1.` numbered lists (use bullets with numbers: `• 1. First`)
-- **NO** tables (use code blocks or plain text alignment)
-- **NO** `---` horizontal rules
+## Length limit
 
-## Example message
+Slack caps `markdown_text` at **12,000 characters**, and the Slack bridge does
+**not** auto-split long replies the way Telegram's does. A reply over the cap fails
+to send rather than truncating. Keep messages well under it; if you have more to
+say, send the long form as a file and summarize in the message.
 
-```
-*Daily Standup Summary*
+## Do not use legacy mrkdwn
 
-_March 21, 2026_
+Slack's older mrkdwn dialect actively breaks in this pipeline:
 
-• *Completed:* Fixed authentication bug in login flow
-• *In Progress:* Building new dashboard widgets
-• *Blocked:* Waiting on API access from DevOps
+| Don't write | Because | Write instead |
+|---|---|---|
+| `*bold*` | single asterisks mean *italic* in standard markdown | `**bold**` |
+| `<https://x.com\|text>` | renders as literal junk | `[text](https://x.com)` |
+| `~strike~` | needs doubled tildes | `~~strike~~` |
+| `• manual bullets` | markdown lists render properly | `- item` |
 
-> Next sync: Monday 10am
-
-:white_check_mark: All tests passing | <https://ci.example.com/builds/123|View Build>
-```
-
-## Quick rules
-
-1. Use `*bold*` not `**bold**`
-2. Use `<url|text>` not `[text](url)`
-3. Use `•` bullets, avoid numbered lists
-4. Use `:emoji:` shortcodes
-5. Quote blocks with `>`
-6. Skip headings — use bold text instead
+If you find yourself reaching for mrkdwn because a message "looked wrong in Slack,"
+the fix is almost never mrkdwn — check the length cap and the nested-list caveat
+above first.

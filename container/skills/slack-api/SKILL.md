@@ -55,7 +55,8 @@ Slack always returns `{"ok": true|false, ...}`. On `ok:false`, surface the `erro
 
 ## Message formatting
 
-When posting, use Slack mrkdwn — see `/slack-formatting` for the full reference. Quick rules:
+These rules apply to **this** skill only — direct `chat.postMessage` calls that pass
+a `text` field, which Slack renders as mrkdwn:
 
 - `*bold*` (single asterisks)
 - `_italic_` (underscores)
@@ -63,6 +64,12 @@ When posting, use Slack mrkdwn — see `/slack-formatting` for the full referenc
 - `:emoji:` shortcodes
 - `>` for block quotes
 - No `##` headings
+
+Do **not** apply these to ordinary replies in a Slack conversation NanoClaw is wired
+to. Those go out through the bridge as `markdown_text`, which renders *standard*
+markdown — the opposite dialect. See `/slack-formatting`, which covers that path.
+(If you pass `markdown_text` instead of `text` on a direct API call, follow
+`/slack-formatting` for that call too.)
 
 ## What this is not
 

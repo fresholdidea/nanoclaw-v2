@@ -17,14 +17,16 @@ Three layers:
 2. **Wiki** (`50-Wiki/`) — your domain. You create and maintain all pages here: summaries, entity pages, concept pages, comparisons, syntheses.
 3. **Schema** (this file) — your operating instructions.
 
+The Wiki is the durable knowledge corpus. NanoClaw memory is only operational state and routing pointers, and the Wiki group does not use Mnemon. Do not invoke Mnemon writes from this group or copy an entire Wiki page into another memory store.
+
 ## Page Types
 
 - **Source summaries** — one per ingested source. Key takeaways, relevance, links to entity/concept pages.
-- **Entity pages** — people, companies, tools, platforms. Cross-referenced.
+- **Entity briefs** — people, companies, tools, platforms. Cross-referenced, with a `canonical` frontmatter link when a record already exists elsewhere in the vault. Do not create a second mutable person or company record.
 - **Concept pages** — ideas, strategies, frameworks, patterns.
 - **Synthesis pages** — comparisons, analyses, or explorations that draw from multiple sources.
 
-All pages use Obsidian `[[wikilinks]]` for internal links. Include YAML frontmatter with `type` (wiki-summary, wiki-entity, wiki-concept, wiki-synthesis), `sources` (list of source files), and `updated` date.
+All pages use Obsidian `[[wikilinks]]` for internal links. Include YAML frontmatter with `type` (wiki-summary, wiki-entity, wiki-concept, wiki-synthesis), `sources` (list of source files), and `updated` date. A `sources: []` value is an explicit provenance gap, not permission to invent a source.
 
 ## Special Files
 
@@ -77,13 +79,18 @@ When the user asks a question:
 
 Periodic health check:
 
-1. Scan all wiki pages for:
+1. **Run the deterministic structural pass first:**
+   ```bash
+   node /app/skills/wiki/scripts/wiki-lint.mjs --root /workspace/extra/obsidian/50-Wiki
+   ```
+   Treat errors as blockers. The script checks frontmatter, index coverage, resolvable links, orphan pages, provenance fields, canonical entity links, and the maintenance backlog. It intentionally ignores historical prose in `log.md` when checking the link graph.
+2. **Scan all wiki pages for:**
    - Contradictions between pages
    - Orphan pages (no inbound links)
    - Stale content superseded by newer sources
    - Missing cross-references
    - Important concepts mentioned but lacking dedicated pages
    - Gaps — topics that should be covered based on the sources
-2. Report findings.
-3. Offer to fix issues.
-4. Append lint results to `log.md`.
+3. Report findings.
+4. Offer to fix issues. Unwritten methodology candidates belong in `backlog.md` as plain text until a source supports a page; do not leave speculative broken wikilinks in active pages.
+5. Append lint results to `log.md`.
