@@ -6,6 +6,7 @@
  * rest of the scheduling module.
  */
 import Database from 'better-sqlite3';
+import { spawn } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
@@ -163,6 +164,91 @@ describe('syncProcessingAcks — script-skip counter', () => {
 });
 
 describe('openOutboundDb read-only enforcement', () => {
+  it('recovers a hot DELETE journal before enforcing query-only access', async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const outDbPath = path.join(TEST_DIR, 'outbound.db');
+    ensureSchema(outDbPath, 'outbound');
+
+    const seedDb = new Database(outDbPath);
+    const seed = seedDb.prepare('INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES (?, ?, ?, ?, ?)');
+    seedDb.transaction(() => {
+      for (let i = 0; i < 64; i++) {
+        seed.run(
+          `baseline-${i}`,
+          i * 2 + 1,
+          new Date().toISOString(),
+          'chat',
+          JSON.stringify({ text: `committed-${i}`, padding: 'x'.repeat(8192) }),
+        );
+      }
+    })();
+    seedDb.close();
+
+    const childScript = String.raw`
+      const Database = require('better-sqlite3');
+      const db = new Database(process.argv[1]);
+      db.pragma('journal_mode = DELETE');
+      db.pragma('synchronous = FULL');
+      db.pragma('cache_size = 4');
+      db.exec('BEGIN IMMEDIATE');
+      db.prepare('UPDATE messages_out SET content = ?')
+        .run(JSON.stringify({ text: 'uncommitted', padding: 'y'.repeat(8192) }));
+      process.stdout.write('ready\n');
+      setInterval(() => {}, 1000);
+    `;
+    const child = spawn(process.execPath, ['--input-type=commonjs', '-e', childScript, outDbPath], {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`child did not create hot journal: ${stderr}`)), 5000);
+        child.once('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.stdout.once('data', (chunk) => {
+          clearTimeout(timer);
+          if (!String(chunk).includes('ready')) {
+            reject(new Error(`unexpected child output: ${String(chunk)} ${stderr}`));
+            return;
+          }
+          resolve();
+        });
+      });
+
+      expect(fs.existsSync(`${outDbPath}-journal`)).toBe(true);
+      child.kill('SIGKILL');
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+
+      const hostOutDb = openOutboundDb(outDbPath);
+      try {
+        const row = hostOutDb.prepare("SELECT content FROM messages_out WHERE id = 'baseline-0'").get() as {
+          content: string;
+        };
+        expect(JSON.parse(row.content)).toEqual({ text: 'committed-0', padding: 'x'.repeat(8192) });
+
+        for (const sql of [
+          "INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('new', 3, 'now', 'chat', '{}')",
+          "UPDATE messages_out SET content = '{}' WHERE id = 'baseline-0'",
+          "DELETE FROM messages_out WHERE id = 'baseline-0'",
+        ]) {
+          expect(() => hostOutDb.prepare(sql).run()).toThrow(/attempt to write a readonly database/);
+        }
+      } finally {
+        hostOutDb.close();
+      }
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  }, 10_000);
+
   it('allows SELECT queries but rejects mutations with attempt to write a readonly database', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { getContinuation, setContinuation } from './db/session-state.js';
+import { getContinuation, getCurrentBatchRouting, setContinuation } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
@@ -33,6 +33,55 @@ function insertMessage(id: string, content: object, opts?: { platformId?: string
 }
 
 describe('poll loop integration', () => {
+  it('publishes routing only for messages that survive command and script filtering', async () => {
+    const insertRouted = (
+      id: string,
+      seq: number,
+      kind: 'chat' | 'task',
+      channelType: string,
+      platformId: string,
+      content: object,
+    ) => {
+      getInboundDb()
+        .prepare(
+          `INSERT INTO messages_in
+             (id, seq, kind, timestamp, status, trigger, channel_type, platform_id, content)
+           VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'pending', 1, ?, ?, ?)`,
+        )
+        .run(id, seq, kind, channelType, platformId, JSON.stringify(content));
+    };
+
+    insertRouted('visible-peer', 2, 'chat', 'agent', 'ag-peer', { sender: 'Peer', text: 'handle this' });
+    insertRouted('clear-command', 4, 'chat', 'agent', 'ag-command', { sender: 'Admin', text: '/clear' });
+    insertRouted('gated-task', 6, 'task', 'agent', 'ag-task', {
+      prompt: 'do not wake',
+      script: `printf '%s\\n' '{"wakeAgent":false}'`,
+    });
+
+    let observed = false;
+    let visibleRouting: ReturnType<typeof getCurrentBatchRouting>;
+    let commandRouting: ReturnType<typeof getCurrentBatchRouting>;
+    let gatedRouting: ReturnType<typeof getCurrentBatchRouting>;
+    const provider = new MockProvider({}, () => {
+      visibleRouting = getCurrentBatchRouting('agent', 'ag-peer');
+      commandRouting = getCurrentBatchRouting('agent', 'ag-command');
+      gatedRouting = getCurrentBatchRouting('agent', 'ag-task');
+      observed = true;
+      return '';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
+
+    await waitFor(() => observed, 3000);
+    controller.abort();
+
+    expect(visibleRouting).toEqual({ inReplyTo: 'visible-peer', threadId: null });
+    expect(commandRouting).toBeNull();
+    expect(gatedRouting).toBeNull();
+
+    await loopPromise.catch(() => {});
+  });
+
   it('should pick up a message, process it, and write a response', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'What is the meaning of life?' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' });
 

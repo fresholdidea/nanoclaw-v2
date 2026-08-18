@@ -15,6 +15,7 @@ import {
   clearContinuation,
   clearCurrentBatchRouting,
   clearCurrentInReplyTo,
+  getCurrentBatchRouting,
   migrateLegacyContinuation,
   setContinuation,
   setCurrentBatchRouting,
@@ -240,6 +241,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    const queryRouting = extractRouting(keep);
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
@@ -260,7 +262,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp per-destination in_reply_to onto outbound rows for messages
     // in the claimed batch — preventing replies from correlating to unseen messages.
     const batchRoutingMap: Record<string, { inReplyTo: string | null; threadId: string | null }> = {};
-    for (const m of messages) {
+    for (const m of keep) {
       if (m.channel_type && m.platform_id) {
         batchRoutingMap[`${m.channel_type}:${m.platform_id}`] = {
           inReplyTo: m.id,
@@ -268,7 +270,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         };
       }
     }
-    setCurrentBatchRouting(batchRoutingMap, routing.inReplyTo);
+    setCurrentBatchRouting(batchRoutingMap, queryRouting.inReplyTo);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -282,7 +284,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     try {
       const result = await processQuery(
         query,
-        routing,
+        queryRouting,
         processingIds,
         config.providerName,
         config.provider.onExchangeComplete?.bind(config.provider),
@@ -308,7 +310,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
 
       // Write error response so the user knows something went wrong
-      emitProviderError(`Error: ${errMsg}`, routing, null);
+      emitProviderError(`Error: ${errMsg}`, queryRouting, null);
 
       // The batch is still acked completed below (no redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
@@ -384,6 +386,7 @@ export async function processQuery(
   emitsMidTurnText = false,
 ): Promise<QueryResult> {
   clearTurnDedup();
+  let activeRouting = routing;
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
@@ -512,6 +515,17 @@ export async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        const followUpRoutingMap: Record<string, { inReplyTo: string | null; threadId: string | null }> = {};
+        for (const message of keep) {
+          if (message.channel_type && message.platform_id) {
+            followUpRoutingMap[`${message.channel_type}:${message.platform_id}`] = {
+              inReplyTo: message.id,
+              threadId: message.thread_id,
+            };
+          }
+        }
+        activeRouting = extractRouting(keep);
+        setCurrentBatchRouting(followUpRoutingMap, activeRouting.inReplyTo);
         clearTurnDedup();
         unwrappedNudged = false;
         taskBlockNudged = false;
@@ -558,7 +572,7 @@ export async function processQuery(
 
   try {
     for await (const event of query.events) {
-      handleEvent(event, routing);
+      handleEvent(event, activeRouting);
       touchHeartbeat();
 
       if (event.type === 'init') {
@@ -573,7 +587,7 @@ export async function processQuery(
       } else if (event.type === 'file') {
         // A harness-generated file (e.g. a Codex built-in image generation the
         // model itself never send_files). Deliver it to the turn's channel.
-        deliverGeneratedFile(event.path, routing);
+        deliverGeneratedFile(event.path, activeRouting);
       } else if (event.type === 'text') {
         // Assistant text emitted mid-turn (e.g. between tool calls). The
         // final result only carries the LAST assistant text, so complete
@@ -583,7 +597,7 @@ export async function processQuery(
         // emitsMidTurnText the result stays the only delivery door, so a
         // stray text event must not open a second one.
         if (emitsMidTurnText) {
-          const scan = deliverMidTurnBlocks(event.text, routing, turnStartSeq, midTurnTail);
+          const scan = deliverMidTurnBlocks(event.text, activeRouting, turnStartSeq, midTurnTail);
           midTurnSent += scan.delivered;
           midTurnTail = scan.tail;
         }
@@ -596,7 +610,7 @@ export async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { sent, hasUnwrapped, taskBlocks, resultBlocks } = dispatchResultText(event.text, routing, {
+          const { sent, hasUnwrapped, taskBlocks, resultBlocks } = dispatchResultText(event.text, activeRouting, {
             midTurnSent,
             // For emitsMidTurnText providers the result door NEVER delivers
             // content (error results excepted, below): mid-turn streaming is
@@ -611,19 +625,19 @@ export async function processQuery(
             // and the retry streams through the mid-turn door.
             turnDelivered: emitsMidTurnText ? midTurnSent > 0 || chatRowWrittenSince(turnStartSeq) : undefined,
           });
-          const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
+          const willRetryTaskBlocks = shouldNudgeTaskBlocks(activeRouting.taskRun, taskBlocks, taskBlockNudged);
           // One-door task delivery: the final text becomes the run log entry
           // while explicit append-log calls remain optional additive notes.
           // Errors included: a failed run's text belongs in its log, not chat.
           // A corrective retry handles delivery only; its result is not a
           // second run summary.
-          if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text);
-          if (resultBlocks === 0 && event.isError === true && !routing.taskRun) {
+          if (activeRouting.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text);
+          if (resultBlocks === 0 && event.isError === true && !activeRouting.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
-            deliverErrorResult(event.text, routing);
+            deliverErrorResult(event.text, activeRouting);
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
@@ -1256,14 +1270,16 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   // that came from this same channel+platform. In agent-shared sessions,
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
-  const destRouting = resolveDestinationThread(channelType, platformId);
+  const batchRouting = getCurrentBatchRouting(channelType, platformId);
+  const destRouting = channelType === 'agent' ? null : resolveDestinationThread(channelType, platformId);
   writeMessageOut({
     id: generateId(),
-    in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
+    in_reply_to:
+      batchRouting !== undefined ? (batchRouting?.inReplyTo ?? null) : (destRouting?.inReplyTo ?? routing.inReplyTo),
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: destRouting?.threadId ?? null,
+    thread_id: batchRouting?.threadId ?? destRouting?.threadId ?? null,
     content: JSON.stringify({ text: body }),
   });
 }

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { TIMEZONE, formatLocalTime, formatLocalStamp } from './timezone.js';
@@ -201,7 +203,7 @@ function formatSingleChat(msg: MessageInRow): string {
   const time = formatLocalTime(msg.timestamp, TIMEZONE);
   const text = content.text || '';
   const idAttr = msg.seq != null ? ` id="${msg.seq}"` : msg.id ? ` id="${escapeXml(msg.id)}"` : '';
-  const msgIdAttr = msg.id && msg.seq != null && msg.id !== String(msg.seq) ? ` msg_id="${escapeXml(msg.id)}"` : '';
+  const msgIdAttr = msg.id ? ` msg_id="${canonicalCitationId(msg)}"` : '';
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
   const replyPrefix = formatReplyContext(content.replyTo);
   const linksSuffix = formatLinks(content.links, text);
@@ -211,6 +213,12 @@ function formatSingleChat(msg: MessageInRow): string {
   const fromAttr = originAttr(msg);
 
   return `<message${idAttr}${msgIdAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+}
+
+function canonicalCitationId(msg: MessageInRow): string {
+  const sourceIdentity = JSON.stringify([msg.channel_type, msg.platform_id, msg.thread_id, msg.id]);
+  const digest = createHash('sha256').update(sourceIdentity).digest('base64url');
+  return `msg-v1-${digest}`;
 }
 
 /**

@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
+import { setCurrentBatchRouting } from './db/session-state.js';
+import { sendMessage } from './mcp-tools/core.js';
 import { processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
@@ -48,6 +50,31 @@ function seedDest(name = 'discord-main', channelType = 'discord', platformId = '
     .run(name, name, channelType, platformId);
 }
 
+function seedAgentDest(name = 'peer', agentGroupId = 'ag-peer'): void {
+  getInboundDb()
+    .prepare(
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES (?, ?, 'agent', NULL, NULL, ?)`,
+    )
+    .run(name, name, agentGroupId);
+}
+
+function insertRoutedMessage(
+  id: string,
+  seq: number,
+  channelType: string,
+  platformId: string,
+  text: string,
+): void {
+  getInboundDb()
+    .prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, status, process_after, trigger, on_wake, channel_type, platform_id, content)
+       VALUES (?, ?, 'chat', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'pending', NULL, 1, 0, ?, ?, ?)`,
+    )
+    .run(id, seq, channelType, platformId, JSON.stringify({ sender: 'Peer', text }));
+}
+
 function insertMessage(id: string, kind: string, content: object): void {
   getInboundDb()
     .prepare(
@@ -81,6 +108,108 @@ function makeStubQuery(events: AsyncGenerator<ProviderEvent>): { query: AgentQue
 }
 
 describe('mid-turn <message> block delivery', () => {
+  it('uses the claimed follow-up A2A row for MCP replies and ignores a newer unclaimed row', async () => {
+    seedAgentDest();
+    setCurrentBatchRouting(
+      { 'agent:ag-peer': { inReplyTo: 'seen-S1', threadId: null } },
+      'seen-S1',
+    );
+    const pushes: string[] = [];
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      insertRoutedMessage('seen-S2', 2, 'agent', 'ag-peer', 'follow-up from S2');
+      const deadline = Date.now() + 5000;
+      while (!pushes.some((p) => p.includes('follow-up from S2')) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!pushes.some((p) => p.includes('follow-up from S2'))) throw new Error('follow-up was not pushed');
+
+      // This row arrived after the accepted prompt batch. It must not become
+      // the return path for the reply being produced from that batch.
+      insertRoutedMessage('unseen-S3', 4, 'agent', 'ag-peer', 'not claimed yet');
+      await sendMessage.handler({ to: 'peer', text: 'reply to S2' });
+      yield { type: 'result', text: '' };
+    }
+
+    const query: AgentQuery = {
+      push: (message) => pushes.push(message),
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, CHAT_ROUTING, ['seen-S1'], 'claude', undefined, 'prompt', undefined);
+
+    const [out] = getUndeliveredMessages();
+    expect(out.in_reply_to).toBe('seen-S2');
+  });
+
+  it('uses the claimed follow-up A2A row for wrapped replies and ignores a newer unclaimed row', async () => {
+    seedAgentDest();
+    setCurrentBatchRouting(
+      { 'agent:ag-peer': { inReplyTo: 'seen-S1', threadId: null } },
+      'seen-S1',
+    );
+    const pushes: string[] = [];
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      insertRoutedMessage('seen-S2', 2, 'agent', 'ag-peer', 'follow-up from S2');
+      const deadline = Date.now() + 5000;
+      while (!pushes.some((p) => p.includes('follow-up from S2')) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!pushes.some((p) => p.includes('follow-up from S2'))) throw new Error('follow-up was not pushed');
+
+      insertRoutedMessage('unseen-S3', 4, 'agent', 'ag-peer', 'not claimed yet');
+      yield { type: 'text', text: '<message to="peer">reply to S2</message>' };
+      yield { type: 'result', text: 'sent above' };
+    }
+
+    const query: AgentQuery = {
+      push: (message) => pushes.push(message),
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, CHAT_ROUTING, ['seen-S1'], 'claude', undefined, 'prompt', undefined, true);
+
+    const [out] = getUndeliveredMessages();
+    expect(out.in_reply_to).toBe('seen-S2');
+  });
+
+  it('routes direct provider errors to the accepted follow-up batch', async () => {
+    const pushes: string[] = [];
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      insertRoutedMessage('follow-up-slack', 2, 'slack', 'chan-2', 'follow-up from Slack');
+      const deadline = Date.now() + 5000;
+      while (!pushes.some((p) => p.includes('follow-up from Slack')) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!pushes.some((p) => p.includes('follow-up from Slack'))) throw new Error('follow-up was not pushed');
+
+      yield { type: 'result', text: 'Provider unavailable', isError: true };
+    }
+
+    const query: AgentQuery = {
+      push: (message) => pushes.push(message),
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const [out] = getUndeliveredMessages();
+    expect(out.channel_type).toBe('slack');
+    expect(out.platform_id).toBe('chan-2');
+    expect(out.in_reply_to).toBe('follow-up-slack');
+  });
+
   it('delivers a complete block from a mid-turn text event immediately', async () => {
     seedDest();
     let outCountBeforeResult = -1;

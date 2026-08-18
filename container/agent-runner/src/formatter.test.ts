@@ -28,15 +28,33 @@ function insertMessage(
   id: string,
   kind: string,
   content: object,
-  opts?: { timestamp?: string; processAfter?: string; seq?: number },
+  opts?: {
+    timestamp?: string;
+    processAfter?: string;
+    seq?: number;
+    channelType?: string;
+    platformId?: string;
+    threadId?: string;
+  },
 ) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, status, process_after, channel_type, platform_id, thread_id, content)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
     )
-    .run(id, opts?.seq ?? null, kind, timestamp, opts?.processAfter ?? null, JSON.stringify(content));
+    .run(
+      id,
+      opts?.seq ?? null,
+      kind,
+      timestamp,
+      opts?.processAfter ?? null,
+      opts?.channelType ?? null,
+      opts?.platformId ?? null,
+      opts?.threadId ?? null,
+      JSON.stringify(content),
+    );
 }
 
 describe('context timezone header', () => {
@@ -323,25 +341,52 @@ describe('app_context rendering (Slack agent mode, contract C4)', () => {
   });
 });
 
-describe('global message identity (msg_id)', () => {
-  it('renders msg_id attribute when msg.id differs from seq', () => {
-    insertMessage('a2a-1786998296874-gdq5yv', 'chat', { sender: 'zed', text: 'cross-agent update' }, { seq: 164 });
+describe('canonical message citation identity (msg_id)', () => {
+  it('renders the documented v1 citation token while retaining seq as the local id', () => {
+    insertMessage(
+      'a2a-1786998296874-gdq5yv',
+      'chat',
+      { sender: 'zed', text: 'cross-agent update' },
+      { seq: 164, channelType: 'agent', platformId: 'ag-cache' },
+    );
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('id="164"');
-    expect(result).toContain('msg_id="a2a-1786998296874-gdq5yv"');
+    expect(result).toContain('msg_id="msg-v1--pBCOW0rJyf_gz8Md-98d2St1TjxQQLj9VC8PMBsp0Y"');
   });
 
-  it('escapes special characters in msg.id', () => {
-    insertMessage('msg-123<test>&"foo"', 'chat', { sender: 'alice', text: 'hello' }, { seq: 16 });
-    const result = formatMessages(getPendingMessages());
-    expect(result).toContain('id="16"');
-    expect(result).toContain('msg_id="msg-123&lt;test&gt;&amp;&quot;foo&quot;"');
+  it('distinguishes identical raw ids from different source routes without exposing either route', () => {
+    const base = {
+      id: '16',
+      seq: 16,
+      kind: 'chat',
+      timestamp: '2026-08-17T12:00:00.000Z',
+      status: 'pending',
+      process_after: null,
+      recurrence: null,
+      tries: 0,
+      trigger: 1,
+      thread_id: null,
+      content: JSON.stringify({ sender: 'alice', text: 'hello' }),
+    };
+    const first = formatMessages([{ ...base, channel_type: 'telegram', platform_id: 'chat-secret-one' }]);
+    const second = formatMessages([{ ...base, channel_type: 'telegram', platform_id: 'chat-secret-two' }]);
+    const firstCitation = first.match(/msg_id="([^"]+)"/)?.[1];
+    const secondCitation = second.match(/msg_id="([^"]+)"/)?.[1];
+
+    expect(firstCitation).toMatch(/^msg-v1-[A-Za-z0-9_-]{43}$/);
+    expect(secondCitation).toMatch(/^msg-v1-[A-Za-z0-9_-]{43}$/);
+    expect(firstCitation).not.toBe(secondCitation);
+    expect(firstCitation).not.toContain('chat-secret-one');
+    expect(secondCitation).not.toContain('chat-secret-two');
   });
 
-  it('renders id attribute with string id when seq is null', () => {
-    insertMessage('a2a-123', 'chat', { sender: 'zed', text: 'hello' });
+  it('renders a canonical citation even for a legacy row without seq', () => {
+    insertMessage('a2a-123', 'chat', { sender: 'zed', text: 'hello' }, {
+      channelType: 'agent',
+      platformId: 'ag-zed',
+    });
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('id="a2a-123"');
-    expect(result).not.toContain('msg_id=');
+    expect(result).toMatch(/msg_id="msg-v1-[A-Za-z0-9_-]{43}"/);
   });
 });
