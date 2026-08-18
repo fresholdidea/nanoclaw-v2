@@ -1,8 +1,14 @@
 # `/notebooklm` Container Skill — Design
 
-**Status:** Design
+**Status:** In implementation (branch `notebooklm-skill`)
 **Date:** 2026-07-16
 **Author:** Brad (via brainstorm with Claude Code)
+
+> **Implementation addendum (2026-07-16, post-discovery).** Two decisions in this
+> design changed once the tool was actually installed and inspected on the host.
+> The body below is preserved as the original design; the addendum at the end
+> ([Implementation addendum](#implementation-addendum-discovery-findings)) is
+> authoritative where they conflict.
 
 ## Goal
 
@@ -132,3 +138,71 @@ This is a verification step, not a known break — but it is the single most lik
 - `notebooklm create` + `source add` + `ask` round-trips end-to-end inside a live container.
 - After the master token's cookies naturally expire, the next `ask` self-heals without human intervention.
 - Rebuild + restart is the only step needed to roll the skill to all groups.
+
+## Implementation addendum (discovery findings)
+
+Discovery was done against the tool **already installed on Brad's Mac**, so several
+"open items" above are now resolved with facts rather than assumptions. Where this
+addendum conflicts with the body, the addendum wins.
+
+### Deviation 1 — tool is `jacob-bd/notebooklm-mcp-cli` (`nlm`), not `teng-lin/notebooklm-py`
+
+Decision 2 in the body picked `teng-lin/notebooklm-py` (entrypoint `notebooklm`,
+`--master-token`). What Brad actually installed and authenticated is
+**`notebooklm-mcp-cli` v0.8.7** — entrypoint **`nlm`**, package on PyPI, installed via
+`uv tool install`. Brad chose to standardize on this tool (it's the same one wired into
+his Hermes agent and the Antigravity IDE). This design follows the installed tool.
+
+The body's objection to jacob-bd (cookie jar dies in `--rm` containers, needs an
+interactive re-login) **does not hold** for the container model we're building — see
+Deviation 2. The tool has also grown well past the body's snapshot: a unified command
+surface (`create`/`source`/`query`/`studio`/`download`/`research`/`batch`/`cross`/
+`pipeline`), profiles, and a `--provider openclaw --cdp-url` external-browser mode.
+
+### Deviation 2 — auth is a portable 20K cookie file; no browser/Playwright in-container
+
+The load-bearing discovery. `nlm` stores everything under `~/.notebooklm-mcp-cli/`:
+
+| Path | Size | Role | Needed in container? |
+|------|------|------|----------------------|
+| `profiles/<name>/cookies.json` + `metadata.json` | ~20K | The actual auth credential used for HTTP RPC queries | **Yes** |
+| `chrome-profiles/<name>/` | ~71M | Chrome user-data dir used **only at interactive login time** (driven over CDP) | **No** |
+| `cache/`, `chrome-port-map.json` | tiny | runtime scratch | No |
+
+Verified on the host: `nlm list notebooks` returns real notebooks **purely from
+`cookies.json` with no browser spawn**, and a **profiles-only 20K store at an arbitrary
+path** (pointed to via `NOTEBOOKLM_MCP_CLI_PATH`) works identically. `notebooklm-mcp-cli`
+does **not depend on Playwright** at all (deps: `fastmcp, httpx[socks], platformdirs,
+pydantic, pyyaml, rich, typer, websocket-client`); login drives an external Chrome over
+CDP. Since the container never logs in (login is a one-time host step), **the image needs
+nothing browser-related for `nlm`.**
+
+### Resolutions to the "open items" list
+
+1. **Auth storage path + env var** — RESOLVED. Root: `~/.notebooklm-mcp-cli/`. Relocated
+   via **`NOTEBOOKLM_MCP_CLI_PATH`** (`notebooklm_tools/utils/config.py:get_storage_dir`).
+   Container mounts host `~/.notebooklm-mcp-cli` → `/workspace/extra/notebooklm` and the
+   image bakes `ENV NOTEBOOKLM_MCP_CLI_PATH=/workspace/extra/notebooklm` — the exact
+   `MNEMON_DATA_DIR` pattern.
+2. **Playwright at runtime** — RESOLVED. Not a dependency; not needed in-container. No
+   `[browser]` extra.
+3. **Proxy/NO_PROXY** — still a verification step. `nlm` honors `http_proxy`/`https_proxy`/
+   `NO_PROXY`. Traffic hits `notebooklm.google.com` (not `*.googleapis.com`), so the known
+   `GEMINI_API_KEY` clobber shouldn't match — confirm during container e2e.
+4. **PATH for `node`** — install must land in a `node`-readable location. `uv tool install`
+   defaults under `/root/.local` (mode 0700, unreadable by `node`); use
+   `UV_TOOL_DIR`/`UV_TOOL_BIN_DIR` pointed at world-readable paths (`/opt/uv/tools`,
+   `/usr/local/bin`) so `/usr/local/bin/nlm` resolves — mirrors `bun`/`deepline`/`ncl`.
+5. **First-run auth bootstrap** — one-time host command is `nlm login` (interactive Chrome
+   once). Already done: profile `default: jaybhess@gmail.com`. Refresh-on-expiry = re-run
+   `nlm login` on the host; the shared cookie file self-heals every container.
+6. **Image size** — the `uv`-managed Python + deps adds **~73M** (no Playwright). Note in
+   `docs/build-and-runtime.md`.
+
+### Command-surface note
+
+The container `SKILL.md` is adapted from the tool's own generated skill
+(`nlm skill install` → 891-line `SKILL.md` + reference files), not the body's guessed
+verb list, so it matches v0.8.7 exactly. Verbs the body listed under `notebooklm ask`
+map to `nlm query`; `source add` → `nlm source add` / `nlm add`; Studio generation →
+`nlm audio|video|quiz|...` or `nlm studio`.
