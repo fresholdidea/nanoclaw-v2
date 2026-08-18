@@ -84,6 +84,27 @@ RUN chmod +x /usr/local/bin/mnemon
 
 ENV MNEMON_DATA_DIR=/workspace/extra/mnemon
 
+# ---- notebooklm CLI (nlm) — Google NotebookLM --------------------------------
+# `notebooklm-mcp-cli` drives NotebookLM from a portable cookie file. Auth is a
+# one-time interactive host `nlm login`; the host then mounts ~/.notebooklm-mcp-cli
+# (RW) at /workspace/extra/notebooklm via each group's container.json
+# `additionalMounts`, and NOTEBOOKLM_MCP_CLI_PATH below points the CLI at it.
+# Queries use profiles/<name>/cookies.json over HTTP — no browser or Playwright is
+# needed in-container (login, which drives Chrome over CDP, happens on the host).
+# Installed with uv against the system python3 into world-readable /opt so the
+# non-root `node` user can execute /usr/local/bin/nlm.
+ARG NOTEBOOKLM_CLI_VERSION=0.8.7
+ENV UV_TOOL_DIR=/opt/uv/tools
+ENV UV_TOOL_BIN_DIR=/usr/local/bin
+ENV UV_PYTHON_DOWNLOADS=never
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh && \
+    uv tool install --python /usr/bin/python3 "notebooklm-mcp-cli==${NOTEBOOKLM_CLI_VERSION}" && \
+    uv cache clean && \
+    rm -f /usr/local/bin/uv /usr/local/bin/uvx && \
+    chmod -R a+rX /opt/uv
+
+ENV NOTEBOOKLM_MCP_CLI_PATH=/workspace/extra/notebooklm
+
 # ---- deepline CLI ------------------------------------------------------------
 # Download the Python binary directly — the full install script runs `npx
 # skills add` at the end to install Claude Code host skills, which hangs in
