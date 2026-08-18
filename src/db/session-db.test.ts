@@ -7,6 +7,7 @@
  */
 import Database from 'better-sqlite3';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
@@ -224,8 +225,9 @@ describe('openOutboundDb read-only enforcement', () => {
       });
 
       expect(fs.existsSync(`${outDbPath}-journal`)).toBe(true);
+      const exitPromise = once(child, 'exit');
       child.kill('SIGKILL');
-      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      await exitPromise;
 
       const hostOutDb = openOutboundDb(outDbPath);
       try {
@@ -245,7 +247,11 @@ describe('openOutboundDb read-only enforcement', () => {
         hostOutDb.close();
       }
     } finally {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      if (child.exitCode === null && child.signalCode === null) {
+        const exitPromise = once(child, 'exit');
+        child.kill('SIGKILL');
+        await exitPromise;
+      }
     }
   }, 10_000);
 

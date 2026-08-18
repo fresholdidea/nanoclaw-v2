@@ -202,9 +202,12 @@ Split across the two files. JSON blobs for content — schema-free, format varie
 `seq` is a session-local ordering counter with a **disjoint parity**: the host writes even seqs to
 `messages_in`, the container writes odd seqs to `messages_out`. Each side reads the other's
 MAX(seq) to pick its next value, so seq is a monotonic counter across both tables within a session.
-This is used for session-local tool operations (`edit_message` / `add_reaction`). For cross-session
-and cross-agent references, the globally unique string `id` (exposed as `msg_id` in formatted prompts)
-provides the unambiguous canonical identity.
+This is used for session-local tool operations (`edit_message` / `add_reaction`). When a raw inbound
+message ID exists, formatted prompts also include a stable, collision-resistant citation token:
+`msg-v1-<base64url(sha256(JSON([channel_type, platform_id, thread_id, raw_id])))>`. The token is scoped
+to one NanoClaw installation; it is not a globally unique database ID or a tool argument. Including
+the source route makes identical raw IDs from different channels or agent sessions unambiguous without
+exposing those routing fields in the prompt.
 
 ```sql
 -- inbound.db — host writes, container opens read-only

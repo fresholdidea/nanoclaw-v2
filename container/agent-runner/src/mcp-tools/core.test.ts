@@ -37,7 +37,8 @@ beforeEach(() => {
     .prepare(
       `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
        VALUES ('peer', 'Peer', 'agent', NULL, NULL, 'ag-peer'),
-              ('other', 'Other', 'agent', NULL, NULL, 'ag-other')`,
+              ('other', 'Other', 'agent', NULL, NULL, 'ag-other'),
+              ('slack', 'Slack', 'channel', 'slack', 'chan-slack', NULL)`,
     )
     .run();
 });
@@ -96,6 +97,30 @@ describe('send_message MCP tool — in_reply_to plumbing', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
+    expect(out[0].in_reply_to).toBeNull();
+  });
+
+  it('retains historical thread lookup for a non-agent destination without correlating to the old row', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, content, channel_type, platform_id, thread_id)
+         VALUES ('slack-history', 2, 'chat', 'now', 'completed', '{}', 'slack', 'chan-slack', 'thread-history'),
+                ('slack-threadless', 4, 'chat', 'now', 'completed', '{}', 'slack', 'chan-slack', NULL)`,
+      )
+      .run();
+    setCurrentBatchRouting(
+      {
+        'agent:ag-peer': { inReplyTo: 'seen-current', threadId: null },
+      },
+      'seen-current',
+    );
+
+    await sendMessage.handler({ to: 'slack', text: 'continue the channel thread' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].thread_id).toBe('thread-history');
     expect(out[0].in_reply_to).toBeNull();
   });
 

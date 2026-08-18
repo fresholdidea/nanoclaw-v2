@@ -10,9 +10,9 @@ import fs from 'fs';
 import path from 'path';
 
 import { findByName, getAllDestinations } from '../destinations.js';
-import { getInboundDb } from '../db/connection.js';
+import { resolveDestinationCorrelation } from '../destination-routing.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
-import { getCurrentBatchRouting, getCurrentInReplyTo } from '../db/session-state.js';
+import { getCurrentInReplyTo } from '../db/session-state.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { recordTurnSend } from '../turn-dedup.js';
 import { registerTools } from './server.js';
@@ -38,30 +38,6 @@ function destinationList(): string {
   const all = getAllDestinations();
   if (all.length === 0) return '(none)';
   return all.map((d) => d.name).join(', ');
-}
-
-/**
- * For non-agent channels (e.g. Slack/Telegram), look up the thread_id from
- * recent conversation history if not already explicit in session routing.
- * Never used for agent-to-agent messages (A2A return paths must strictly bind
- * to the claimed batch to avoid correlating to unseen messages).
- */
-function resolveHistoricalChannelThreadId(channelType: string, platformId: string): string | null {
-  if (channelType === 'agent') return null;
-  try {
-    const db = getInboundDb();
-    const row = db
-      .prepare(
-        `SELECT thread_id FROM messages_in
-         WHERE channel_type = ? AND platform_id = ? AND thread_id IS NOT NULL
-         ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(channelType, platformId) as { thread_id: string | null } | undefined;
-    return row?.thread_id ?? null;
-  } catch (err) {
-    log(`resolveHistoricalChannelThreadId error: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
 }
 
 /**
@@ -118,21 +94,19 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
-    const batchRouting = getCurrentBatchRouting(routing.channel_type, routing.platform_id);
-    const inReplyTo = batchRouting !== undefined ? (batchRouting?.inReplyTo ?? null) : (getCurrentInReplyTo() ?? null);
-    const threadId =
-      routing.thread_id ??
-      batchRouting?.threadId ??
-      resolveHistoricalChannelThreadId(routing.channel_type, routing.platform_id);
+    const correlation = resolveDestinationCorrelation(routing.channel_type, routing.platform_id, {
+      explicitThreadId: routing.thread_id,
+      legacyInReplyTo: getCurrentInReplyTo(),
+    });
 
     const id = generateId();
     const seq = writeMessageOut({
       id,
-      in_reply_to: inReplyTo,
+      in_reply_to: correlation.inReplyTo,
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
-      thread_id: threadId,
+      thread_id: correlation.threadId,
       content: JSON.stringify({ text }),
     });
 
@@ -172,12 +146,10 @@ export const sendFile: McpToolDefinition = {
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
-    const batchRouting = getCurrentBatchRouting(routing.channel_type, routing.platform_id);
-    const inReplyTo = batchRouting !== undefined ? (batchRouting?.inReplyTo ?? null) : (getCurrentInReplyTo() ?? null);
-    const threadId =
-      routing.thread_id ??
-      batchRouting?.threadId ??
-      resolveHistoricalChannelThreadId(routing.channel_type, routing.platform_id);
+    const correlation = resolveDestinationCorrelation(routing.channel_type, routing.platform_id, {
+      explicitThreadId: routing.thread_id,
+      legacyInReplyTo: getCurrentInReplyTo(),
+    });
 
     const id = generateId();
     const filename = (args.filename as string) || path.basename(resolvedPath);
@@ -188,11 +160,11 @@ export const sendFile: McpToolDefinition = {
 
     writeMessageOut({
       id,
-      in_reply_to: inReplyTo,
+      in_reply_to: correlation.inReplyTo,
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
-      thread_id: threadId,
+      thread_id: correlation.threadId,
       content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
     });
 

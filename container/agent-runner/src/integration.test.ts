@@ -477,6 +477,32 @@ describe('poll loop — provider error recovery', () => {
 
     await loopPromise.catch(() => {});
   });
+
+  it('routes a thrown provider error to the latest accepted follow-up batch', async () => {
+    insertMessage('m1', { sender: 'Alice', text: 'initial request' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new FollowUpThrowingProvider();
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 4000);
+
+    await waitFor(() => provider.started, 2000);
+    insertMessage(
+      'm2',
+      { sender: 'Bob', text: 'follow-up request' },
+      { platformId: 'chan-2', channelType: 'slack', threadId: 'thread-2' },
+    );
+    await waitFor(() => getUndeliveredMessages().length > 0, 3000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('slack');
+    expect(out[0].platform_id).toBe('chan-2');
+    expect(out[0].thread_id).toBe('thread-2');
+    expect(out[0].in_reply_to).toBe('m2');
+
+    await loopPromise.catch(() => {});
+  });
 });
 
 describe('poll loop — stale session recovery', () => {
@@ -565,6 +591,37 @@ class ThrowingProvider {
       abort() {},
       events: (async function* () {
         throw new Error(errorMessage);
+      })(),
+    };
+  }
+}
+
+class FollowUpThrowingProvider {
+  readonly supportsNativeSlashCommands = false;
+  started = false;
+
+  isSessionInvalid(): boolean {
+    return false;
+  }
+
+  query() {
+    const owner = this;
+    let pushed = false;
+    let wake: (() => void) | null = null;
+    return {
+      push() {
+        pushed = true;
+        wake?.();
+      },
+      end() {},
+      abort() {
+        wake?.();
+      },
+      events: (async function* () {
+        owner.started = true;
+        yield { type: 'init' as const, continuation: 'follow-up-error-session' };
+        if (!pushed) await new Promise<void>((resolve) => (wake = resolve));
+        throw new Error('follow-up provider failure');
       })(),
     };
   }

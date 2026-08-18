@@ -404,15 +404,18 @@ The agent-runner transforms messages_in rows into a prompt string. The provider 
 
 **Routing field stripping:** `platform_id`, `channel_type`, `thread_id` are never included in the prompt. They're stored as context for writing messages_out.
 
-Every kind renders to a single self-contained XML element. The `id` attribute is the
-message's `seq` (the agent-facing message ID it passes to `edit_message` / `add_reaction`).
-The `from` attribute is the origin destination name (resolved from the routing fields via
-the destination map), so the agent always knows where a message came from — routing fields
-themselves are never shown.
+Every kind renders to a single self-contained XML element. The numeric `id` attribute is the
+message's session-local `seq` (the agent-facing ID it passes to `edit_message` / `add_reaction`).
+When the row has a raw message ID, `msg_id` is a stable, collision-resistant citation token scoped
+to one NanoClaw installation. It is computed as
+`msg-v1-<base64url(sha256(JSON([channel_type, platform_id, thread_id, raw_id])))>` and is not a
+database primary key or tool argument. The `from` attribute is the origin destination name
+(resolved from the routing fields via the destination map), so the agent always knows where a
+message came from; raw routing fields are never shown.
 
 - **`chat`** — one `<message>` per row:
   ```xml
-  <message id="5" from="family" sender="John" time="Jan 1, 10:00 AM">Check this PR</message>
+  <message id="5" msg_id="msg-v1-..." from="family" sender="John" time="Jan 1, 10:00 AM">Check this PR</message>
   ```
   A reply carries a `reply_to` attribute and an inline `<quoted_message from="…">…</quoted_message>`.
 
@@ -533,6 +536,13 @@ the session's own reply routing (`session_routing`); if the destination resolves
 channel the session is bound to, the session's `thread_id` is preserved so the reply lands
 in-thread, otherwise `thread_id` is null. The tool then writes a `messages_out` row with
 `kind: 'chat'` and content `{ text }`, and returns the new `seq` as the message id.
+
+While a provider query is active, MCP sends, generated files, provider errors, and parsed
+`<message>` output all use the latest batch accepted into that query. Agent-to-agent
+`in_reply_to` correlation is limited to a matching row in that batch; an agent destination absent
+from the batch starts a new thread. Non-agent destinations may still recover historical channel
+thread context. Legacy fallback behavior applies only when no batch-routing state exists, and the
+state is cleared when the query exits.
 
 #### send_file
 

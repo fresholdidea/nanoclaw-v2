@@ -98,6 +98,26 @@ export interface BatchDestinationRouting {
   threadId: string | null;
 }
 
+interface BatchRoutingMessage {
+  id: string;
+  channel_type: string | null;
+  platform_id: string | null;
+  thread_id: string | null;
+}
+
+export function buildBatchRoutingMap(messages: BatchRoutingMessage[]): Record<string, BatchDestinationRouting> {
+  const routingMap: Record<string, BatchDestinationRouting> = {};
+  for (const message of messages) {
+    if (message.channel_type && message.platform_id) {
+      routingMap[`${message.channel_type}:${message.platform_id}`] = {
+        inReplyTo: message.id,
+        threadId: message.thread_id,
+      };
+    }
+  }
+  return routingMap;
+}
+
 /**
  * Ignore a stamp older than this. The poll loop clears the stamp in a
  * finally, but a container killed mid-batch (SIGKILL) can leave one behind;

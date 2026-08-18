@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
-import { setCurrentBatchRouting } from './db/session-state.js';
+import { getCurrentBatchRouting, setCurrentBatchRouting } from './db/session-state.js';
 import { sendMessage } from './mcp-tools/core.js';
 import { processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
@@ -108,6 +108,19 @@ function makeStubQuery(events: AsyncGenerator<ProviderEvent>): { query: AgentQue
 }
 
 describe('mid-turn <message> block delivery', () => {
+  it('clears the claimed-batch routing state when the query exits', async () => {
+    setCurrentBatchRouting({ 'agent:ag-peer': { inReplyTo: 'seen-S1', threadId: null } }, 'seen-S1');
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'result', text: '' };
+    }
+
+    const { query } = makeStubQuery(events());
+    await processQuery(query, CHAT_ROUTING, ['seen-S1'], 'claude', undefined, 'prompt', undefined);
+
+    expect(getCurrentBatchRouting('agent', 'ag-peer')).toBeUndefined();
+  });
+
   it('uses the claimed follow-up A2A row for MCP replies and ignores a newer unclaimed row', async () => {
     seedAgentDest();
     setCurrentBatchRouting(

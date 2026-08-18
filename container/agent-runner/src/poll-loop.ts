@@ -12,15 +12,16 @@ import {
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, getOutboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
+  buildBatchRoutingMap,
   clearContinuation,
   clearCurrentBatchRouting,
   clearCurrentInReplyTo,
-  getCurrentBatchRouting,
   migrateLegacyContinuation,
   setContinuation,
   setCurrentBatchRouting,
   setCurrentInReplyTo,
 } from './db/session-state.js';
+import { resolveDestinationCorrelation } from './destination-routing.js';
 import {
   formatMessages,
   extractRouting,
@@ -261,16 +262,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Publish the batch's routing map so MCP tools (send_message, send_file)
     // can stamp per-destination in_reply_to onto outbound rows for messages
     // in the claimed batch — preventing replies from correlating to unseen messages.
-    const batchRoutingMap: Record<string, { inReplyTo: string | null; threadId: string | null }> = {};
-    for (const m of keep) {
-      if (m.channel_type && m.platform_id) {
-        batchRoutingMap[`${m.channel_type}:${m.platform_id}`] = {
-          inReplyTo: m.id,
-          threadId: m.thread_id,
-        };
-      }
-    }
-    setCurrentBatchRouting(batchRoutingMap, queryRouting.inReplyTo);
+    setCurrentBatchRouting(buildBatchRoutingMap(keep), queryRouting.inReplyTo);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -281,6 +273,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const abortActiveQuery = () => query.abort();
     if (config.signal?.aborted) abortActiveQuery();
     else config.signal?.addEventListener('abort', abortActiveQuery, { once: true });
+    let activeQueryRouting = queryRouting;
     try {
       const result = await processQuery(
         query,
@@ -291,6 +284,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         prompt,
         continuation,
         config.provider.emitsMidTurnText === true,
+        (nextRouting) => {
+          activeQueryRouting = nextRouting;
+        },
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -310,7 +306,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
 
       // Write error response so the user knows something went wrong
-      emitProviderError(`Error: ${errMsg}`, queryRouting, null);
+      emitProviderError(`Error: ${errMsg}`, activeQueryRouting, activeQueryRouting.inReplyTo);
 
       // The batch is still acked completed below (no redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
@@ -384,6 +380,8 @@ export async function processQuery(
    * delivery-inert and the final result stays the single delivery door.
    */
   emitsMidTurnText = false,
+  /** Keep the outer error door aligned with the latest batch accepted by the provider query. */
+  onRoutingChange?: (routing: RoutingContext) => void,
 ): Promise<QueryResult> {
   clearTurnDedup();
   let activeRouting = routing;
@@ -515,17 +513,9 @@ export async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
-        const followUpRoutingMap: Record<string, { inReplyTo: string | null; threadId: string | null }> = {};
-        for (const message of keep) {
-          if (message.channel_type && message.platform_id) {
-            followUpRoutingMap[`${message.channel_type}:${message.platform_id}`] = {
-              inReplyTo: message.id,
-              threadId: message.thread_id,
-            };
-          }
-        }
         activeRouting = extractRouting(keep);
-        setCurrentBatchRouting(followUpRoutingMap, activeRouting.inReplyTo);
+        onRoutingChange?.(activeRouting);
+        setCurrentBatchRouting(buildBatchRoutingMap(keep), activeRouting.inReplyTo);
         clearTurnDedup();
         unwrappedNudged = false;
         taskBlockNudged = false;
@@ -709,6 +699,7 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    clearCurrentBatchRouting();
   }
 
   return { continuation: queryContinuation };
@@ -1270,42 +1261,19 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   // that came from this same channel+platform. In agent-shared sessions,
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
-  const batchRouting = getCurrentBatchRouting(channelType, platformId);
-  const destRouting = channelType === 'agent' ? null : resolveDestinationThread(channelType, platformId);
+  const correlation = resolveDestinationCorrelation(channelType, platformId, {
+    legacyInReplyTo: routing.inReplyTo,
+    legacyHistoricalInReplyTo: true,
+  });
   writeMessageOut({
     id: generateId(),
-    in_reply_to:
-      batchRouting !== undefined ? (batchRouting?.inReplyTo ?? null) : (destRouting?.inReplyTo ?? routing.inReplyTo),
+    in_reply_to: correlation.inReplyTo,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: batchRouting?.threadId ?? destRouting?.threadId ?? null,
+    thread_id: correlation.threadId,
     content: JSON.stringify({ text: body }),
   });
-}
-
-/**
- * Find the thread_id and message id from the most recent inbound message
- * matching the given channel+platform. Returns null if no match found.
- */
-export function resolveDestinationThread(
-  channelType: string,
-  platformId: string,
-): { threadId: string | null; inReplyTo: string | null } | null {
-  try {
-    const db = getInboundDb();
-    const row = db
-      .prepare(
-        `SELECT thread_id, id FROM messages_in
-         WHERE channel_type = ? AND platform_id = ?
-         ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(channelType, platformId) as { thread_id: string | null; id: string } | undefined;
-    if (row) return { threadId: row.thread_id, inReplyTo: row.id };
-  } catch (err) {
-    log(`resolveDestinationThread error: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return null;
 }
 
 function sleep(ms: number): Promise<void> {
