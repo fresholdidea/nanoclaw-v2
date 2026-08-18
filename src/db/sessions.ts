@@ -62,7 +62,7 @@ export function findSessionByAgentGroup(agentGroupId: string): Session | undefin
        WHERE agent_group_id = ?
          AND status = 'active'
          AND NOT (messaging_group_id IS NULL AND thread_id IS NOT NULL AND thread_id LIKE 'system:%')
-       ORDER BY created_at DESC
+       ORDER BY COALESCE(last_active, created_at) DESC
        LIMIT 1`,
     )
     .get(agentGroupId) as Session | undefined;

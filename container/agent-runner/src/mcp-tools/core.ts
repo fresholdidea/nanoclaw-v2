@@ -14,6 +14,7 @@ import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messa
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { recordTurnSend } from '../turn-dedup.js';
+import { resolveDestinationThread } from '../poll-loop.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -93,14 +94,17 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
+    const destThread = resolveDestinationThread(routing.channel_type, routing.platform_id);
+    const inReplyTo = destThread?.inReplyTo ?? getCurrentInReplyTo();
+
     const id = generateId();
     const seq = writeMessageOut({
       id,
-      in_reply_to: getCurrentInReplyTo(),
+      in_reply_to: inReplyTo,
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
+      thread_id: routing.thread_id ?? destThread?.threadId ?? null,
       content: JSON.stringify({ text }),
     });
 
@@ -140,6 +144,9 @@ export const sendFile: McpToolDefinition = {
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
+    const destThread = resolveDestinationThread(routing.channel_type, routing.platform_id);
+    const inReplyTo = destThread?.inReplyTo ?? getCurrentInReplyTo();
+
     const id = generateId();
     const filename = (args.filename as string) || path.basename(resolvedPath);
 
@@ -149,11 +156,11 @@ export const sendFile: McpToolDefinition = {
 
     writeMessageOut({
       id,
-      in_reply_to: getCurrentInReplyTo(),
+      in_reply_to: inReplyTo,
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
+      thread_id: routing.thread_id ?? destThread?.threadId ?? null,
       content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
     });
 

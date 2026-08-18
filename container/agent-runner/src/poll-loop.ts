@@ -1260,7 +1260,7 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
  * Find the thread_id and message id from the most recent inbound message
  * matching the given channel+platform. Returns null if no match found.
  */
-function resolveDestinationThread(
+export function resolveDestinationThread(
   channelType: string,
   platformId: string,
 ): { threadId: string | null; inReplyTo: string | null } | null {

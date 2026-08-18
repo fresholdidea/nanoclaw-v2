@@ -28,15 +28,15 @@ function insertMessage(
   id: string,
   kind: string,
   content: object,
-  opts?: { timestamp?: string; processAfter?: string },
+  opts?: { timestamp?: string; processAfter?: string; seq?: number },
 ) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, content)
-       VALUES (?, ?, ?, 'pending', ?, ?)`,
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, content)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
     )
-    .run(id, kind, timestamp, opts?.processAfter ?? null, JSON.stringify(content));
+    .run(id, opts?.seq ?? null, kind, timestamp, opts?.processAfter ?? null, JSON.stringify(content));
 }
 
 describe('context timezone header', () => {
@@ -320,5 +320,28 @@ describe('app_context rendering (Slack agent mode, contract C4)', () => {
     });
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('(viewing: channel C1&lt;&amp;&gt;)');
+  });
+});
+
+describe('global message identity (msg_id)', () => {
+  it('renders msg_id attribute when msg.id differs from seq', () => {
+    insertMessage('a2a-1786998296874-gdq5yv', 'chat', { sender: 'zed', text: 'cross-agent update' }, { seq: 164 });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('id="164"');
+    expect(result).toContain('msg_id="a2a-1786998296874-gdq5yv"');
+  });
+
+  it('escapes special characters in msg.id', () => {
+    insertMessage('msg-123<test>&"foo"', 'chat', { sender: 'alice', text: 'hello' }, { seq: 16 });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('id="16"');
+    expect(result).toContain('msg_id="msg-123&lt;test&gt;&amp;&quot;foo&quot;"');
+  });
+
+  it('renders id attribute with string id when seq is null', () => {
+    insertMessage('a2a-123', 'chat', { sender: 'zed', text: 'hello' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('id="a2a-123"');
+    expect(result).not.toContain('msg_id=');
   });
 });

@@ -200,7 +200,8 @@ function formatSingleChat(msg: MessageInRow): string {
   const sender = content.sender || content.author?.fullName || content.author?.userName || 'Unknown';
   const time = formatLocalTime(msg.timestamp, TIMEZONE);
   const text = content.text || '';
-  const idAttr = msg.seq != null ? ` id="${msg.seq}"` : '';
+  const idAttr = msg.seq != null ? ` id="${msg.seq}"` : msg.id ? ` id="${escapeXml(msg.id)}"` : '';
+  const msgIdAttr = msg.id && msg.seq != null && msg.id !== String(msg.seq) ? ` msg_id="${escapeXml(msg.id)}"` : '';
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
   const replyPrefix = formatReplyContext(content.replyTo);
   const linksSuffix = formatLinks(content.links, text);
@@ -209,7 +210,7 @@ function formatSingleChat(msg: MessageInRow): string {
 
   const fromAttr = originAttr(msg);
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+  return `<message${idAttr}${msgIdAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
 }
 
 /**
