@@ -112,6 +112,11 @@ From a channel you own or administer, you can manage groups and tasks:
 @Andy join the Family Chat group
 ```
 
+To include NanoClaw's Claude, Codex, OpenCode, and (when supported by the
+installed ccusage build) Antigravity usage in `ccusage` reports, run
+[`./bin/ccusage`](docs/ccusage.md) from this checkout. Use
+`./bin/ccusage nanoclaw daily` when you need the NanoClaw-only subtotal.
+
 ## Customizing
 
 NanoClaw doesn't use configuration files. To make changes, just tell Claude Code what you want:

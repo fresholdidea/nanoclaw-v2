@@ -20,6 +20,7 @@
     "setup": "tsx setup/index.ts",
     "setup:auto": "tsx setup/auto.ts",
     "ncl": "tsx src/cli/client.ts",
+    "ccusage": "tsx src/ccusage.ts",
     "chat": "tsx scripts/chat.ts",
     "auth": "tsx setup/index.ts --step whatsapp-auth",
     "lint": "eslint src/",
