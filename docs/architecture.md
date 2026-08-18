@@ -199,11 +199,12 @@ Dedup is the channel adapter's responsibility. Chat SDK handles this internally.
 ## Session DB Schema
 
 Split across the two files. JSON blobs for content — schema-free, format varies by `kind`.
-`seq` is a global ordering counter with a **disjoint parity**: the host writes even seqs to
+`seq` is a session-local ordering counter with a **disjoint parity**: the host writes even seqs to
 `messages_in`, the container writes odd seqs to `messages_out`. Each side reads the other's
-MAX(seq) to pick its next value, so seq is a single monotonic message id across both tables —
-which is why the agent-facing message id it returns from `send_message` (and accepts in
-`edit_message` / `add_reaction`) is unambiguous.
+MAX(seq) to pick its next value, so seq is a monotonic counter across both tables within a session.
+This is used for session-local tool operations (`edit_message` / `add_reaction`). For cross-session
+and cross-agent references, the globally unique string `id` (exposed as `msg_id` in formatted prompts)
+provides the unambiguous canonical identity.
 
 ```sql
 -- inbound.db — host writes, container opens read-only

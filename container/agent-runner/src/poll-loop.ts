@@ -13,9 +13,11 @@ import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, getOutboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
   clearContinuation,
+  clearCurrentBatchRouting,
   clearCurrentInReplyTo,
   migrateLegacyContinuation,
   setContinuation,
+  setCurrentBatchRouting,
   setCurrentInReplyTo,
 } from './db/session-state.js';
 import {
@@ -254,9 +256,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped.map((s) => s.id));
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
-    // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
-    // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(routing.inReplyTo);
+    // Publish the batch's routing map so MCP tools (send_message, send_file)
+    // can stamp per-destination in_reply_to onto outbound rows for messages
+    // in the claimed batch — preventing replies from correlating to unseen messages.
+    const batchRoutingMap: Record<string, { inReplyTo: string | null; threadId: string | null }> = {};
+    for (const m of messages) {
+      if (m.channel_type && m.platform_id) {
+        batchRoutingMap[`${m.channel_type}:${m.platform_id}`] = {
+          inReplyTo: m.id,
+          threadId: m.thread_id,
+        };
+      }
+    }
+    setCurrentBatchRouting(batchRoutingMap, routing.inReplyTo);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -303,7 +315,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // followed by a "Completed" line that reads like success.
       log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
     } finally {
-      clearCurrentInReplyTo();
+      clearCurrentBatchRouting();
       config.signal?.removeEventListener('abort', abortActiveQuery);
     }
 

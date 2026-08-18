@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
+import { setCurrentBatchRouting } from '../db/session-state.js';
 import { sendMessage } from './core.js';
 
 /**
@@ -31,11 +32,12 @@ function publishInReplyTo(id: string, ageMs = 0): void {
 
 beforeEach(() => {
   initTestSessionDb();
-  // Seed a peer agent destination
+  // Seed peer agent destinations
   getInboundDb()
     .prepare(
       `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-       VALUES ('peer', 'Peer', 'agent', NULL, NULL, 'ag-peer')`,
+       VALUES ('peer', 'Peer', 'agent', NULL, NULL, 'ag-peer'),
+              ('other', 'Other', 'agent', NULL, NULL, 'ag-other')`,
     )
     .run();
 });
@@ -53,6 +55,48 @@ describe('send_message MCP tool — in_reply_to plumbing', () => {
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].in_reply_to).toBe('inbound-msg-1');
+  });
+
+  it('stamps the claimed batch message id, ignoring newer unseen inbound rows', async () => {
+    // Current claimed batch has 'seen-current' from ag-peer
+    setCurrentBatchRouting(
+      {
+        'agent:ag-peer': { inReplyTo: 'seen-current', threadId: null },
+      },
+      'seen-current',
+    );
+
+    // Newer unseen row arrives in inbound.db from ag-peer
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, channel_type, platform_id)
+         VALUES ('unseen-newer', 100, 'chat', 'now', 'pending', '{}', 'agent', 'ag-peer')`,
+      )
+      .run();
+
+    await sendMessage.handler({ to: 'peer', text: 'reply to peer' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    // MUST be 'seen-current', NOT 'unseen-newer'
+    expect(out[0].in_reply_to).toBe('seen-current');
+  });
+
+  it('sets in_reply_to = null when sending to a peer not in the claimed batch', async () => {
+    // Current claimed batch only has messages from ag-peer
+    setCurrentBatchRouting(
+      {
+        'agent:ag-peer': { inReplyTo: 'seen-current', threadId: null },
+      },
+      'seen-current',
+    );
+
+    // Send to 'other' (ag-other), which was not in the claimed batch
+    await sendMessage.handler({ to: 'other', text: 'initiating new thread' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].in_reply_to).toBeNull();
   });
 
   it('writes null when no batch is active', async () => {

@@ -29,6 +29,7 @@ export function openInboundDb(dbPath: string): Database.Database {
 export function openOutboundDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma('busy_timeout = 5000');
+  db.pragma('query_only = ON');
   return db;
 }
 

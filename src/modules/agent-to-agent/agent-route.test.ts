@@ -375,6 +375,63 @@ describe('routeAgentMessage return-path', () => {
     expect(s2Rows).toHaveLength(1);
   });
 
+  it('competing sessions: peer-affinity routes to conversing session even if idle session was restarted with newer last_active', async () => {
+    // S1 communicates with B, establishing peer affinity
+    await routeAgentMessage(
+      {
+        id: 'msg-from-A-S1-chat',
+        platform_id: B,
+        content: JSON.stringify({ text: 'conversation from S1' }),
+        in_reply_to: null,
+      },
+      S1,
+    );
+
+    // S2 is an idle session that gets restarted/refreshed, setting last_active to a much newer time
+    updateSession(S2.id, { last_active: '2026-08-17T23:59:59.000Z' });
+
+    // B replies without in_reply_to (or with missing in_reply_to).
+    // Peer-affinity MUST still route back to S1 (the conversing session), NOT S2.
+    await routeAgentMessage(
+      {
+        id: 'msg-from-B-reply',
+        platform_id: A,
+        content: JSON.stringify({ text: 'reply to conversation' }),
+        in_reply_to: null,
+      },
+      SB,
+    );
+
+    const s1Rows = readInbound(A, S1.id);
+    const s2Rows = readInbound(A, S2.id);
+    expect(s1Rows).toHaveLength(1);
+    expect(JSON.parse(s1Rows[0].content).text).toBe('reply to conversation');
+    expect(s2Rows).toHaveLength(0);
+  });
+
+  it('unsolicited fallback: routes to session with most recent last_active', async () => {
+    // Both S1 and S2 exist. S1 has recent last_active, S2 does not.
+    updateSession(S1.id, { last_active: '2026-08-17T12:00:00.000Z' });
+    updateSession(S2.id, { last_active: '2026-08-01T12:00:00.000Z' });
+
+    // Unsolicited message from B to A (no peer history)
+    await routeAgentMessage(
+      {
+        id: 'msg-from-B-unsolicited',
+        platform_id: A,
+        content: JSON.stringify({ text: 'unsolicited' }),
+        in_reply_to: null,
+      },
+      SB,
+    );
+
+    const s1Rows = readInbound(A, S1.id);
+    const s2Rows = readInbound(A, S2.id);
+    // S1 wins because its last_active is newer than S2
+    expect(s1Rows).toHaveLength(1);
+    expect(s2Rows).toHaveLength(0);
+  });
+
   it('self-route is denied — an agent group cannot route a message to itself', async () => {
     // A targets itself. This is never a legitimate outbound: every host-side
     // "note to self" (approval follow-ups, restart notes) is written straight

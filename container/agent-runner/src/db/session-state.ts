@@ -91,6 +91,12 @@ export function clearContinuation(providerName: string): void {
  * (journal_mode=DELETE + busy_timeout make intra-container access safe).
  */
 const IN_REPLY_TO_KEY = 'current_in_reply_to';
+const BATCH_ROUTING_KEY = 'current_batch_routing';
+
+export interface BatchDestinationRouting {
+  inReplyTo: string | null;
+  threadId: string | null;
+}
 
 /**
  * Ignore a stamp older than this. The poll loop clears the stamp in a
@@ -120,4 +126,33 @@ export function getCurrentInReplyTo(): string | null {
   const age = Date.now() - new Date(row.updated_at).getTime();
   if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return null;
   return row.value;
+}
+
+export function setCurrentBatchRouting(
+  routingMap: Record<string, BatchDestinationRouting>,
+  defaultInReplyTo: string | null,
+): void {
+  setCurrentInReplyTo(defaultInReplyTo);
+  setValue(BATCH_ROUTING_KEY, JSON.stringify(routingMap));
+}
+
+export function clearCurrentBatchRouting(): void {
+  clearCurrentInReplyTo();
+  deleteValue(BATCH_ROUTING_KEY);
+}
+
+export function getCurrentBatchRouting(channelType: string, platformId: string): BatchDestinationRouting | null | undefined {
+  const row = getOutboundDb()
+    .prepare('SELECT value, updated_at FROM session_state WHERE key = ?')
+    .get(BATCH_ROUTING_KEY) as { value: string; updated_at: string } | undefined;
+  if (!row) return undefined;
+  const age = Date.now() - new Date(row.updated_at).getTime();
+  if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return undefined;
+  try {
+    const map = JSON.parse(row.value) as Record<string, BatchDestinationRouting>;
+    const key = `${channelType}:${platformId}`;
+    return map[key] ?? null;
+  } catch {
+    return undefined;
+  }
 }

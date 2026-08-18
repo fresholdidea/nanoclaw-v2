@@ -10,7 +10,13 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { ensureSchema, getInboundSourceSessionId, migrateMessagesInTable, syncProcessingAcks } from './session-db.js';
+import {
+  ensureSchema,
+  getInboundSourceSessionId,
+  migrateMessagesInTable,
+  openOutboundDb,
+  syncProcessingAcks,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -153,5 +159,29 @@ describe('syncProcessingAcks — script-skip counter', () => {
     syncProcessingAcks(inDb, outDb);
 
     expect(status(inDb, 't1')).toBe('completed');
+  });
+});
+
+describe('openOutboundDb read-only enforcement', () => {
+  it('allows SELECT queries but rejects mutations with attempt to write a readonly database', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const outDbPath = path.join(TEST_DIR, 'outbound.db');
+    ensureSchema(outDbPath, 'outbound');
+
+    const hostOutDb = openOutboundDb(outDbPath);
+
+    // SELECT succeeds
+    const rows = hostOutDb.prepare('SELECT * FROM messages_out').all();
+    expect(rows).toEqual([]);
+
+    // INSERT fails under PRAGMA query_only = ON
+    expect(() => {
+      hostOutDb
+        .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('m1', 1, 'now', 'chat', '{}')")
+        .run();
+    }).toThrow(/attempt to write a readonly database/);
+
+    hostOutDb.close();
   });
 });
