@@ -22,6 +22,8 @@ export interface RunnerConfig {
   effort?: string;
   providerChain?: string[];
   providerChainCooldownMinutes?: number;
+  transcriptRotateBytes?: number;
+  transcriptRotateAgeDays?: number;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -53,6 +55,8 @@ export function loadConfig(): RunnerConfig {
     effort: (raw.effort as string) || undefined,
     providerChain: Array.isArray(raw.providerChain) ? (raw.providerChain as string[]) : undefined,
     providerChainCooldownMinutes: (raw.providerChainCooldownMinutes as number) || undefined,
+    transcriptRotateBytes: (raw.transcriptRotateBytes as number) || undefined,
+    transcriptRotateAgeDays: (raw.transcriptRotateAgeDays as number) || undefined,
   };
 
   return _config;

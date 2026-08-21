@@ -14,9 +14,23 @@ import path from 'path';
 import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
 import { isValidTimezone } from './timezone.js';
 import { log } from './log.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
+
+/**
+ * Transcript-rotation defaults, forced into container.json so every group
+ * gets a value without needing an env var or a DB column. A group with zero
+ * chat wiring (no messaging_group_agents rows) only ever runs scheduled
+ * tasks, each with its own `system:tasks:<id>` session — long history there
+ * buys little, since each firing's prompt is self-contained, so it rotates
+ * far sooner than a live chat session would.
+ */
+const CHAT_TRANSCRIPT_ROTATE_BYTES = 4 * 1024 * 1024;
+const CHAT_TRANSCRIPT_ROTATE_AGE_DAYS = 5;
+const TASK_ONLY_TRANSCRIPT_ROTATE_BYTES = 1 * 1024 * 1024;
+const TASK_ONLY_TRANSCRIPT_ROTATE_AGE_DAYS = 2;
 
 /**
  * Container-side path where a group's stamped plugins are mounted read-only.
@@ -276,6 +290,8 @@ export interface ContainerConfig {
   model?: string;
   effort?: string;
   timezone?: string;
+  transcriptRotateBytes?: number;
+  transcriptRotateAgeDays?: number;
 }
 
 /**
@@ -339,6 +355,7 @@ export function sanitizeStoredMcpServers(raw: unknown, groupName: string): Recor
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
+  const isTaskOnly = getMessagingGroupsByAgentGroup(group.id).length === 0;
   return {
     mcpServers: sanitizeStoredMcpServers(JSON.parse(row.mcp_servers), group.name),
     packages: {
@@ -359,6 +376,8 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
+    transcriptRotateBytes: isTaskOnly ? TASK_ONLY_TRANSCRIPT_ROTATE_BYTES : CHAT_TRANSCRIPT_ROTATE_BYTES,
+    transcriptRotateAgeDays: isTaskOnly ? TASK_ONLY_TRANSCRIPT_ROTATE_AGE_DAYS : CHAT_TRANSCRIPT_ROTATE_AGE_DAYS,
   };
 }
 
