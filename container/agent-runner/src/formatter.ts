@@ -249,10 +249,20 @@ function formatEchoMessage(msg: MessageInRow): string {
  * originated — critical for explicit addressing.
  */
 function originAttr(msg: MessageInRow): string {
+  // Agent-channel messages additionally carry the peer's session id. An agent
+  // group can have many concurrent sessions (channel DMs, thread sessions,
+  // scheduled-task sessions) with divergent contexts, all presenting under
+  // one group name; without the session attribute a receiver cannot tell
+  // which "cache-am" is speaking, and cross-session contradictions read as
+  // forged messages (see the 2026-08-20 provenance incident).
+  const sessionAttr =
+    msg.channel_type === 'agent' && msg.source_session_id
+      ? ` session="${escapeXml(msg.source_session_id)}"`
+      : '';
   const fromDest = findByRouting(msg.channel_type, msg.platform_id);
-  if (fromDest) return ` from="${escapeXml(fromDest.name)}"`;
+  if (fromDest) return ` from="${escapeXml(fromDest.name)}"${sessionAttr}`;
   if (msg.channel_type || msg.platform_id) {
-    return ` from="unknown:${escapeXml(msg.channel_type || '')}:${escapeXml(msg.platform_id || '')}"`;
+    return ` from="unknown:${escapeXml(msg.channel_type || '')}:${escapeXml(msg.platform_id || '')}"${sessionAttr}`;
   }
   return '';
 }

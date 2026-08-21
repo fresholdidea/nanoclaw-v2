@@ -57,6 +57,40 @@ function insertMessage(
     );
 }
 
+describe('agent-to-agent source session attribution', () => {
+  function insertA2aMessage(id: string, sourceSessionId: string | null, text: string) {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, channel_type, platform_id, source_session_id, content)
+         VALUES (?, 'chat', ?, 'pending', 'agent', 'ag-peer-group', ?, ?)`,
+      )
+      .run(id, new Date().toISOString(), sourceSessionId, JSON.stringify({ sender: 'cache-am', text }));
+  }
+
+  it('stamps session="..." on agent-channel messages so peers with multiple sessions are distinguishable', () => {
+    insertA2aMessage('a2a-1', 'sess-1779772778492-wtp3f6', 'need a CPA pull');
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('session="sess-1779772778492-wtp3f6"');
+  });
+
+  it('omits the session attribute when source_session_id is NULL (pre-migration rows)', () => {
+    insertA2aMessage('a2a-2', null, 'legacy row');
+    const result = formatMessages(getPendingMessages());
+    expect(result).not.toContain('session=');
+  });
+
+  it('never stamps session on non-agent channel messages', () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, channel_type, platform_id, source_session_id, content)
+         VALUES ('t-1', 'chat', ?, 'pending', 'telegram', '12345', 'sess-should-not-show', ?)`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ sender: 'Brad', text: 'hi' }));
+    const result = formatMessages(getPendingMessages());
+    expect(result).not.toContain('session=');
+  });
+});
+
 describe('context timezone header', () => {
   it('prepends <context timezone="..."/> to formatted output', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'hello' });

@@ -29,7 +29,7 @@ import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../../db/session-db.js';
-import { getSession } from '../../db/sessions.js';
+import { TASKS_SYSTEM_THREAD_ID, findPrimaryChannelSession, getSession, isTaskThread } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
@@ -206,9 +206,15 @@ export interface RoutableAgentMessage {
  *    me, which target session was driving? Route the reply there, since
  *    that's the session most plausibly in active conversation.
  *
- * 3. **Newest active session**: legacy heuristic. Used when no prior a2a
- *    has been recorded with `source_session_id` (e.g. fresh installs,
- *    pre-migration data).
+ * 3. **Primary channel session**: fresh outreach (no return path, no peer
+ *    affinity) lands in the target's most recently active channel-facing
+ *    session — the conversation its humans actually see. Routing fresh a2a
+ *    into the hidden `(null, null)` fallback session created a second,
+ *    unsupervised context per group whose sends the channel-facing session
+ *    would truthfully deny (the 2026-08-20 provenance incidents).
+ *
+ * 4. **Newest active session**: legacy heuristic. Used when the target has
+ *    no channel session at all (e.g. task-only groups, fresh installs).
  */
 function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session, targetAgentGroupId: string): Session {
   const srcDb = openInboundDb(sourceSession.agent_group_id, sourceSession.id);
@@ -232,7 +238,42 @@ function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session,
       return candidate;
     }
   }
+  const primary = findPrimaryChannelSession(targetAgentGroupId);
+  if (primary) return primary;
   return resolveSession(targetAgentGroupId, null, null, 'agent-shared').session;
+}
+
+/**
+ * Host-attested sender label for an a2a message, derived from the SOURCE
+ * session. Only channel-facing sessions speak under the bare agent name;
+ * task, thread, and fallback sessions are marked so a receiver can tell a
+ * peer's subagent contexts from its main one ("Zed" vs "Zed [task
+ * weekly-client-status]"). Applied by overwriting any agent-supplied
+ * `sender` — provenance is the host's to assert, not the sender's.
+ */
+export function a2aSenderLabel(agentName: string, source: Session): string {
+  const threadId = source.thread_id;
+  if (isTaskThread(threadId)) {
+    const taskName = threadId === TASKS_SYSTEM_THREAD_ID ? '' : threadId!.slice(TASKS_SYSTEM_THREAD_ID.length + 1);
+    return taskName ? `${agentName} [task ${taskName}]` : `${agentName} [task]`;
+  }
+  if (threadId) return `${agentName} [thread]`;
+  if (source.messaging_group_id) return agentName;
+  return `${agentName} [shared]`;
+}
+
+/** Overwrite `sender` in a JSON content payload; non-JSON content passes through. */
+function stampSender(contentStr: string, label: string): string {
+  try {
+    const parsed = JSON.parse(contentStr) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      (parsed as Record<string, unknown>).sender = label;
+      return JSON.stringify(parsed);
+    }
+  } catch {
+    // Non-JSON content — leave unchanged.
+  }
+  return contentStr;
 }
 
 export async function routeAgentMessage(
@@ -339,6 +380,9 @@ async function performAgentRoute(
   // read the bytes — they live in a session dir it doesn't mount.
   const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
 
+  const sourceName = getAgentGroup(session.agent_group_id)?.name ?? session.agent_group_id;
+  const attributedContent = stampSender(forwardedContent, a2aSenderLabel(sourceName, session));
+
   writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
     kind: 'chat',
@@ -346,7 +390,7 @@ async function performAgentRoute(
     platformId: session.agent_group_id,
     channelType: 'agent',
     threadId: null,
-    content: forwardedContent,
+    content: attributedContent,
     sourceSessionId: session.id,
   });
   log.info('Agent message routed', {
