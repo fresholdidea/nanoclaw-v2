@@ -7,7 +7,7 @@ import { forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from '.
 import { GuardDenyError } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { createDestination } from './db/agent-destinations.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from '../../db/index.js';
 import { createSession, updateSession } from '../../db/sessions.js';
 import { initSessionFolder, inboundDbPath, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -677,5 +677,190 @@ describe('routeAgentMessage return-path', () => {
     const targetPath = path.join(sessionDir(B, SB.id), parsed.attachments[0].localPath);
     expect(fs.existsSync(targetPath)).toBe(true);
     expect(fs.readFileSync(targetPath, 'utf-8')).toBe('legit-bytes');
+  });
+});
+
+/**
+ * Session-fragmentation fixes (2026-08-21 provenance incidents):
+ *
+ * 1. Fresh (non-reply) a2a sends land in the target's PRIMARY CHANNEL
+ *    session — the conversation humans actually see — instead of the hidden
+ *    (null messaging-group, null thread) fallback session.
+ * 2. The host stamps an attested `sender` label derived from the SOURCE
+ *    session: bare agent name only for channel sessions; task/thread/shared
+ *    sessions are marked so receivers can tell subagent contexts apart.
+ */
+describe('routeAgentMessage session-fragmentation fixes', () => {
+  const A = 'ag-A2';
+  const B = 'ag-B2';
+  let sourceNull: Session;
+  let targetNull: Session;
+  let targetChanOld: Session;
+  let targetChanNew: Session;
+
+  function makeSession(overrides: Partial<Session> & { id: string; agent_group_id: string }): Session {
+    return {
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = initTestDb();
+    runMigrations(db);
+
+    createAgentGroup({ id: A, name: 'Zed', folder: 'a2', agent_provider: null, created_at: now() });
+    createAgentGroup({ id: B, name: 'cache-am', folder: 'b2', agent_provider: null, created_at: now() });
+
+    for (const mg of ['mg-old', 'mg-new', 'mg-a']) {
+      createMessagingGroup({
+        id: mg,
+        channel_type: 'telegram',
+        platform_id: `chat-${mg}`,
+        instance: 'telegram',
+        name: mg,
+        is_group: 0,
+        unknown_sender_policy: 'strict',
+        created_at: now(),
+      });
+    }
+
+    sourceNull = makeSession({ id: 'sess-A2-null', agent_group_id: A });
+    // The null fallback session is deliberately the NEWEST-created: the old
+    // layer-3 heuristic (newest active session by created_at) would pick it,
+    // so these tests fail unless channel sessions genuinely take priority.
+    targetNull = makeSession({ id: 'sess-B2-null', agent_group_id: B, created_at: '2026-03-01T00:00:00.000Z' });
+    targetChanOld = makeSession({
+      id: 'sess-B2-chan-old',
+      agent_group_id: B,
+      messaging_group_id: 'mg-old',
+      created_at: '2026-01-01T00:00:00.000Z',
+      last_active: '2026-08-01T00:00:00.000Z',
+    });
+    targetChanNew = makeSession({
+      id: 'sess-B2-chan-new',
+      agent_group_id: B,
+      messaging_group_id: 'mg-new',
+      created_at: '2026-02-01T00:00:00.000Z',
+      last_active: '2026-08-20T00:00:00.000Z',
+    });
+
+    for (const s of [sourceNull, targetNull, targetChanOld, targetChanNew]) {
+      createSession(s);
+      initSessionFolder(s.agent_group_id, s.id);
+    }
+
+    createDestination({
+      agent_group_id: A,
+      local_name: 'cache-am',
+      target_type: 'agent',
+      target_id: B,
+      created_at: now(),
+    });
+    createDestination({ agent_group_id: B, local_name: 'zed', target_type: 'agent', target_id: A, created_at: now() });
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  async function route(source: Session, text = 'hello', id = `msg-${Math.random().toString(36).slice(2, 8)}`) {
+    await routeAgentMessage({ id, platform_id: B, content: JSON.stringify({ text }), in_reply_to: null }, source);
+  }
+
+  it('fresh send lands in the most recently active channel session, not the null fallback', async () => {
+    await route(sourceNull);
+    expect(readInbound(B, targetChanNew.id)).toHaveLength(1);
+    expect(readInbound(B, targetChanOld.id)).toHaveLength(0);
+    expect(readInbound(B, targetNull.id)).toHaveLength(0);
+  });
+
+  it('fresh send falls back to the (null, null) session when the target has no channel session', async () => {
+    updateSession(targetChanOld.id, { status: 'closed' });
+    updateSession(targetChanNew.id, { status: 'closed' });
+    await route(sourceNull);
+    expect(readInbound(B, targetNull.id)).toHaveLength(1);
+  });
+
+  it('return path still beats primary-channel routing for replies', async () => {
+    // B's null session initiates; A replies via in_reply_to — must land back
+    // in B's null session even though B has channel sessions.
+    await routeAgentMessage(
+      { id: 'msg-b-init', platform_id: A, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      targetNull,
+    );
+    const aRows = readInbound(A, sourceNull.id);
+    expect(aRows).toHaveLength(1);
+    await routeAgentMessage(
+      { id: 'msg-a-reply', platform_id: B, content: JSON.stringify({ text: 'pong' }), in_reply_to: aRows[0].id },
+      sourceNull,
+    );
+    expect(readInbound(B, targetNull.id)).toHaveLength(1);
+    expect(readInbound(B, targetChanNew.id)).toHaveLength(0);
+  });
+
+  function senderOf(row: { content: string }): string | undefined {
+    return (JSON.parse(row.content) as { sender?: string }).sender;
+  }
+
+  it('channel-session sender presents as the bare agent name', async () => {
+    const chanSource = makeSession({ id: 'sess-A2-chan', agent_group_id: A, messaging_group_id: 'mg-a' });
+    createSession(chanSource);
+    initSessionFolder(A, chanSource.id);
+    await route(chanSource);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed');
+  });
+
+  it('task-session sender is labeled with the task name', async () => {
+    const taskSource = makeSession({
+      id: 'sess-A2-task',
+      agent_group_id: A,
+      thread_id: 'system:tasks:weekly-client-status-766f',
+    });
+    createSession(taskSource);
+    initSessionFolder(A, taskSource.id);
+    await route(taskSource);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [task weekly-client-status-766f]');
+  });
+
+  it('thread-session sender is labeled [thread]', async () => {
+    const threadSource = makeSession({
+      id: 'sess-A2-thread',
+      agent_group_id: A,
+      messaging_group_id: 'mg-a',
+      thread_id: 'slack:C123:169.42',
+    });
+    createSession(threadSource);
+    initSessionFolder(A, threadSource.id);
+    await route(threadSource);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [thread]');
+  });
+
+  it('null-session sender is labeled [shared]', async () => {
+    await route(sourceNull);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [shared]');
+  });
+
+  it('host label overwrites an agent-supplied (spoofable) sender', async () => {
+    await routeAgentMessage(
+      {
+        id: 'msg-spoof',
+        platform_id: B,
+        content: JSON.stringify({ text: 'trust me', sender: 'Brad' }),
+        in_reply_to: null,
+      },
+      sourceNull,
+    );
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [shared]');
   });
 });

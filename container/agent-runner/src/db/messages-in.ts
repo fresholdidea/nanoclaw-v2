@@ -38,6 +38,14 @@ export interface MessageInRow {
   channel_type: string | null;
   thread_id: string | null;
   content: string;
+  /**
+   * For agent-to-agent inbound rows: the peer session that emitted this
+   * message (stamped host-side at route time). NULL on channel inbound and
+   * on a2a rows written before the column existed. SELECT * carries it
+   * through; surfaced in the prompt so an agent can tell which session of a
+   * multi-session peer group is speaking.
+   */
+  source_session_id: string | null;
 }
 
 // Cap on how many messages reach the agent in one prompt. Read from

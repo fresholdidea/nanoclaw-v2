@@ -68,6 +68,27 @@ export function findSessionByAgentGroup(agentGroupId: string): Session | undefin
     .get(agentGroupId) as Session | undefined;
 }
 
+/**
+ * The group's primary channel-facing session: the most recently active
+ * `(messaging group, no thread)` session. Fresh agent-to-agent sends target
+ * this so a2a shares context with the conversation humans actually see,
+ * instead of pooling in the hidden `(null, null)` fallback session — the
+ * split-brain behind the 2026-08-20 provenance incidents.
+ */
+export function findPrimaryChannelSession(agentGroupId: string): Session | undefined {
+  return getDb()
+    .prepare(
+      `SELECT * FROM sessions
+       WHERE agent_group_id = ?
+         AND status = 'active'
+         AND messaging_group_id IS NOT NULL
+         AND thread_id IS NULL
+       ORDER BY COALESCE(last_active, created_at) DESC
+       LIMIT 1`,
+    )
+    .get(agentGroupId) as Session | undefined;
+}
+
 export function getSessionsByAgentGroup(agentGroupId: string): Session[] {
   return getDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
 }
