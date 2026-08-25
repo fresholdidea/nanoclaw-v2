@@ -177,6 +177,7 @@ export type ProviderEvent =
   | { type: 'text'; text: string }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
+  | { type: 'file'; path: string }
   /**
    * A harness-generated file to deliver to the turn's channel. Providers whose
    * underlying harness produces files the model itself never sends (e.g. Codex

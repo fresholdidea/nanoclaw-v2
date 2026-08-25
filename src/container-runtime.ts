@@ -1,105 +1,16 @@
 /**
- * Container runtime abstraction for NanoClaw.
- * All runtime-specific logic lives here so swapping runtimes means changing one file.
+ * Container runtime constants.
+ *
+ * This file used to claim that "all runtime-specific logic lives here so
+ * swapping runtimes means changing one file" while the actual runtime logic —
+ * spawn argv, mounts, hardening, kill/stop, orphan reaping — lived in
+ * `container-runner.ts` and the egress module. That logic now lives behind the
+ * driver seam (`src/drivers/`), which is what makes the claim true.
+ *
+ * What is left is the binary name, still needed by the few paths that shell
+ * Docker for something that is not a session: per-group image builds and the
+ * egress lockdown network.
  */
-import { execSync } from 'child_process';
-import os from 'os';
-
-import { CONTAINER_INSTALL_LABEL } from './config.js';
-import { log } from './log.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
-
-/** CLI args needed for the container to resolve the host gateway. */
-export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
-  }
-  return [];
-}
-
-/** Returns CLI args for a readonly bind mount. */
-export function readonlyMountArgs(hostPath: string, containerPath: string): string[] {
-  return ['-v', `${hostPath}:${containerPath}:ro`];
-}
-
-/** Stop a container by name. Uses execFileSync to avoid shell injection. */
-export function stopContainer(name: string): void {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
-    throw new Error(`Invalid container name: ${name}`);
-  }
-  execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
-}
-
-/** Ensure the container runtime is running, starting it if needed. */
-export function ensureContainerRuntimeRunning(): void {
-  try {
-    execSync(`${CONTAINER_RUNTIME_BIN} info`, {
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    log.debug('Container runtime already running');
-  } catch (err) {
-    log.error('Failed to reach container runtime', { err });
-    console.error('\n╔════════════════════════════════════════════════════════════════╗');
-    console.error('║  FATAL: Container runtime failed to start                      ║');
-    console.error('║                                                                ║');
-    console.error('║  Agents cannot run without a container runtime. To fix:        ║');
-    console.error('║  1. Ensure Docker is installed and running                     ║');
-    console.error('║  2. Run: docker info                                           ║');
-    console.error('║  3. Restart NanoClaw                                           ║');
-    console.error('╚════════════════════════════════════════════════════════════════╝\n');
-    throw new Error('Container runtime is required but failed to start', {
-      cause: err,
-    });
-  }
-}
-
-/**
- * Kill orphaned NanoClaw containers from THIS install's previous runs.
- *
- * Scoped by label `nanoclaw-install=<slug>` so a crash-looping peer install
- * cannot reap our containers, and we cannot reap theirs. The label is
- * stamped onto every container at spawn time — see container-runner.ts.
- */
-export function cleanupOrphans(): void {
-  try {
-    const list = execSync(
-      // The format arg must be single-quoted for the shell: the Go template's own
-      // double quotes around the label key would otherwise terminate the shell
-      // quoting and docker sees a mangled template ("bad character U+002D").
-      `${CONTAINER_RUNTIME_BIN} ps --filter "name=^nanoclaw-v2-" --format '{{.Names}}\t{{.Label "nanoclaw-install"}}'`,
-      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
-    )
-      .trim()
-      .split('\n')
-      .filter(Boolean);
-
-    // `{{.Label "nanoclaw-install"}}` prints the label VALUE (the bare slug),
-    // not the key=value pair that CONTAINER_INSTALL_LABEL holds.
-    const installSlug = CONTAINER_INSTALL_LABEL.split('=')[1];
-    const orphans: string[] = [];
-    for (const line of list) {
-      const [name, label] = line.split('\t');
-      // Pass 1: exact slug match. Pass 2: pre-label-fix zombies (empty label)
-      if (label === installSlug || !label) {
-        orphans.push(name);
-      }
-    }
-
-    for (const name of orphans) {
-      try {
-        stopContainer(name);
-      } catch {
-        /* already stopped */
-      }
-    }
-    if (orphans.length > 0) {
-      log.info('Stopped orphaned containers', { count: orphans.length, names: orphans });
-    }
-  } catch (err) {
-    log.warn('Failed to clean up orphaned containers', { err });
-  }
-}

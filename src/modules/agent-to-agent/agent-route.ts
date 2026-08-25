@@ -11,12 +11,8 @@
  * The target agent can then forward the file onward via its own `send_file`
  * call using the absolute `/workspace/inbox/<a2a-msg-id>/<filename>` path.
  *
- * Self-routes are refused. System notes injected back into an agent's own
- * session (post-approval follow-ups, restart notes) never travel this path —
- * the host writes them straight into the session's inbound DB via
- * `writeSessionMessage`. An outbound row addressed to its own group is
- * therefore always a routing echo, and routing it self-feeds forever; see the
- * self-route check in `guard.ts`.
+ * Self-messages are always allowed (used for system notes injected back into
+ * an agent's own session, e.g. post-approval follow-up prompts).
  *
  * Core delivery.ts dispatches into this via a dynamic import guarded by a
  * `channel_type === 'agent'` check. When the module is absent the check in
@@ -28,12 +24,11 @@ import path from 'path';
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../../db/session-db.js';
-import { TASKS_SYSTEM_THREAD_ID, findPrimaryChannelSession, getSession, isTaskThread } from '../../db/sessions.js';
+import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
-import { openInboundDb, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { resolveSession, sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
 import { A2A_MESSAGE_GATE_ACTION, a2aSend } from './guard.js';
@@ -206,74 +201,35 @@ export interface RoutableAgentMessage {
  *    me, which target session was driving? Route the reply there, since
  *    that's the session most plausibly in active conversation.
  *
- * 3. **Primary channel session**: fresh outreach (no return path, no peer
- *    affinity) lands in the target's most recently active channel-facing
- *    session — the conversation its humans actually see. Routing fresh a2a
- *    into the hidden `(null, null)` fallback session created a second,
- *    unsupervised context per group whose sends the channel-facing session
- *    would truthfully deny (the 2026-08-20 provenance incidents).
- *
- * 4. **Newest active session**: legacy heuristic. Used when the target has
- *    no channel session at all (e.g. task-only groups, fresh installs).
+ * 3. **Newest active session**: legacy heuristic. Used when no prior a2a
+ *    has been recorded with `source_session_id` (e.g. fresh installs,
+ *    pre-migration data).
  */
-function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session, targetAgentGroupId: string): Session {
-  const srcDb = openInboundDb(sourceSession.agent_group_id, sourceSession.id);
-  let originSessionId: string | null = null;
-  try {
+async function resolveTargetSession(
+  msg: RoutableAgentMessage,
+  sourceSession: Session,
+  targetAgentGroupId: string,
+): Promise<Session> {
+  const originSessionId = await withExistingMailboxSession(sourceSession.agent_group_id, sourceSession.id, (srcDb) => {
+    let origin: string | null = null;
     if (msg.in_reply_to) {
-      originSessionId = getInboundSourceSessionId(srcDb, msg.in_reply_to);
+      origin = srcDb.getInboundSourceSessionId(msg.in_reply_to);
     }
-    if (!originSessionId) {
+    if (!origin) {
       // Peer-affinity fallback — covers the case where the container's
       // outbound write didn't carry in_reply_to (e.g. legacy MCP send_message
       // path, container running pre-fix code).
-      originSessionId = getMostRecentPeerSourceSessionId(srcDb, targetAgentGroupId);
+      origin = srcDb.getMostRecentPeerSourceSessionId(targetAgentGroupId);
     }
-  } finally {
-    srcDb.close();
-  }
+    return origin;
+  });
   if (originSessionId) {
-    const candidate = getSession(originSessionId);
+    const candidate = await getSession(originSessionId);
     if (candidate && candidate.agent_group_id === targetAgentGroupId && candidate.status === 'active') {
       return candidate;
     }
   }
-  const primary = findPrimaryChannelSession(targetAgentGroupId);
-  if (primary) return primary;
-  return resolveSession(targetAgentGroupId, null, null, 'agent-shared').session;
-}
-
-/**
- * Host-attested sender label for an a2a message, derived from the SOURCE
- * session. Only channel-facing sessions speak under the bare agent name;
- * task, thread, and fallback sessions are marked so a receiver can tell a
- * peer's subagent contexts from its main one ("Zed" vs "Zed [task
- * weekly-client-status]"). Applied by overwriting any agent-supplied
- * `sender` — provenance is the host's to assert, not the sender's.
- */
-export function a2aSenderLabel(agentName: string, source: Session): string {
-  const threadId = source.thread_id;
-  if (isTaskThread(threadId)) {
-    const taskName = threadId === TASKS_SYSTEM_THREAD_ID ? '' : threadId!.slice(TASKS_SYSTEM_THREAD_ID.length + 1);
-    return taskName ? `${agentName} [task ${taskName}]` : `${agentName} [task]`;
-  }
-  if (threadId) return `${agentName} [thread]`;
-  if (source.messaging_group_id) return agentName;
-  return `${agentName} [shared]`;
-}
-
-/** Overwrite `sender` in a JSON content payload; non-JSON content passes through. */
-function stampSender(contentStr: string, label: string): string {
-  try {
-    const parsed = JSON.parse(contentStr) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      (parsed as Record<string, unknown>).sender = label;
-      return JSON.stringify(parsed);
-    }
-  } catch {
-    // Non-JSON content — leave unchanged.
-  }
-  return contentStr;
+  return (await resolveSession(targetAgentGroupId, null, null, 'agent-shared')).session;
 }
 
 export async function routeAgentMessage(
@@ -287,11 +243,12 @@ export async function routeAgentMessage(
     throw new Error(`agent-to-agent message ${msg.id} is missing a target agent group id`);
   }
 
-  // The a2a.send decision (guard.ts) runs: self-route deny, destination ACL
-  // deny, target-exists deny, agent_message_policies hold. An approved replay carries the
+  // The a2a.send decision (guard.ts) carries the checks verbatim in their
+  // original order: destination ACL deny, target-exists deny, self-send
+  // allow, agent_message_policies hold. An approved replay carries the
   // grant — the hold is satisfied but the structure is re-checked live, so
   // revoking a destination between hold and approve blocks delivery.
-  const decision = guard(a2aSend, {
+  const decision = await guard(a2aSend, {
     actor: { kind: 'agent', agentGroupId: sourceAgentGroupId, sessionId: session.id },
     resource: { from: sourceAgentGroupId, to: targetAgentGroupId },
     payload: { id: msg.id, platform_id: targetAgentGroupId, content: msg.content, in_reply_to: msg.in_reply_to },
@@ -306,8 +263,8 @@ export async function routeAgentMessage(
   // consumes the outbound row; `applyA2aMessageGate` re-enters here with the
   // grant on approve.
   if (decision.effect === 'hold') {
-    const sourceName = getAgentGroup(sourceAgentGroupId)?.name ?? sourceAgentGroupId;
-    const targetName = getAgentGroup(targetAgentGroupId)?.name ?? targetAgentGroupId;
+    const sourceName = (await getAgentGroup(sourceAgentGroupId))?.name ?? sourceAgentGroupId;
+    const targetName = (await getAgentGroup(targetAgentGroupId))?.name ?? targetAgentGroupId;
     await requestApproval({
       session,
       agentName: sourceName,
@@ -370,7 +327,7 @@ async function performAgentRoute(
   session: Session,
   targetAgentGroupId: string,
 ): Promise<void> {
-  const targetSession = resolveTargetSession(msg, session, targetAgentGroupId);
+  const targetSession = await resolveTargetSession(msg, session, targetAgentGroupId);
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // If the source message references files (via `send_file`), forward the
@@ -380,17 +337,14 @@ async function performAgentRoute(
   // read the bytes — they live in a session dir it doesn't mount.
   const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
 
-  const sourceName = getAgentGroup(session.agent_group_id)?.name ?? session.agent_group_id;
-  const attributedContent = stampSender(forwardedContent, a2aSenderLabel(sourceName, session));
-
-  writeSessionMessage(targetAgentGroupId, targetSession.id, {
+  await writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
     kind: 'chat',
     timestamp: new Date().toISOString(),
     platformId: session.agent_group_id,
     channelType: 'agent',
     threadId: null,
-    content: attributedContent,
+    content: forwardedContent,
     sourceSessionId: session.id,
   });
   log.info('Agent message routed', {
@@ -400,7 +354,7 @@ async function performAgentRoute(
     a2aMsgId,
     forwardedFileCount: countForwardedFiles(forwardedContent),
   });
-  const fresh = getSession(targetSession.id);
+  const fresh = await getSession(targetSession.id);
   if (fresh) await wakeContainer(fresh);
 }
 

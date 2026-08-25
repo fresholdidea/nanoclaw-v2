@@ -9,19 +9,26 @@ import './core.js';
 import './interactive.js';
 import './agents.js';
 import './self-mod.js';
-// Provider-delegation tools. Registered unconditionally: each handler
-// self-describes the "not enabled" case (missing binary → clean error),
-// so a group without agy/opencode tooling sees a tool that explains how to
-// enable it rather than a silently-absent one.
-import './query-agy.js';
-import './query-opencode.js';
+// Module barrel — loads registration modules, including the singular mailbox slot.
+import '../modules/index.js';
+import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
 
-startMcpServer().catch((err) => {
+async function main(): Promise<void> {
+  const mailbox = getAgentMailbox();
+  await mailbox.start(await readMailboxContext());
+  try {
+    await startMcpServer((action) => mailbox.run(action));
+  } finally {
+    await mailbox.stop();
+  }
+}
+
+main().catch((err) => {
   log(`MCP server error: ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 });

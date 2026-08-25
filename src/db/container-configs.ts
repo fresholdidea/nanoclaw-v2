@@ -11,45 +11,31 @@ const SCALAR_COLUMNS = new Set([
   'max_messages_per_prompt',
   'cli_scope',
   'timezone',
-  'enable_agy_tooling',
-  'enable_opencode_tooling',
 ]);
-const JSON_COLUMNS = new Set([
-  'skills',
-  'mcp_servers',
-  'packages_apt',
-  'packages_npm',
-  'additional_mounts',
-  // provider_chain is intentionally excluded: the dedicated updateContainerConfig fn
-  // handles it with proper null-vs-"null" semantics, and getContainerConfig returns it
-  // as a raw JSON string (or SQL NULL) for resolveProviderChain to parse itself.
-]);
+const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
-export function getContainerConfig(agentGroupId: string): ContainerConfigRow | undefined {
-  return getDb().prepare('SELECT * FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
-    | ContainerConfigRow
-    | undefined;
+export async function getContainerConfig(agentGroupId: string): Promise<ContainerConfigRow | undefined> {
+  return getDb().get<ContainerConfigRow>('SELECT * FROM container_configs WHERE agent_group_id = ?', agentGroupId);
 }
 
-export function getAllContainerConfigs(): ContainerConfigRow[] {
-  return getDb().prepare('SELECT * FROM container_configs').all() as ContainerConfigRow[];
+export async function getAllContainerConfigs(): Promise<ContainerConfigRow[]> {
+  return getDb().all<ContainerConfigRow>('SELECT * FROM container_configs');
 }
 
 /** Insert a new config row. Caller must supply all JSON fields (use defaults for empty). */
-export function createContainerConfig(config: ContainerConfigRow): void {
-  getDb()
-    .prepare(
-      `INSERT INTO container_configs (
+export async function createContainerConfig(config: ContainerConfigRow): Promise<void> {
+  await getDb().run(
+    `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
         max_messages_per_prompt, skills, mcp_servers, packages_apt, packages_npm,
-        additional_mounts, cli_scope, timezone, enable_agy_tooling, enable_opencode_tooling, updated_at
+        additional_mounts, cli_scope, timezone, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @skills, @mcp_servers, @packages_apt, @packages_npm,
-        @additional_mounts, @cli_scope, @timezone, @enable_agy_tooling, @enable_opencode_tooling, @updated_at
+        @additional_mounts, @cli_scope, @timezone, @updated_at
       )`,
-    )
-    .run(config);
+    config,
+  );
 }
 
 /**
@@ -62,7 +48,7 @@ export function createContainerConfig(config: ContainerConfigRow): void {
  * `claude` and an absent value that resolves to claude are stored as NULL — the
  * column means "follows the built-in default", matching pre-feature rows.
  */
-export function ensureContainerConfig(agentGroupId: string, provider?: string | null): void {
+export async function ensureContainerConfig(agentGroupId: string, provider?: string | null): Promise<void> {
   // Single chokepoint for the instance default: a fresh row with no explicit
   // provider is stamped with DEFAULT_AGENT_PROVIDER, so every new-group creation
   // path inherits it without each having to remember. INSERT OR IGNORE keeps an
@@ -76,16 +62,18 @@ export function ensureContainerConfig(agentGroupId: string, provider?: string | 
   // column matches what resolution lowercases to.
   const normalized = (provider ?? DEFAULT_AGENT_PROVIDER).toLowerCase();
   const stamped = normalized && normalized !== 'claude' ? normalized : null;
-  getDb()
-    .prepare(
-      `INSERT OR IGNORE INTO container_configs (agent_group_id, provider, updated_at)
-       VALUES (?, ?, ?)`,
-    )
-    .run(agentGroupId, stamped, new Date().toISOString());
+  await getDb().run(
+    `INSERT INTO container_configs (agent_group_id, provider, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT (agent_group_id) DO NOTHING`,
+    agentGroupId,
+    stamped,
+    new Date().toISOString(),
+  );
 }
 
 /** Update scalar fields on a config row. Only touches fields present in `updates`. */
-export function updateContainerConfigScalars(
+export async function updateContainerConfigScalars(
   agentGroupId: string,
   updates: Partial<
     Pick<
@@ -98,11 +86,9 @@ export function updateContainerConfigScalars(
       | 'max_messages_per_prompt'
       | 'cli_scope'
       | 'timezone'
-      | 'enable_agy_tooling'
-      | 'enable_opencode_tooling'
     >
   >,
-): void {
+): Promise<void> {
   const fields: string[] = [];
   const values: Record<string, unknown> = { agent_group_id: agentGroupId };
 
@@ -118,47 +104,25 @@ export function updateContainerConfigScalars(
   fields.push('updated_at = @updated_at');
   values.updated_at = new Date().toISOString();
 
-  getDb()
-    .prepare(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`)
-    .run(values);
+  await getDb().run(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`, values);
 }
 
-/** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts, provider_chain. */
-export function updateContainerConfigJson(
+/** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts. */
+export async function updateContainerConfigJson(
   agentGroupId: string,
-  column: 'skills' | 'mcp_servers' | 'packages_apt' | 'packages_npm' | 'additional_mounts' | 'provider_chain',
+  column: 'skills' | 'mcp_servers' | 'packages_apt' | 'packages_npm' | 'additional_mounts',
   value: unknown,
-): void {
+): Promise<void> {
   if (!JSON_COLUMNS.has(column)) throw new Error(`Invalid JSON column: ${column}`);
   const now = new Date().toISOString();
-  getDb()
-    .prepare(`UPDATE container_configs SET ${column} = ?, updated_at = ? WHERE agent_group_id = ?`)
-    .run(JSON.stringify(value), now, agentGroupId);
+  await getDb().run(
+    `UPDATE container_configs SET ${column} = ?, updated_at = ? WHERE agent_group_id = ?`,
+    JSON.stringify(value),
+    now,
+    agentGroupId,
+  );
 }
 
-/**
- * Update the provider_chain column. Pass `null` to clear (revert to instance default).
- * The chain is stored as a JSON-encoded array string.
- */
-export function updateContainerConfig(agentGroupId: string, updates: { providerChain?: string[] | null }): void {
-  const fields: string[] = [];
-  const values: Record<string, unknown> = { agent_group_id: agentGroupId };
-
-  if ('providerChain' in updates) {
-    fields.push('provider_chain = @provider_chain');
-    values.provider_chain = updates.providerChain != null ? JSON.stringify(updates.providerChain) : null;
-  }
-
-  if (fields.length === 0) return;
-
-  fields.push('updated_at = @updated_at');
-  values.updated_at = new Date().toISOString();
-
-  getDb()
-    .prepare(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`)
-    .run(values);
-}
-
-export function deleteContainerConfig(agentGroupId: string): void {
-  getDb().prepare('DELETE FROM container_configs WHERE agent_group_id = ?').run(agentGroupId);
+export async function deleteContainerConfig(agentGroupId: string): Promise<void> {
+  await getDb().run('DELETE FROM container_configs WHERE agent_group_id = ?', agentGroupId);
 }

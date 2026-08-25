@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { getContinuation, getCurrentBatchRouting, setContinuation } from './db/session-state.js';
+import { getContinuation, setContinuation } from './db/session-state.js';
+import { getSessionRouting } from './db/session-routing.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
@@ -33,53 +34,11 @@ function insertMessage(id: string, content: object, opts?: { platformId?: string
 }
 
 describe('poll loop integration', () => {
-  it('publishes routing only for messages that survive command and script filtering', async () => {
-    const insertRouted = (
-      id: string,
-      seq: number,
-      kind: 'chat' | 'task',
-      channelType: string,
-      platformId: string,
-      content: object,
-    ) => {
-      getInboundDb()
-        .prepare(
-          `INSERT INTO messages_in
-             (id, seq, kind, timestamp, status, trigger, channel_type, platform_id, content)
-           VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'pending', 1, ?, ?, ?)`,
-        )
-        .run(id, seq, kind, channelType, platformId, JSON.stringify(content));
-    };
+  it('defaults only when the legacy session routing table is absent', () => {
+    expect(getSessionRouting()).toEqual({ channel_type: null, platform_id: null, thread_id: null });
 
-    insertRouted('visible-peer', 2, 'chat', 'agent', 'ag-peer', { sender: 'Peer', text: 'handle this' });
-    insertRouted('clear-command', 4, 'chat', 'agent', 'ag-command', { sender: 'Admin', text: '/clear' });
-    insertRouted('gated-task', 6, 'task', 'agent', 'ag-task', {
-      prompt: 'do not wake',
-      script: `printf '%s\\n' '{"wakeAgent":false}'`,
-    });
-
-    let observed = false;
-    let visibleRouting: ReturnType<typeof getCurrentBatchRouting>;
-    let commandRouting: ReturnType<typeof getCurrentBatchRouting>;
-    let gatedRouting: ReturnType<typeof getCurrentBatchRouting>;
-    const provider = new MockProvider({}, () => {
-      visibleRouting = getCurrentBatchRouting('agent', 'ag-peer');
-      commandRouting = getCurrentBatchRouting('agent', 'ag-command');
-      gatedRouting = getCurrentBatchRouting('agent', 'ag-task');
-      observed = true;
-      return '';
-    });
-    const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
-
-    await waitFor(() => observed, 3000);
-    controller.abort();
-
-    expect(visibleRouting).toEqual({ inReplyTo: 'visible-peer', threadId: null });
-    expect(commandRouting).toBeNull();
-    expect(gatedRouting).toBeNull();
-
-    await loopPromise.catch(() => {});
+    getInboundDb().exec('CREATE VIEW session_routing AS SELECT * FROM missing_routing');
+    expect(() => getSessionRouting()).toThrow(/missing_routing/);
   });
 
   it('should pick up a message, process it, and write a response', async () => {
@@ -477,32 +436,6 @@ describe('poll loop — provider error recovery', () => {
 
     await loopPromise.catch(() => {});
   });
-
-  it('routes a thrown provider error to the latest accepted follow-up batch', async () => {
-    insertMessage('m1', { sender: 'Alice', text: 'initial request' }, { platformId: 'chan-1', channelType: 'discord' });
-
-    const provider = new FollowUpThrowingProvider();
-    const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 4000);
-
-    await waitFor(() => provider.started, 2000);
-    insertMessage(
-      'm2',
-      { sender: 'Bob', text: 'follow-up request' },
-      { platformId: 'chan-2', channelType: 'slack', threadId: 'thread-2' },
-    );
-    await waitFor(() => getUndeliveredMessages().length > 0, 3000);
-    controller.abort();
-
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(out[0].channel_type).toBe('slack');
-    expect(out[0].platform_id).toBe('chan-2');
-    expect(out[0].thread_id).toBe('thread-2');
-    expect(out[0].in_reply_to).toBe('m2');
-
-    await loopPromise.catch(() => {});
-  });
 });
 
 describe('poll loop — stale session recovery', () => {
@@ -591,37 +524,6 @@ class ThrowingProvider {
       abort() {},
       events: (async function* () {
         throw new Error(errorMessage);
-      })(),
-    };
-  }
-}
-
-class FollowUpThrowingProvider {
-  readonly supportsNativeSlashCommands = false;
-  started = false;
-
-  isSessionInvalid(): boolean {
-    return false;
-  }
-
-  query() {
-    const owner = this;
-    let pushed = false;
-    let wake: (() => void) | null = null;
-    return {
-      push() {
-        pushed = true;
-        wake?.();
-      },
-      end() {},
-      abort() {
-        wake?.();
-      },
-      events: (async function* () {
-        owner.started = true;
-        yield { type: 'init' as const, continuation: 'follow-up-error-session' };
-        if (!pushed) await new Promise<void>((resolve) => (wake = resolve));
-        throw new Error('follow-up provider failure');
       })(),
     };
   }

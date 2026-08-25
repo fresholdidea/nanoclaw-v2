@@ -14,23 +14,9 @@ import path from 'path';
 import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
 import { isValidTimezone } from './timezone.js';
 import { log } from './log.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
-
-/**
- * Transcript-rotation defaults, forced into container.json so every group
- * gets a value without needing an env var or a DB column. A group with zero
- * chat wiring (no messaging_group_agents rows) only ever runs scheduled
- * tasks, each with its own `system:tasks:<id>` session — long history there
- * buys little, since each firing's prompt is self-contained, so it rotates
- * far sooner than a live chat session would.
- */
-const CHAT_TRANSCRIPT_ROTATE_BYTES = 4 * 1024 * 1024;
-const CHAT_TRANSCRIPT_ROTATE_AGE_DAYS = 5;
-const TASK_ONLY_TRANSCRIPT_ROTATE_BYTES = 1 * 1024 * 1024;
-const TASK_ONLY_TRANSCRIPT_ROTATE_AGE_DAYS = 2;
 
 /**
  * Container-side path where a group's stamped plugins are mounted read-only.
@@ -249,29 +235,6 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
-export const DEFAULT_PROVIDER_CHAIN = ['claude', 'codex', 'opencode'];
-
-export function resolveProviderChain(provider: string | undefined, providerChainJson: string | null): string[] {
-  const primary = provider ?? 'claude';
-  let chain: string[];
-  if (providerChainJson) {
-    try {
-      const parsed = JSON.parse(providerChainJson) as unknown;
-      chain = Array.isArray(parsed) && parsed.every((x) => typeof x === 'string') ? (parsed as string[]) : [];
-    } catch {
-      chain = [];
-    }
-  } else {
-    chain = primary === 'claude' ? [...DEFAULT_PROVIDER_CHAIN] : [primary];
-  }
-  if (chain.length === 0) chain = primary === 'claude' ? [...DEFAULT_PROVIDER_CHAIN] : [primary];
-  if (chain[0] !== primary) {
-    console.warn(`[container-config] providerChain[0] (${chain[0]}) != primary (${primary}); prepending primary`);
-    chain = [primary, ...chain.filter((p) => p !== primary)];
-  }
-  return chain;
-}
-
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -280,9 +243,6 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
-  providerChain?: string[];
-  enableAgyTooling?: boolean;
-  enableOpencodeTooling?: boolean;
   groupName?: string;
   assistantName?: string;
   agentGroupId?: string;
@@ -290,8 +250,8 @@ export interface ContainerConfig {
   model?: string;
   effort?: string;
   timezone?: string;
-  transcriptRotateBytes?: number;
-  transcriptRotateAgeDays?: number;
+  /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
+  runtimeTier?: 'container' | 'vm';
 }
 
 /**
@@ -300,8 +260,8 @@ export interface ContainerConfig {
  * flip scheduling to UTC — an invalid override falls back to the global tz,
  * same as no override.
  */
-export function resolveGroupTimezone(agentGroupId: string): string {
-  const tz = getContainerConfig(agentGroupId)?.timezone;
+export async function resolveGroupTimezone(agentGroupId: string): Promise<string> {
+  const tz = (await getContainerConfig(agentGroupId))?.timezone;
   return tz && isValidTimezone(tz) ? tz : TIMEZONE;
 }
 
@@ -353,9 +313,47 @@ export function sanitizeStoredMcpServers(raw: unknown, groupName: string): Recor
   return servers;
 }
 
+/**
+ * runtime_tier is an isolation control: dropping an unknown stored value would
+ * silently compose the group at the default tier — a weaker boundary than the
+ * one the value asked for. Fail closed instead: the group refuses to compose
+ * until the stored value is fixed. (A *declared* tier the driver cannot
+ * realize is refused separately by validateSpec, against the driver's
+ * capabilities.)
+ */
+function parseRuntimeTier(raw: string | null | undefined, groupName: string): 'container' | 'vm' | undefined {
+  if (raw == null) return undefined;
+  if (raw === 'container' || raw === 'vm') return raw;
+  throw new Error(`agent group "${groupName}" has invalid runtime_tier "${raw}" — expected "container" or "vm"`);
+}
+
+/**
+ * `'all'`, or the names the group selected. Anything else is treated as `'all'`:
+ * a bare string would otherwise turn an `includes` filter into a substring
+ * match and silently drop skills.
+ *
+ * The single reading of this column. `configFromDb` used to cast it instead,
+ * which threw on a corrupt row before the composer's tolerance could apply:
+ * every spawn failed, and `wakeContainer`'s retry contract darkened the group.
+ * Two readings that must agree is also how the document ends up teaching a
+ * skill the agent was never given.
+ */
+export function parseSkillSelection(raw: string | undefined, groupName: string): string[] | 'all' {
+  if (raw === undefined) return 'all';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed === 'all') return 'all';
+  if (Array.isArray(parsed) && parsed.every((n) => typeof n === 'string')) return parsed;
+  log.warn('Stored skill selection is not "all" or a string list; inlining every skill', { group: groupName });
+  return 'all';
+}
+
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
-  const isTaskOnly = getMessagingGroupsByAgentGroup(group.id).length === 0;
   return {
     mcpServers: sanitizeStoredMcpServers(JSON.parse(row.mcp_servers), group.name),
     packages: {
@@ -364,11 +362,8 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     },
     imageTag: row.image_tag ?? undefined,
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
-    skills: JSON.parse(row.skills) as string[] | 'all',
+    skills: parseSkillSelection(row.skills, group.name),
     provider: row.provider ?? undefined,
-    providerChain: resolveProviderChain(row.provider ?? undefined, row.provider_chain ?? null),
-    enableAgyTooling: row.enable_agy_tooling === 1,
-    enableOpencodeTooling: row.enable_opencode_tooling === 1,
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,
@@ -376,21 +371,20 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
-    transcriptRotateBytes: isTaskOnly ? TASK_ONLY_TRANSCRIPT_ROTATE_BYTES : CHAT_TRANSCRIPT_ROTATE_BYTES,
-    transcriptRotateAgeDays: isTaskOnly ? TASK_ONLY_TRANSCRIPT_ROTATE_AGE_DAYS : CHAT_TRANSCRIPT_ROTATE_AGE_DAYS,
+    runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
   };
 }
 
 /**
  * Materialize `container.json` from the DB. Called at spawn time so the
  * container always sees fresh config. Returns the `ContainerConfig` for
- * use by the caller (buildMounts, buildContainerArgs, etc.).
+ * use by the caller (buildMounts, composeSessionSpec, etc.).
  */
-export function materializeContainerJson(agentGroupId: string): ContainerConfig {
-  const group = getAgentGroup(agentGroupId);
+export async function materializeContainerJson(agentGroupId: string): Promise<ContainerConfig> {
+  const group = await getAgentGroup(agentGroupId);
   if (!group) throw new Error(`Agent group not found: ${agentGroupId}`);
 
-  const row = getContainerConfig(agentGroupId);
+  const row = await getContainerConfig(agentGroupId);
   if (!row) throw new Error(`Container config not found for agent group: ${agentGroupId}`);
 
   const config = configFromDb(row, group);

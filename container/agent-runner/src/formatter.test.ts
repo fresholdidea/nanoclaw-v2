@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb } from './mailbox/sqlite/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { formatMessages, stripInternalTags, stripLegacyTaskContract } from './formatter.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
@@ -24,72 +24,25 @@ afterEach(() => {
   closeSessionDb();
 });
 
+// Production always assigns seq (the host writer); a NULL seq makes both the
+// query's ORDER BY and getPendingMessages' final sort ties, so multi-row
+// ordering becomes whatever SQLite returns — the source of a long flake.
+let nextSeq = 1;
+
 function insertMessage(
   id: string,
   kind: string,
   content: object,
-  opts?: {
-    timestamp?: string;
-    processAfter?: string;
-    seq?: number;
-    channelType?: string;
-    platformId?: string;
-    threadId?: string;
-  },
+  opts?: { timestamp?: string; processAfter?: string },
 ) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in
-         (id, seq, kind, timestamp, status, process_after, channel_type, platform_id, thread_id, content)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, content, seq)
+       VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
     )
-    .run(
-      id,
-      opts?.seq ?? null,
-      kind,
-      timestamp,
-      opts?.processAfter ?? null,
-      opts?.channelType ?? null,
-      opts?.platformId ?? null,
-      opts?.threadId ?? null,
-      JSON.stringify(content),
-    );
+    .run(id, kind, timestamp, opts?.processAfter ?? null, JSON.stringify(content), nextSeq++);
 }
-
-describe('agent-to-agent source session attribution', () => {
-  function insertA2aMessage(id: string, sourceSessionId: string | null, text: string) {
-    getInboundDb()
-      .prepare(
-        `INSERT INTO messages_in (id, kind, timestamp, status, channel_type, platform_id, source_session_id, content)
-         VALUES (?, 'chat', ?, 'pending', 'agent', 'ag-peer-group', ?, ?)`,
-      )
-      .run(id, new Date().toISOString(), sourceSessionId, JSON.stringify({ sender: 'cache-am', text }));
-  }
-
-  it('stamps session="..." on agent-channel messages so peers with multiple sessions are distinguishable', () => {
-    insertA2aMessage('a2a-1', 'sess-1779772778492-wtp3f6', 'need a CPA pull');
-    const result = formatMessages(getPendingMessages());
-    expect(result).toContain('session="sess-1779772778492-wtp3f6"');
-  });
-
-  it('omits the session attribute when source_session_id is NULL (pre-migration rows)', () => {
-    insertA2aMessage('a2a-2', null, 'legacy row');
-    const result = formatMessages(getPendingMessages());
-    expect(result).not.toContain('session=');
-  });
-
-  it('never stamps session on non-agent channel messages', () => {
-    getInboundDb()
-      .prepare(
-        `INSERT INTO messages_in (id, kind, timestamp, status, channel_type, platform_id, source_session_id, content)
-         VALUES ('t-1', 'chat', ?, 'pending', 'telegram', '12345', 'sess-should-not-show', ?)`,
-      )
-      .run(new Date().toISOString(), JSON.stringify({ sender: 'Brad', text: 'hi' }));
-    const result = formatMessages(getPendingMessages());
-    expect(result).not.toContain('session=');
-  });
-});
 
 describe('context timezone header', () => {
   it('prepends <context timezone="..."/> to formatted output', () => {
@@ -372,55 +325,5 @@ describe('app_context rendering (Slack agent mode, contract C4)', () => {
     });
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('(viewing: channel C1&lt;&amp;&gt;)');
-  });
-});
-
-describe('canonical message citation identity (msg_id)', () => {
-  it('renders the documented v1 citation token while retaining seq as the local id', () => {
-    insertMessage(
-      'a2a-1786998296874-gdq5yv',
-      'chat',
-      { sender: 'zed', text: 'cross-agent update' },
-      { seq: 164, channelType: 'agent', platformId: 'ag-cache' },
-    );
-    const result = formatMessages(getPendingMessages());
-    expect(result).toContain('id="164"');
-    expect(result).toContain('msg_id="msg-v1--pBCOW0rJyf_gz8Md-98d2St1TjxQQLj9VC8PMBsp0Y"');
-  });
-
-  it('distinguishes identical raw ids from different source routes without exposing either route', () => {
-    const base = {
-      id: '16',
-      seq: 16,
-      kind: 'chat',
-      timestamp: '2026-08-17T12:00:00.000Z',
-      status: 'pending',
-      process_after: null,
-      recurrence: null,
-      tries: 0,
-      trigger: 1,
-      thread_id: null,
-      content: JSON.stringify({ sender: 'alice', text: 'hello' }),
-    };
-    const first = formatMessages([{ ...base, channel_type: 'telegram', platform_id: 'chat-secret-one' }]);
-    const second = formatMessages([{ ...base, channel_type: 'telegram', platform_id: 'chat-secret-two' }]);
-    const firstCitation = first.match(/msg_id="([^"]+)"/)?.[1];
-    const secondCitation = second.match(/msg_id="([^"]+)"/)?.[1];
-
-    expect(firstCitation).toMatch(/^msg-v1-[A-Za-z0-9_-]{43}$/);
-    expect(secondCitation).toMatch(/^msg-v1-[A-Za-z0-9_-]{43}$/);
-    expect(firstCitation).not.toBe(secondCitation);
-    expect(firstCitation).not.toContain('chat-secret-one');
-    expect(secondCitation).not.toContain('chat-secret-two');
-  });
-
-  it('renders a canonical citation even for a legacy row without seq', () => {
-    insertMessage('a2a-123', 'chat', { sender: 'zed', text: 'hello' }, {
-      channelType: 'agent',
-      platformId: 'ag-zed',
-    });
-    const result = formatMessages(getPendingMessages());
-    expect(result).toContain('id="a2a-123"');
-    expect(result).toMatch(/msg_id="msg-v1-[A-Za-z0-9_-]{43}"/);
   });
 });

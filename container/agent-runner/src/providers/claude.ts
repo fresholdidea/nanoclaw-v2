@@ -4,8 +4,7 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
-import { getConfig, type RunnerConfig } from '../config.js';
-import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
@@ -22,21 +21,6 @@ import type {
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
-
-function resolveClaudeBinary(): string {
-  // Bun: /home/node/.bun/bin/claude. npm global: /usr/local/bin/claude.
-  // pnpm: /pnpm/claude. Fallback to /pnpm/claude if none found.
-  const paths = [
-    '/home/node/.bun/bin/claude',
-    '/usr/local/bin/claude',
-    '/pnpm/claude',
-  ];
-  for (const p of paths) {
-    if (fs.existsSync(p)) return p;
-  }
-  return '/pnpm/claude';
-}
-const CLAUDE_BIN = resolveClaudeBinary();
 
 export interface SdkRateLimitInfo {
   status?: string;
@@ -348,45 +332,23 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 // ── Continuation rotation (cold-resume guard) ──
 
 /**
- * getConfig() throws until loadConfig() has run (index.ts does this at
- * startup, well before any rotation check). Tests that exercise
- * maybeRotateContinuation directly never call loadConfig(), so this
- * degrades to undefined instead of throwing.
- */
-function loadedConfig(): RunnerConfig | undefined {
-  try {
-    return getConfig();
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Resume cost is dominated by transcript size. Past this many bytes a fresh
  * cold container can't reload the .jsonl before the host's 30-min idle ceiling
- * fires, so the session is dropped and started clean.
- *
- * Precedence: CLAUDE_TRANSCRIPT_ROTATE_BYTES env var (manual operator
- * override) → container.json's transcriptRotateBytes (host-computed
- * per-group default — tighter for task-only groups, see
- * src/container-config.ts) → hardcoded fallback for configs predating this
- * field.
+ * fires, so the session is dropped and started clean. Operator-overridable.
  */
 function transcriptRotateBytes(): number {
-  return Number(process.env.CLAUDE_TRANSCRIPT_ROTATE_BYTES) || loadedConfig()?.transcriptRotateBytes || 4 * 1024 * 1024;
+  return Number(process.env.CLAUDE_TRANSCRIPT_ROTATE_BYTES) || 12 * 1024 * 1024;
 }
 
 /**
  * Secondary age trigger, measured from the transcript's first entry. 0 (or a
  * non-positive value) disables the age check; size alone then governs.
- * Same precedence as transcriptRotateBytes() above.
  */
 function transcriptRotateAgeMs(): number {
   const raw = process.env.CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS;
-  const fallbackDays = loadedConfig()?.transcriptRotateAgeDays || 5;
-  if (raw === undefined || raw.trim() === '') return fallbackDays * 86_400_000;
+  if (raw === undefined || raw.trim() === '') return 14 * 86_400_000;
   const days = Number(raw);
-  if (!Number.isFinite(days)) return fallbackDays * 86_400_000;
+  if (!Number.isFinite(days)) return 14 * 86_400_000;
   // Explicit non-positive override disables the age check; size alone governs.
   return days > 0 ? days * 86_400_000 : Infinity;
 }
@@ -597,7 +559,7 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: CLAUDE_BIN,
+        pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions
           ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions }
           : undefined,

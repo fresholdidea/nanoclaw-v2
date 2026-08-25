@@ -1,21 +1,19 @@
 /**
  * NanoClaw Agent Runner v2
  *
- * Runs inside a container. All IO goes through the session DB.
- * No stdin, no stdout markers, no IPC files.
+ * Runs inside a container. All message IO goes through the registered mailbox.
  *
  * Config is read from /workspace/agent/container.json (mounted RO).
  * Only TZ and OneCLI networking vars come from env.
  *
  * Mount structure:
  *   /workspace/
- *     inbound.db        ← host-owned session DB (container reads only)
- *     outbound.db       ← container-owned session DB
+ *     mailbox state     ← selected implementation
  *     .heartbeat        ← container touches for liveness detection
  *     outbox/           ← outbound files
  *     agent/            ← agent group folder (CLAUDE.md, container.json, working files)
+ *       CLAUDE.md       ← composed project document (RO nested mount)
  *       container.json  ← per-group config (RO nested mount)
- *     global/           ← shared global memory (RO)
  *   /app/src/           ← shared agent-runner source (RO)
  *   /app/skills/        ← shared skills (RO)
  *   /home/node/.claude/ ← Claude SDK state + skill symlinks (RW)
@@ -30,13 +28,15 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { ensureMemoryScaffold } from './memory/scaffold.js';
 import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
-import type { McpServerConfig } from './providers/types.js';
+// Module barrel — loads registration modules, including the singular mailbox slot.
+import './modules/index.js';
+import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
-import { type ProviderName } from './providers/factory.js';
-import { buildProvider } from './providers/build-provider.js';
+import { createProvider, type ProviderName } from './providers/factory.js';
 import { resolvePluginServer } from './plugin-mcp.js';
+import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -45,27 +45,11 @@ function log(msg: string): void {
 
 const CWD = '/workspace/agent';
 
-/**
- * Expand `${VAR}` / `$VAR` placeholders in a stdio MCP's `env` block against
- * the container's `process.env`. Used for stdio MCPs that read their API key
- * directly (e.g. SERPER_API_KEY) — the host forwards the value via `-e` and
- * we wire it into the SDK-spawned MCP child here.
- *
- * HTTP/SSE MCP configs pass through unchanged.
- */
-function expandMcpEnvPlaceholders(server: McpServerConfig): McpServerConfig {
-  if (!('command' in server) || !server.env) return server;
-  const placeholderRe = /\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g;
-  const expanded: Record<string, string> = {};
-  for (const [key, raw] of Object.entries(server.env)) {
-    expanded[key] = raw.replace(placeholderRe, (_, braced, bare) => process.env[braced || bare] ?? '');
-  }
-  return { ...server, env: expanded };
-}
-
 async function main(): Promise<void> {
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
+  const mailbox = getAgentMailbox();
+  await mailbox.start(await readMailboxContext());
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
@@ -76,9 +60,9 @@ async function main(): Promise<void> {
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module
   // instructions, per-channel formatting) is loaded by Claude Code from
-  // /workspace/agent/CLAUDE.md — the composed entry imports the shared
-  // base (/app/CLAUDE.md) and each enabled module's fragment. Memory is
-  // supplied separately by each provider's native lifecycle hook.
+  // /workspace/agent/CLAUDE.md — one flat file the host composes per spawn
+  // with every instruction source inlined, no imports. Memory is supplied
+  // separately by each provider's native lifecycle hook.
   const taskId = getTaskSeriesId();
   const instructions = buildSystemPromptAddendum(
     config.assistantName || undefined,
@@ -116,10 +100,7 @@ async function main(): Promise<void> {
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
     // Plugin-shipped servers get ${PLUGIN_ROOT}/${PLUGIN_DATA} expansion and
     // the two injected env vars; everything else passes through untouched.
-    // Plugin resolution runs FIRST: it substitutes real container paths for
-    // those two placeholders, which are not in process.env — expanding env
-    // first would blank them out.
-    mcpServers[name] = expandMcpEnvPlaceholders(resolvePluginServer(serverConfig));
+    mcpServers[name] = resolvePluginServer(serverConfig);
     log(
       serverConfig.type === 'http'
         ? `Additional MCP server: ${name} (HTTP)`
@@ -127,23 +108,26 @@ async function main(): Promise<void> {
     );
   }
 
-  const providerOptions = {
+  const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     model: config.model,
     effort: config.effort,
-  };
-  const provider = buildProvider(config, providerOptions);
+  });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
 
-  await runPollLoop({
-    provider,
-    providerName,
-    cwd: CWD,
-    systemContext: { instructions },
-  });
+  try {
+    await runPollLoop({
+      provider,
+      providerName,
+      cwd: CWD,
+      systemContext: { instructions },
+    });
+  } finally {
+    await mailbox.stop();
+  }
 }
 
 main().catch((err) => {
