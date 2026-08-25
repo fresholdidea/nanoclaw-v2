@@ -41,9 +41,15 @@ afterEach(() => {
 describe('installed skill detection', () => {
   it('finds channel and provider imports while excluding built-ins', () => {
     const root = temp('nanoclaw-skills-detect-');
-    write(root, 'src/channels/index.ts', "import './cli.js';\nimport './slack.js';\n");
+    write(root, 'src/channels/index.ts', "import './cli.js';\nimport './slack.js';\nimport './slack-a2a-guard.js';\n");
+    write(root, 'src/channels/slack.ts', "registerChannelAdapter('slack', {});\n");
+    write(root, 'src/channels/slack-a2a-guard.ts', "registerBridgeInboundPolicy('slack', {});\n");
     write(root, 'src/providers/index.ts', "import './opencode.js';\n");
-    write(root, 'container/agent-runner/src/providers/index.ts', "import './claude.js';\nimport './opencode.js';\n");
+    write(
+      root,
+      'container/agent-runner/src/providers/index.ts',
+      "import './claude.js';\nimport './mock.js';\nimport './opencode.js';\n",
+    );
 
     expect(detectInstalledSkills(root)).toEqual([
       { name: 'opencode', skillName: 'add-opencode', kind: 'provider' },

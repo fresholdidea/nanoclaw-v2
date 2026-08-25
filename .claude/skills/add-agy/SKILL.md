@@ -45,6 +45,18 @@ test -f "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" && echo "  oauth
 git fetch fork providers
 ```
 
+The installed provider payload is refreshed from the same fork-owned registry branch during NanoClaw updates:
+
+```nc:run effect:refresh
+set -e
+git fetch fork providers
+git show fork/providers:src/providers/agy.ts > src/providers/agy.ts
+git show fork/providers:container/agent-runner/src/providers/agy.ts > container/agent-runner/src/providers/agy.ts
+git show fork/providers:container/agent-runner/src/providers/mcp-to-agy.ts > container/agent-runner/src/providers/mcp-to-agy.ts
+git show fork/providers:container/agent-runner/src/providers/mcp-to-agy.test.ts > container/agent-runner/src/providers/mcp-to-agy.test.ts
+git show fork/providers:container/agent-runner/src/providers/agy.factory.test.ts > container/agent-runner/src/providers/agy.factory.test.ts
+```
+
 > **Why `fork` not `origin`:** in this install, `origin` points to the upstream public repo and is off-limits for personal-install work. `fork` (`github.com/fresholdidea/nanoclaw-v2`) holds the agy provider files on its `providers` branch.
 
 ### 2. Copy the agy source files (skip per file if already present)
@@ -69,15 +81,18 @@ Each barrel gets one line appended at the end — skip if the line is already pr
 import './agy.js';
 ```
 
-`container/agent-runner/src/providers/index.ts`: add a new `loadProvider('agy')` call to the existing `Promise.all` block:
+```nc:append to:src/providers/index.ts
+import './agy.js';
+```
+
+`container/agent-runner/src/providers/index.ts`: append the provider's self-registration import:
 
 ```typescript
-await Promise.all([
-  loadProvider('claude'),
-  loadProvider('mock'),
-  loadProvider('opencode'),
-  loadProvider('agy'),
-]);
+import './agy.js';
+```
+
+```nc:append to:container/agent-runner/src/providers/index.ts
+import './agy.js';
 ```
 
 ### 4. Install the Linux binary

@@ -90,15 +90,24 @@ function readImports(file: string): string[] {
   return names;
 }
 
+function isChannelAdapterImport(root: string, name: string): boolean {
+  if (fs.existsSync(path.join(root, '.claude/skills', `add-${name}`, 'SKILL.md'))) return true;
+  const modulePath = path.join(root, 'src/channels', `${name}.ts`);
+  if (!fs.existsSync(modulePath)) return true;
+  return /\bregisterChannelAdapter\s*\(/.test(fs.readFileSync(modulePath, 'utf8'));
+}
+
 export function detectInstalledSkills(root: string): InstalledSkill[] {
   const channels = readImports(path.join(root, 'src/channels/index.ts'))
     .filter((name) => name !== 'cli')
+    .filter((name) => isChannelAdapterImport(root, name))
     .map((name) => ({ name, skillName: `add-${name}`, kind: 'channel' as const }));
   const providers = new Set([
     ...readImports(path.join(root, 'src/providers/index.ts')),
     ...readImports(path.join(root, 'container/agent-runner/src/providers/index.ts')),
   ]);
   providers.delete('claude');
+  providers.delete('mock');
 
   return [
     ...channels,
