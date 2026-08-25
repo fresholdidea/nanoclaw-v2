@@ -3,7 +3,6 @@ import fs from 'fs';
 import path from 'path';
 
 import { registerProvider } from './provider-registry.js';
-import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToAgyConfig } from './mcp-to-agy.js';
 
@@ -62,12 +61,6 @@ export class AgyProvider implements AgentProvider {
   constructor(options: ProviderOptions = {}) {
     this.options = options;
   }
-
-  // No-op: agy is a CLI-per-turn harness with no native session-start hook to
-  // wire the file-tree memory command into. Groups on this provider surface
-  // standing context through their instructions/CLAUDE.md and (where enabled)
-  // mnemon at the container level, not through this hook.
-  registerMemorySessionHook(_hook: MemorySessionHookRegistration): void {}
 
   isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);

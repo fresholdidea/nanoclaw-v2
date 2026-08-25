@@ -17,7 +17,6 @@ import os from 'os';
 import path from 'path';
 
 import { registerProviderContainerConfig } from './provider-container-registry.js';
-import type { ProviderContainerContext } from './provider-container-registry.js';
 
 // Candidate paths for the Linux agy binary, in priority order.
 // The binary inside the tarball is named `antigravity`, not `agy`.
@@ -36,7 +35,7 @@ function resolveAgyBin(envOverride?: string): string | null {
   return null;
 }
 
-export function agyContribution(ctx: ProviderContainerContext) {
+registerProviderContainerConfig('agy', (ctx) => {
   const agyBin = resolveAgyBin(ctx.hostEnv.AGY_LINUX_BIN);
   const geminiDir = ctx.hostEnv.AGY_GEMINI_DIR || DEFAULT_GEMINI_DIR;
 
@@ -64,6 +63,4 @@ export function agyContribution(ctx: ProviderContainerContext) {
       AGY_LAST_CONVS_PATH: '/home/node/.gemini/antigravity-cli/cache/last_conversations.json',
     },
   };
-}
-
-registerProviderContainerConfig('agy', agyContribution);
+});
