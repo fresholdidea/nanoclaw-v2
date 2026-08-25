@@ -1,86 +1,94 @@
 ---
 name: slack-formatting
-description: Format replies for Slack. Slack renders standard markdown natively — write normal markdown, not legacy mrkdwn. Use when replying to a Slack destination (currently zed-dm-brad or nanoclaw).
+description: Format messages for Slack using mrkdwn syntax. Use when responding to Slack channels (folder starts with "slack_" or JID contains slack identifiers).
 ---
 
-# Slack message formatting
+# Slack Message Formatting (mrkdwn)
 
-**Write standard markdown.** Slack renders it natively. The legacy mrkdwn dialect
-(`*bold*`, `<url|text>`) is wrong here and renders badly — see the bottom section.
+When responding to Slack channels, use Slack's mrkdwn syntax instead of standard Markdown.
 
-## How to tell you are in Slack
+## How to detect Slack context
 
-You never see `channel_type` or `platform_id` — the formatter strips routing fields
-before messages reach you. The only signal is the `from="…"` attribute on the
-incoming message, which names the destination:
+Check your group folder name or workspace path:
+- Folder starts with `slack_` (e.g., `slack_engineering`, `slack_general`)
+- Or check `/workspace/group/` path for `slack_` prefix
 
-| `from="…"` | Where |
-|---|---|
-| `zed-dm-brad` | Slack DM with Brad |
-| `nanoclaw` | Slack `#nanoclaw` |
-| `telegram-mg-…` | Telegram — not Slack |
+## Formatting reference
 
-Those Slack names are install-specific. `ncl destinations list` shows the
-`channel_type` column if you need to confirm which destinations are Slack.
+### Text styles
 
-## Why standard markdown
+| Style | Syntax | Example |
+|-------|--------|---------|
+| Bold | `*text*` | *bold text* |
+| Italic | `_text_` | _italic text_ |
+| Strikethrough | `~text~` | ~strikethrough~ |
+| Code (inline) | `` `code` `` | `inline code` |
+| Code block | ` ```code``` ` | Multi-line code |
 
-Your reply travels as `{ markdown: … }` → the Slack adapter puts it in Slack's
-`markdown_text` field → Slack parses **standard markdown**. Write exactly what you
-would write anywhere else.
-
-Supported: `**bold**`, `*italic*` / `_italic_`, `~~strikethrough~~`,
-`[text](url)`, ordered lists (`1.`), unordered lists (`- `), headings (`#`…`######`),
-`` `inline code` ``, fenced code blocks with language hints, `> blockquotes`,
-`---` horizontal rules, tables, and task lists (`- [ ]` / `- [x]`).
-
-Three caveats:
-
-- **Nested lists are not supported** — flatten them, or use a heading per group.
-- **Images render as links.** `![alt](url)` degrades to `[alt](url)`. To actually
-  show an image, send it as a file instead of embedding a URL.
-- **Headings all render at the same size**, so heading level conveys structure, not
-  visual hierarchy. Don't rely on `#` vs `###` looking different.
-
-## Slack-specific syntax (not markdown)
-
-These are Slack entity references and pass through the markdown untouched. They are
-the one place Slack's own syntax is still required:
+### Links and mentions
 
 ```
-<@U0B02HS2Z7S>    mention a user — must be the member ID, not a display name
-<#C0BQZJN5BMJ>    link a channel — must be the channel ID
-<!here>           notify active members in the channel
-<!channel>        notify everyone in the channel
-:white_check_mark:  emoji shortcodes work normally
+<https://example.com|Link text>     # Named link
+<https://example.com>                # Auto-linked URL
+<@U1234567890>                       # Mention user by ID
+<#C1234567890>                       # Mention channel by ID
+<!here>                              # @here
+<!channel>                           # @channel
 ```
 
-Use `<!here>` and `<!channel>` sparingly — they notify real people.
+### Lists
 
-## Not this skill: direct Web API posts
+Slack supports simple bullet lists but NOT numbered lists:
 
-This skill covers replies in Slack conversations NanoClaw is wired to. Posting to a
-client workspace yourself via `chat.postMessage` with a `text` field is a different
-path with the *opposite* dialect — that one is mrkdwn. See `/slack-api`.
+```
+• First item
+• Second item
+• Third item
+```
 
-## Length limit
+Use `•` (bullet character) or `- ` or `* ` for bullets.
 
-Slack caps `markdown_text` at **12,000 characters**, and the Slack bridge does
-**not** auto-split long replies the way Telegram's does. A reply over the cap fails
-to send rather than truncating. Keep messages well under it; if you have more to
-say, send the long form as a file and summarize in the message.
+### Block quotes
 
-## Do not use legacy mrkdwn
+```
+> This is a block quote
+> It can span multiple lines
+```
 
-Slack's older mrkdwn dialect actively breaks in this pipeline:
+### Emoji
 
-| Don't write | Because | Write instead |
-|---|---|---|
-| `*bold*` | single asterisks mean *italic* in standard markdown | `**bold**` |
-| `<https://x.com\|text>` | renders as literal junk | `[text](https://x.com)` |
-| `~strike~` | needs doubled tildes | `~~strike~~` |
-| `• manual bullets` | markdown lists render properly | `- item` |
+Use standard emoji shortcodes: `:white_check_mark:`, `:x:`, `:rocket:`, `:tada:`
 
-If you find yourself reaching for mrkdwn because a message "looked wrong in Slack,"
-the fix is almost never mrkdwn — check the length cap and the nested-list caveat
-above first.
+## What NOT to use
+
+- **NO** `##` headings (use `*Bold text*` for headers instead)
+- **NO** `**double asterisks**` for bold (use `*single asterisks*`)
+- **NO** `[text](url)` links (use `<url|text>` instead)
+- **NO** `1.` numbered lists (use bullets with numbers: `• 1. First`)
+- **NO** tables (use code blocks or plain text alignment)
+- **NO** `---` horizontal rules
+
+## Example message
+
+```
+*Daily Standup Summary*
+
+_March 21, 2026_
+
+• *Completed:* Fixed authentication bug in login flow
+• *In Progress:* Building new dashboard widgets
+• *Blocked:* Waiting on API access from DevOps
+
+> Next sync: Monday 10am
+
+:white_check_mark: All tests passing | <https://ci.example.com/builds/123|View Build>
+```
+
+## Quick rules
+
+1. Use `*bold*` not `**bold**`
+2. Use `<url|text>` not `[text](url)`
+3. Use `•` bullets, avoid numbered lists
+4. Use `:emoji:` shortcodes
+5. Quote blocks with `>`
+6. Skip headings — use bold text instead

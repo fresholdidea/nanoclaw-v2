@@ -37,26 +37,21 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 
 registerProviderContainerConfig(
   'codex',
-  (ctx) => {
+  async (ctx) => {
     // Per-group codex state (config.toml, thread metadata).
     const codexDir = path.join(DATA_DIR, 'v2-sessions', ctx.agentGroupId, '.codex-shared');
     fs.mkdirSync(codexDir, { recursive: true });
-    // OneCLI contributes its shared auth stub for ~/.codex/auth.json.
-    // container-runner validates that exact contribution, retargets the shared
-    // source read-only to a staging path, then mounts a private writable
-    // per-container copy at auth.json so Codex can persist a gateway-rewritten
-    // refresh response without mutating the shared stub or giving Docker a
-    // duplicate destination.
-    // Docker on macOS still requires the nested mountpoint to exist inside the
-    // virtiofs parent (otherwise runc exits 125), so create and harden it on
-    // every spawn. The 'a' flag never truncates an existing mountpoint file.
-    const authMountpoint = path.join(codexDir, 'auth.json');
-    fs.closeSync(fs.openSync(authMountpoint, 'a', 0o600));
-    fs.chmodSync(authMountpoint, 0o600);
+    // OneCLI bind-mounts its auth stub at ~/.codex/auth.json, nested inside
+    // this dir mount — Docker on macOS can't create a missing mountpoint file
+    // inside a virtiofs bind mount (runc: "mountpoint is outside of rootfs",
+    // exit 125), so it must exist before first spawn. Re-created here per
+    // spawn because a group reset that wipes .codex-shared re-triggers it.
+    // The 'a' flag creates the file if missing, never truncates an existing one.
+    fs.closeSync(fs.openSync(path.join(codexDir, 'auth.json'), 'a'));
 
     // Compose this group's AGENTS.md and sync codex-native skill links.
-    const group = getAgentGroup(ctx.agentGroupId);
-    if (group) composeGroupAgentsMd(group, ctx.groupDir);
+    const group = await getAgentGroup(ctx.agentGroupId);
+    if (group) await composeGroupAgentsMd(group, ctx.groupDir);
     syncCodexSkillLinks(ctx.groupDir, ctx.selectedSkills);
     // Template skills live on the Claude plane (.claude-shared/skills); codex
     // reads .agents/skills (RO-mounted), so mirror them here, host-side, via the
@@ -66,8 +61,7 @@ registerProviderContainerConfig(
 
     // No credential env here — OneCLI's container-config drives auth end to
     // end: the gateway serves a sentinel auth.json stub into ~/.codex for
-    // BOTH auth modes (ChatGPT subscription and API key), the runner gives
-    // each container its own writable copy, and the gateway swaps the real
+    // BOTH auth modes (ChatGPT subscription and API key) and swaps the real
     // credential on the wire. Note the runner's CODEX_ENV_ALLOWLIST
     // deliberately strips OPENAI_API_KEY from the codex process env — auth
     // never rides env vars, only the stub. Duplicating any of it here would

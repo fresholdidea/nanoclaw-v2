@@ -1,3 +1,4 @@
+import { cwdWrappedArgv } from './cwd-shim.js';
 import type { McpServerConfig } from './types.js';
 
 /** OpenCode `mcp` entry shape (local stdio server). */
@@ -18,33 +19,34 @@ export type OpenCodeMcpRemote = {
 
 export type OpenCodeMcpEntry = OpenCodeMcpLocal | OpenCodeMcpRemote;
 
-/**
- * Map NanoClaw v2 MCP definitions (same shape as Claude Agent SDK) into
- * OpenCode config `mcp` field. Handles both stdio and remote (http/sse) servers.
- */
+/** Map NanoClaw MCP definitions into OpenCode's local/remote MCP config. */
 export function mcpServersToOpenCodeConfig(
   servers: Record<string, McpServerConfig> | undefined,
 ): Record<string, OpenCodeMcpEntry> {
   const out: Record<string, OpenCodeMcpEntry> = {};
   if (!servers) return out;
   for (const [name, cfg] of Object.entries(servers)) {
-    if ('url' in cfg) {
+    if (cfg.type === 'http') {
       out[name] = {
         type: 'remote',
         url: cfg.url,
-        ...(cfg.headers ? { headers: cfg.headers } : {}),
+        ...(cfg.headers && Object.keys(cfg.headers).length > 0 ? { headers: cfg.headers } : {}),
         enabled: true,
       };
-    } else {
-      out[name] = {
-        type: 'local',
-        // args/env are optional on the stdio config — default them here rather
-        // than spreading undefined into opencode's command array.
-        command: [cfg.command, ...(cfg.args ?? [])],
-        ...(cfg.env && Object.keys(cfg.env).length > 0 ? { environment: cfg.env } : {}),
-        enabled: true,
-      };
+      continue;
     }
+
+    // OpenCode's local entry is a bare argv array with no spawn-directory
+    // key, so a declared cwd goes through the shared cd-then-exec wrap —
+    // never silently launched in the wrong directory.
+    const args = cfg.args ?? [];
+    const env = cfg.env ?? {};
+    out[name] = {
+      type: 'local',
+      command: cfg.cwd ? cwdWrappedArgv(cfg.cwd, cfg.command, args) : [cfg.command, ...args],
+      ...(Object.keys(env).length > 0 ? { environment: env } : {}),
+      enabled: true,
+    };
   }
   return out;
 }

@@ -143,15 +143,7 @@ export class CodexProvider implements AgentProvider {
     const self = this;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
-      // Codex's config.toml expresses stdio MCP servers only (command/args/env);
-      // http/sse entries in the union can't be represented, so drop them.
-      const codexMcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {};
-      for (const [name, cfg] of Object.entries(self.mcpServers)) {
-        if ('command' in cfg) {
-          codexMcpServers[name] = { command: cfg.command, args: cfg.args, env: cfg.env };
-        }
-      }
-      self.runtime.writeCodexConfigToml(codexMcpServers, memorySessionHook, {
+      self.runtime.writeCodexConfigToml(self.mcpServers, memorySessionHook, {
         model: self.model,
         effort: self.effort,
       });

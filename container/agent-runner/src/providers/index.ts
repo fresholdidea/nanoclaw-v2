@@ -17,3 +17,4 @@ await Promise.all([
   loadProvider('agy'),
 ]);
 import './codex.js';
+import './opencode.js';

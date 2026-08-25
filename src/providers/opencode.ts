@@ -14,11 +14,14 @@ import path from 'path';
 import { readEnvFile } from '../env.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
-const OPENCODE_ENV_KEYS = [
+const PASSTHROUGH_KEYS = [
   'OPENCODE_PROVIDER',
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
   'ANTHROPIC_BASE_URL',
+  'OPENCODE_MODEL_CONTEXT_LIMIT',
+  'OPENCODE_MODEL_OUTPUT_LIMIT',
+  'OPENCODE_MODEL_INPUT_MODALITIES',
 ] as const;
 
 function mergeNoProxy(current: string | undefined, additions: string): string {
@@ -45,12 +48,14 @@ registerProviderContainerConfig('opencode', (ctx) => {
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, '127.0.0.1,localhost'),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, '127.0.0.1,localhost'),
   };
-  // The host doesn't auto-load .env into process.env (see src/env.ts), so we
-  // read OPENCODE_* + ANTHROPIC_BASE_URL explicitly here. process.env still
-  // wins if a value is also exported there (launchd plist, shell, etc.).
-  const fileEnv = readEnvFile([...OPENCODE_ENV_KEYS]);
-  for (const key of OPENCODE_ENV_KEYS) {
-    const value = ctx.hostEnv[key] ?? fileEnv[key];
+  // The host process does not load `.env` into process.env (readEnvFile keeps
+  // file values out of child processes), and the service units set no
+  // EnvironmentFile — so under launchd/systemd, ctx.hostEnv carries none of
+  // these. Fall back to the `.env` file the way the claude provider does;
+  // a real exported variable still wins over the file.
+  const dotenv = readEnvFile([...PASSTHROUGH_KEYS]);
+  for (const key of PASSTHROUGH_KEYS) {
+    const value = ctx.hostEnv[key] ?? dotenv[key];
     if (value) env[key] = value;
   }
 
