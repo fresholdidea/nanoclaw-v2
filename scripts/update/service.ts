@@ -5,6 +5,12 @@ import path from 'node:path';
 
 import { getInstallSlug } from '../../src/install-slug.js';
 
+// Frozen installs and the full validation suite can legitimately emit more
+// than Node's 1 MiB execFileSync default (especially pnpm's dependency
+// report). Keep the controller's captured output bounded, but large enough
+// that a successful validation is not misreported as ENOBUFS.
+const MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024;
+
 export interface CommandRunner {
   run(command: string, args: string[], cwd?: string): string;
   tryRun(command: string, args: string[], cwd?: string): { ok: boolean; stdout: string };
@@ -15,6 +21,7 @@ export function createCommandRunner(): CommandRunner {
     execFileSync(command, args, {
       cwd,
       encoding: 'utf8',
+      maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
   return {
