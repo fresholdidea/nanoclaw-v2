@@ -164,7 +164,10 @@ export function detectService(projectRoot: string, env: ServiceEnvironment): Ser
 export async function stopService(handle: ServiceHandle, env: ServiceEnvironment): Promise<void> {
   if (!handle.active) return;
   if (handle.mode === 'launchd') {
-    env.runner.run('launchctl', ['bootout', `gui/${env.uid}/${handle.name}`]);
+    const result = env.runner.tryRun('launchctl', ['bootout', `gui/${env.uid}/${handle.name}`]);
+    if (!result.ok && env.runner.tryRun('launchctl', ['print', `gui/${env.uid}/${handle.name}`]).ok) {
+      throw new Error(result.stdout || `Could not stop launchd service ${handle.name}`);
+    }
   } else if (handle.mode === 'systemd-user') {
     env.runner.run('systemctl', ['--user', 'stop', handle.name!]);
   } else if (handle.mode === 'systemd-system') {

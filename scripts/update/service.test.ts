@@ -153,6 +153,19 @@ describe('service-mode detection and control', () => {
     expect(calls).toEqual([`bash ${definition}`]);
   });
 
+  it('treats an already-unloaded launchd service as stopped', async () => {
+    const { env, calls } = makeEnv('darwin', {
+      'launchctl bootout gui/1000/com.nanoclaw': { ok: false, stdout: 'Boot-out failed: 3: No such process' },
+      'launchctl print gui/1000/com.nanoclaw': { ok: false, stdout: 'Could not find service' },
+    });
+
+    await expect(stopService({ mode: 'launchd', active: true, name: 'com.nanoclaw' }, env)).resolves.toBeUndefined();
+    expect(calls).toEqual([
+      'launchctl bootout gui/1000/com.nanoclaw',
+      'launchctl print gui/1000/com.nanoclaw',
+    ]);
+  });
+
   it('refuses to mutate under an unmanaged pnpm-dev process', async () => {
     const root = temp();
     const pattern = `${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/(dist/index\\.js|src/index\\.ts)`;

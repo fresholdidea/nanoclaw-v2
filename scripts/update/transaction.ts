@@ -454,8 +454,8 @@ export async function cutoverUpdate(
   }
 
   state.service = runtime.detectService(state.projectRoot);
-  await runtime.stopService(state.service);
   try {
+    await runtime.stopService(state.service);
     await runtime.drainContainers(state.projectRoot);
     state.snapshot = createSnapshot(state);
     saveState(state);
