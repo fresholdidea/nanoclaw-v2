@@ -59,26 +59,7 @@ git show fork/providers:container/agent-runner/src/providers/agy.factory.test.ts
 # The provider registry is refreshed independently of the trunk runner. Keep
 # the payload compatible when the registry branch predates the current
 # AgentProvider memory-hook seam or uses optional MCP fields directly.
-node --input-type=module -e 'import fs from "node:fs";
-const agyPath = "container/agent-runner/src/providers/agy.ts";
-let agy = fs.readFileSync(agyPath, "utf8");
-if (!agy.includes("MemorySessionHookRegistration")) {
-  agy = agy.replace(
-    "import { registerProvider } from \"./provider-registry.js\";",
-    "import { registerProvider } from \"./provider-registry.js\";\nimport type { MemorySessionHookRegistration } from \"../memory/session-hook.js\";",
-  );
-}
-if (!agy.includes("registerMemorySessionHook(")) {
-  agy = agy.replace(
-    "  isSessionInvalid(err: unknown): boolean {",
-    "  // agy has no native session-start hook; memory is supplied through the container instructions.\n  registerMemorySessionHook(_hook: MemorySessionHookRegistration): void {}\n\n  isSessionInvalid(err: unknown): boolean {",
-  );
-}
-fs.writeFileSync(agyPath, agy);
-const mcpPath = "container/agent-runner/src/providers/mcp-to-agy.ts";
-let mcp = fs.readFileSync(mcpPath, "utf8");
-mcp = mcp.replace("args: cfg.args,", "args: cfg.args ?? [],").replace("Object.keys(cfg.env).length", "Object.keys(cfg.env ?? {}).length");
-fs.writeFileSync(mcpPath, mcp);'
+node .claude/skills/add-agy/refresh-compat.mjs
 ```
 
 > **Why `fork` not `origin`:** in this install, `origin` points to the upstream public repo and is off-limits for personal-install work. `fork` (`github.com/fresholdidea/nanoclaw-v2`) holds the agy provider files on its `providers` branch.
