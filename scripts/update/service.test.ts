@@ -106,6 +106,43 @@ describe('service-mode detection and control', () => {
     expect(calls).toContain(`launchctl kickstart gui/1000/${name}`);
   });
 
+  it('recognizes a legacy unsuffixed launchd plist for this checkout', () => {
+    const root = temp();
+    const { env, calls, home } = makeEnv('darwin');
+    const plist = path.join(home, 'Library', 'LaunchAgents', 'com.nanoclaw.plist');
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, '<plist/>\n');
+    const responses: Record<string, { ok: boolean; stdout?: string }> = {
+      [`/usr/libexec/PlistBuddy -c Print :WorkingDirectory ${plist}`]: { ok: true, stdout: root },
+      [`/usr/libexec/PlistBuddy -c Print :ProgramArguments:1 ${plist}`]: {
+        ok: true,
+        stdout: path.join(root, 'dist', 'index.js'),
+      },
+      'launchctl print gui/1000/com.nanoclaw': { ok: true },
+    };
+    env.runner = {
+      run(command, args) {
+        const key = `${command} ${args.join(' ')}`;
+        calls.push(key);
+        const response = responses[key];
+        if (response && !response.ok) throw new Error(key);
+        return response?.stdout ?? '';
+      },
+      tryRun(command, args) {
+        const key = `${command} ${args.join(' ')}`;
+        calls.push(key);
+        const response = responses[key] ?? { ok: true, stdout: '' };
+        return { ok: response.ok, stdout: response.stdout ?? '' };
+      },
+    };
+
+    const detected = detectService(root, env);
+    expect(detected).toMatchObject({ mode: 'launchd', active: true, name: 'com.nanoclaw', definition: plist });
+    expect(calls).toContain(
+      `/usr/libexec/PlistBuddy -c Print :WorkingDirectory ${plist}`,
+    );
+  });
+
   it('restarts a WSL/nohup install through its recorded start script', () => {
     const root = temp();
     const definition = path.join(root, 'start-nanoclaw.sh');
