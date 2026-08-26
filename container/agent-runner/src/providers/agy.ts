@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { registerProvider } from './provider-registry.js';
+import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToAgyConfig } from './mcp-to-agy.js';
 
@@ -62,6 +63,10 @@ export class AgyProvider implements AgentProvider {
     this.options = options;
   }
 
+  // agy is a CLI-per-turn harness with no native session-start hook. Memory
+  // is supplied through the container's standing instructions instead.
+  registerMemorySessionHook(_hook: MemorySessionHookRegistration): void {}
+
   isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_SESSION_RE.test(msg);
@@ -83,7 +88,10 @@ export class AgyProvider implements AgentProvider {
     let terminatingForPush = false;
     let waiting: (() => void) | null = null;
 
-    const kick = (): void => { waiting?.(); waiting = null; };
+    const kick = (): void => {
+      waiting?.();
+      waiting = null;
+    };
 
     function spawnTurn(text: string): ChildProcess {
       const args = ['-p', text, '--dangerously-skip-permissions', '--print-timeout', PRINT_TIMEOUT];
@@ -104,7 +112,9 @@ export class AgyProvider implements AgentProvider {
       while (!aborted) {
         terminatingForPush = false;
         while (pending.length === 0 && !ended && !aborted) {
-          await new Promise<void>((resolve) => { waiting = resolve; });
+          await new Promise<void>((resolve) => {
+            waiting = resolve;
+          });
         }
         if (aborted || (pending.length === 0 && ended)) return;
 
@@ -132,7 +142,11 @@ export class AgyProvider implements AgentProvider {
               lines.push(ln);
               if (STALE_SESSION_RE.test(ln)) {
                 staleWarningDetected = true;
-                try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+                try {
+                  proc.kill('SIGTERM');
+                } catch {
+                  /* ignore */
+                }
               }
             }
           });
@@ -197,7 +211,13 @@ export class AgyProvider implements AgentProvider {
         try {
           // Drain heartbeats in parallel with awaiting close.
           let closed = false;
-          stdoutPromise.then(() => { closed = true; }).catch(() => { closed = true; });
+          stdoutPromise
+            .then(() => {
+              closed = true;
+            })
+            .catch(() => {
+              closed = true;
+            });
           while (!closed && !aborted) {
             const { value, done } = await heartbeat.next();
             if (done) break;
@@ -225,7 +245,11 @@ export class AgyProvider implements AgentProvider {
         pending.push(wrapPromptWithContext(message, systemInstructions));
         if (activeProc) {
           terminatingForPush = true;
-          try { activeProc.kill('SIGTERM'); } catch { /* ignore */ }
+          try {
+            activeProc.kill('SIGTERM');
+          } catch {
+            /* ignore */
+          }
         }
         kick();
       },
@@ -237,7 +261,11 @@ export class AgyProvider implements AgentProvider {
       abort: () => {
         aborted = true;
         if (activeProc) {
-          try { activeProc.kill('SIGKILL'); } catch { /* ignore */ }
+          try {
+            activeProc.kill('SIGKILL');
+          } catch {
+            /* ignore */
+          }
         }
         kick();
       },

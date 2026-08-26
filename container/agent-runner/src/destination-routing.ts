@@ -1,4 +1,4 @@
-import { getInboundDb } from './db/connection.js';
+import { getInboundDb } from './mailbox/sqlite/connection.js';
 import { getCurrentBatchRouting } from './db/session-state.js';
 
 export interface DestinationCorrelation {

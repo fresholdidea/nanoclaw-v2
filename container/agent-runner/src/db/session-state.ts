@@ -9,6 +9,7 @@
  * on file and resumes cleanly if the user flips back.
  */
 import { getAgentMailbox } from '../mailbox/index.js';
+import { getOutboundDb } from '../mailbox/sqlite/connection.js';
 
 const LEGACY_KEY = 'sdk_session_id';
 
@@ -151,7 +152,10 @@ export function clearCurrentBatchRouting(): void {
   deleteValue(BATCH_ROUTING_KEY);
 }
 
-export function getCurrentBatchRouting(channelType: string, platformId: string): BatchDestinationRouting | null | undefined {
+export function getCurrentBatchRouting(
+  channelType: string,
+  platformId: string,
+): BatchDestinationRouting | null | undefined {
   const row = getOutboundDb()
     .prepare('SELECT value, updated_at FROM session_state WHERE key = ?')
     .get(BATCH_ROUTING_KEY) as { value: string; updated_at: string } | undefined;
