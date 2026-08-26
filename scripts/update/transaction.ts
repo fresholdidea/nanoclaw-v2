@@ -108,15 +108,15 @@ function statePath(transactionRoot: string): string {
 }
 
 function hasSafeStatePaths(state: UpdateState, projectRoot: string, transactionRoot: string, id: string): boolean {
-  return (
+  const result =
     state.id === id &&
     path.resolve(state.projectRoot) === path.resolve(projectRoot) &&
     path.resolve(state.transactionRoot) === path.resolve(transactionRoot) &&
     path.resolve(state.stageRoot) === path.join(path.resolve(transactionRoot), 'worktree') &&
     state.stageBranch === `update-nanoclaw/${id}` &&
     /^backup\/pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupBranch) &&
-    /^pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupTag)
-  );
+    /^pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupTag);
+  return result;
 }
 
 function saveState(state: UpdateState): void {
@@ -128,11 +128,16 @@ function saveState(state: UpdateState): void {
 }
 
 export function loadState(projectRoot: string, id: string): UpdateState {
-  const expectedTransactionRoot = path.join(defaultTransactionsRoot(path.resolve(projectRoot)), id);
+  // prepareUpdate stores the canonical project root. Resolve callers through
+  // the same realpath (macOS commonly exposes /var via /private/var) before
+  // checking the state binding, otherwise a harmless symlink spelling makes a
+  // valid transaction look tampered with.
+  const resolvedProjectRoot = fs.realpathSync(projectRoot);
+  const expectedTransactionRoot = path.join(defaultTransactionsRoot(resolvedProjectRoot), id);
   const target = statePath(expectedTransactionRoot);
   const state = JSON.parse(fs.readFileSync(target, 'utf8')) as UpdateState;
   if (state.schema !== 'nanoclaw-update/v1') throw new Error(`Unsupported update state in ${target}`);
-  if (!hasSafeStatePaths(state, projectRoot, expectedTransactionRoot, id)) {
+  if (!hasSafeStatePaths(state, resolvedProjectRoot, expectedTransactionRoot, id)) {
     throw new Error('Update state contains mismatched or unsafe paths');
   }
   return state;

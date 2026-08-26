@@ -1,11 +1,10 @@
-import type Database from 'better-sqlite3';
+import type { DbDriver } from '../driver.js';
 import type { Migration } from './index.js';
 
 export const migration021: Migration = {
   version: 21,
   name: 'provider-chain',
-  sqliteOnly: true,
-  up(db: Database.Database) {
-    db.prepare('ALTER TABLE container_configs ADD COLUMN provider_chain TEXT').run();
+  async up(db: DbDriver) {
+    await db.run('ALTER TABLE container_configs ADD COLUMN provider_chain TEXT');
   },
 };

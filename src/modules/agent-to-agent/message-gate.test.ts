@@ -173,14 +173,16 @@ describe('agent message policies', () => {
     expect(JSON.parse(String(opts.payload.content)).text).toBe('sensitive');
   });
 
-  it('self-message is never gated even if a policy row somehow exists', async () => {
+  it('self-message is refused before policy evaluation', async () => {
     await setMessagePolicy(A, A, 'telegram:dana', now()); // pathological, but must be ignored
-    await routeAgentMessage(
-      { id: 'self', platform_id: A, content: JSON.stringify({ text: 'note' }), in_reply_to: null },
-      SA,
-    );
+    await expect(
+      routeAgentMessage(
+        { id: 'self', platform_id: A, content: JSON.stringify({ text: 'note' }), in_reply_to: null },
+        SA,
+      ),
+    ).rejects.toThrow(/self-route refused/);
     expect(requestApproval).not.toHaveBeenCalled();
-    expect(readInbound(A, SA.id)).toHaveLength(1);
+    expect(readInbound(A, SA.id)).toHaveLength(0);
   });
 
   it('ghost policy (policy row, no destination row) still denies — deny beats the policy hold', async () => {
