@@ -457,7 +457,11 @@ export async function cutoverUpdate(
   try {
     await runtime.stopService(state.service);
     await runtime.drainContainers(state.projectRoot);
-    state.snapshot = createSnapshot(state);
+    // A retry after a build or health failure keeps the original snapshot so
+    // rollback always returns to the pre-cutover state. Re-copying into that
+    // snapshot would collide with preserved symlinks and can fail before the
+    // transaction reaches the reset step.
+    if (!state.snapshot) state.snapshot = createSnapshot(state);
     saveState(state);
     git(runtime, state.projectRoot, ['reset', '--hard', state.targetHead]);
     installAndBuild(state.projectRoot, state, runtime);
