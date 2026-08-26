@@ -36,8 +36,8 @@ export function mcpServersToAgyConfig(
     } else {
       out[name] = {
         command: cfg.command,
-        args: cfg.args ?? [],
-        ...(Object.keys(cfg.env ?? {}).length > 0 ? { env: cfg.env } : {}),
+        args: cfg.args,
+        ...(Object.keys(cfg.env).length > 0 ? { env: cfg.env } : {}),
       };
     }
   }
