@@ -29,163 +29,93 @@
  * logs (`groups/<folder>/tasks/<series>.md`) are keyed by series id and
  * carry over unchanged.
  */
-import fs from 'fs';
-
-import { syncProcessingAcks } from '../../db/session-db.js';
 import { getActiveSessions, isTaskThread } from '../../db/sessions.js';
 import { log } from '../../log.js';
-import type { Session } from '../../types.js';
-import {
-  inboundDbPath,
-  openInboundDb,
-  openOutboundDb,
-  outboundDbPath,
-  resolveTaskSession,
-  withInboundDb,
-} from '../../session-manager.js';
-import { insertTaskRow } from './db.js';
+import type { TaskRecord } from '../../mailbox/index.js';
+import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { handleRecurrence } from './recurrence.js';
-
-interface LiveTaskRow {
-  id: string;
-  series_id: string | null;
-  status: 'pending' | 'paused';
-  process_after: string | null;
-  recurrence: string | null;
-  content: string;
-}
-
-type InboundDb = ReturnType<typeof openInboundDb>;
-
-/** Reconcile fired-but-unsynced occurrences, then re-arm completed recurring
- *  rows — the same two steps the sweep runs, so the scan below sees exactly
- *  the rows that are genuinely still live. */
-async function reconcileSource(inDb: InboundDb, session: Session): Promise<void> {
-  if (fs.existsSync(outboundDbPath(session.agent_group_id, session.id))) {
-    try {
-      const outDb = openOutboundDb(session.agent_group_id, session.id);
-      try {
-        syncProcessingAcks(inDb, outDb);
-      } finally {
-        outDb.close();
-      }
-    } catch (err) {
-      log.warn('Legacy task migration: ack reconcile failed, continuing with inbound status as-is', {
-        sessionId: session.id,
-        err,
-      });
-    }
-  }
-  try {
-    await handleRecurrence(inDb, session);
-  } catch (err) {
-    log.warn('Legacy task migration: recurrence re-arm failed, continuing', { sessionId: session.id, err });
-  }
-}
-
-function neutralizeSource(inDb: InboundDb, rowId: string): void {
-  inDb.prepare("UPDATE messages_in SET status = 'cancelled', recurrence = NULL WHERE id = ?").run(rowId);
-}
 
 export async function migrateLegacyTaskSeries(): Promise<{ migrated: number; skipped: number }> {
   let migrated = 0;
   let skipped = 0;
 
-  for (const session of getActiveSessions()) {
+  for (const session of await getActiveSessions()) {
     if (isTaskThread(session.thread_id)) continue;
-    if (!fs.existsSync(inboundDbPath(session.agent_group_id, session.id))) continue;
 
-    let inDb: InboundDb;
-    try {
-      inDb = openInboundDb(session.agent_group_id, session.id);
-    } catch (err) {
-      log.warn('Legacy task migration: could not open session inbound DB, skipping it', {
-        sessionId: session.id,
-        err,
-      });
-      continue;
-    }
+    const rows = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
+      mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks());
+      try {
+        await handleRecurrence(mailbox, session);
+      } catch (err) {
+        log.warn('Legacy task migration: recurrence re-arm failed, continuing', { sessionId: session.id, err });
+      }
+      return mailbox.listLiveTasks();
+    });
+    if (!rows) continue;
 
-    try {
-      await reconcileSource(inDb, session);
-
-      const rows = inDb
-        .prepare(
-          `SELECT id, series_id, status, process_after, recurrence, content
-             FROM messages_in
-            WHERE kind = 'task' AND status IN ('pending', 'paused')`,
-        )
-        .all() as LiveTaskRow[];
-
-      for (const row of rows) {
-        const seriesKey = row.series_id ?? row.id;
-        try {
-          const { session: target } = resolveTaskSession(session.agent_group_id, seriesKey);
-          const outcome = withInboundDb(session.agent_group_id, target.id, (db) => {
-            const clash = db
-              .prepare(
-                `SELECT id FROM messages_in
-                  WHERE (series_id = ? OR id = ?) AND kind = 'task' AND status IN ('pending', 'paused')`,
-              )
-              .get(seriesKey, seriesKey) as { id: string } | undefined;
-            // Same occurrence id already live in the target = an interrupted
-            // earlier move; just finish it by neutralizing the source below.
-            if (clash) return clash.id === row.id ? 'already-moved' : 'conflict';
-            insertTaskRow(db, {
-              id: row.id,
-              seriesId: seriesKey,
-              processAfter: row.process_after,
-              recurrence: row.recurrence,
-              content: row.content,
-              status: row.status,
-            });
-            return 'inserted';
-          });
-
-          if (outcome === 'conflict') {
-            skipped++;
-            log.warn('Legacy task migration: series already live in its task session, left in place', {
-              seriesId: seriesKey,
-              sourceSessionId: session.id,
-              targetSessionId: target.id,
-            });
-            continue;
-          }
-
-          // The target insert is committed; a neutralize failure here must
-          // not read as a failed move (retry once, then leave it to the
-          // startup heal — the duplicate lives at most until next restart).
-          try {
-            neutralizeSource(inDb, row.id);
-          } catch {
-            try {
-              neutralizeSource(inDb, row.id);
-            } catch (err) {
-              log.warn(
-                'Legacy task migration: moved to task session but source row not neutralized — heals at next startup',
-                { seriesId: seriesKey, sourceSessionId: session.id, targetSessionId: target.id, err },
-              );
-            }
-          }
-          migrated++;
-          log.info('Legacy task series moved to its own task session', {
+    for (const row of rows) {
+      const seriesKey = row.seriesId ?? row.id;
+      try {
+        const { session: target } = await resolveTaskSession(session.agent_group_id, seriesKey);
+        const outcome = await withMailboxSession(session.agent_group_id, target.id, async (mailbox) => {
+          const clash = mailbox
+            .listLiveTasks()
+            .find((candidate: TaskRecord) => candidate.seriesId === seriesKey || candidate.id === seriesKey);
+          // Same occurrence id already live in the target = an interrupted
+          // earlier move; just finish it by neutralizing the source below.
+          if (clash) return clash.id === row.id ? 'already-moved' : 'conflict';
+          await mailbox.insertTask({
+            id: row.id,
             seriesId: seriesKey,
-            agentGroupId: session.agent_group_id,
+            processAfter: row.processAfter,
+            recurrence: row.recurrence,
+            content: row.content,
+            status: row.status === 'paused' ? 'paused' : 'pending',
+          });
+          return 'inserted';
+        });
+
+        if (outcome === 'conflict') {
+          skipped++;
+          log.warn('Legacy task migration: series already live in its task session, left in place', {
+            seriesId: seriesKey,
             sourceSessionId: session.id,
             targetSessionId: target.id,
-            status: row.status,
           });
-        } catch (err) {
-          skipped++;
-          log.warn('Legacy task migration: series move failed, left in place', {
-            seriesId: seriesKey,
-            sourceSessionId: session.id,
-            err,
-          });
+          continue;
         }
+
+        // The target insert is committed; a neutralize failure here must
+        // not read as a failed move (retry once, then leave it to the
+        // startup heal — the duplicate lives at most until next restart).
+        try {
+          await withMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.cancelTask(row.id));
+        } catch {
+          try {
+            await withMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.cancelTask(row.id));
+          } catch (err) {
+            log.warn(
+              'Legacy task migration: moved to task session but source row not neutralized — heals at next startup',
+              { seriesId: seriesKey, sourceSessionId: session.id, targetSessionId: target.id, err },
+            );
+          }
+        }
+        migrated++;
+        log.info('Legacy task series moved to its own task session', {
+          seriesId: seriesKey,
+          agentGroupId: session.agent_group_id,
+          sourceSessionId: session.id,
+          targetSessionId: target.id,
+          status: row.status,
+        });
+      } catch (err) {
+        skipped++;
+        log.warn('Legacy task migration: series move failed, left in place', {
+          seriesId: seriesKey,
+          sourceSessionId: session.id,
+          err,
+        });
       }
-    } finally {
-      inDb.close();
     }
   }
 

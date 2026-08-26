@@ -68,8 +68,8 @@ export async function findSessionByAgentGroup(agentGroupId: string): Promise<Ses
          AND NOT (messaging_group_id IS NULL AND thread_id IS NOT NULL AND thread_id LIKE 'system:%')
        ORDER BY COALESCE(last_active, created_at) DESC
        LIMIT 1`,
-    )
-    .get(agentGroupId) as Session | undefined;
+    agentGroupId,
+  );
 }
 
 /**
@@ -79,10 +79,9 @@ export async function findSessionByAgentGroup(agentGroupId: string): Promise<Ses
  * instead of pooling in the hidden `(null, null)` fallback session — the
  * split-brain behind the 2026-08-20 provenance incidents.
  */
-export function findPrimaryChannelSession(agentGroupId: string): Session | undefined {
-  return getDb()
-    .prepare(
-      `SELECT * FROM sessions
+export async function findPrimaryChannelSession(agentGroupId: string): Promise<Session | undefined> {
+  return getDb().get<Session>(
+    `SELECT * FROM sessions
        WHERE agent_group_id = ?
          AND status = 'active'
          AND messaging_group_id IS NOT NULL

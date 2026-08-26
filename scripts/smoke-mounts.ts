@@ -20,10 +20,13 @@
 import { execFileSync } from 'node:child_process';
 
 import { CONTAINER_IMAGE } from '../src/config.js';
+import { getAllAgentGroups } from '../src/db/agent-groups.js';
 import { getContainerConfig } from '../src/db/container-configs.js';
-import { initDb, getDb } from '../src/db/connection.js';
-import { CONTAINER_RUNTIME_BIN, readonlyMountArgs } from '../src/container-runtime.js';
-import { validateAdditionalMounts } from '../src/modules/mount-security/index.js';
+import { initDb } from '../src/db/connection.js';
+import { CONTAINER_RUNTIME_BIN } from '../src/container-runtime.js';
+import { mountArgs } from '../src/drivers/docker-driver.js';
+import type { MountSpec } from '../src/drivers/types.js';
+import { validateAdditionalMounts, type AdditionalMount } from '../src/modules/mount-security/index.js';
 
 const PROBE = process.argv.includes('--probe');
 const groupArg = process.argv.indexOf('--group');
@@ -32,21 +35,16 @@ const onlyGroup = groupArg !== -1 ? process.argv[groupArg + 1] : null;
 // default, never the stale legacy `nanoclaw-agent:latest`.
 const DEFAULT_IMAGE = CONTAINER_IMAGE;
 
-initDb('data/v2.db');
+await initDb('data/v2.db', { role: 'tool' });
 
-type Row = { id: string; name: string };
-const groups = (
-  getDb()
-    .prepare(`SELECT id, name FROM agent_groups ${onlyGroup ? 'WHERE id = ?' : ''} ORDER BY name`)
-    .all(...(onlyGroup ? [onlyGroup] : [])) as Row[]
-);
+const groups = (await getAllAgentGroups()).filter((group) => !onlyGroup || group.id === onlyGroup);
 
 /** The runner stores additional_mounts as raw JSON text, not a parsed array. */
-function readMounts(groupId: string): { mounts: unknown[]; imageTag: string } {
-  const cfg = getContainerConfig(groupId) as any;
+async function readMounts(groupId: string): Promise<{ mounts: AdditionalMount[]; imageTag: string }> {
+  const cfg = await getContainerConfig(groupId);
   const raw = cfg?.additional_mounts ?? [];
   const mounts = typeof raw === 'string' ? JSON.parse(raw) : raw;
-  return { mounts: Array.isArray(mounts) ? mounts : [], imageTag: cfg?.imageTag ?? DEFAULT_IMAGE };
+  return { mounts: Array.isArray(mounts) ? mounts : [], imageTag: cfg?.image_tag ?? DEFAULT_IMAGE };
 }
 
 /**
@@ -58,10 +56,14 @@ function probe(imageTag: string, resolved: { hostPath: string; containerPath: st
   const uid = process.getuid?.();
   const gid = process.getgid?.();
   if (uid != null && uid !== 0 && uid !== 1000) args.push('--user', `${uid}:${gid}`, '-e', 'HOME=/home/node');
-  for (const m of resolved) {
-    if (m.readonly) args.push(...readonlyMountArgs(m.hostPath, m.containerPath));
-    else args.push('-v', `${m.hostPath}:${m.containerPath}`);
-  }
+  const mountSpecs: MountSpec[] = resolved.map((mount) => ({
+    class: 'allowlisted-extra',
+    hostPath: mount.hostPath,
+    containerPath: mount.containerPath,
+    mode: mount.readonly ? 'ro' : 'rw',
+    groupScope: 'mount-smoke-probe',
+  }));
+  args.push(...mountArgs(mountSpecs));
   // A probe file is created and removed inside the mount; name is unique per run.
   const script = resolved
     .map(
@@ -87,20 +89,14 @@ let failures = 0;
 let checked = 0;
 
 for (const g of groups) {
-  const { mounts, imageTag } = readMounts(g.id);
+  const { mounts, imageTag } = await readMounts(g.id);
   if (mounts.length === 0) continue;
 
-  const resolved = validateAdditionalMounts(mounts) as {
-    hostPath: string;
-    containerPath: string;
-    readonly: boolean;
-  }[];
+  const resolved = validateAdditionalMounts(mounts, g.name);
 
   // A mount present in config but absent from the resolved set was rejected
   // outright (missing path, or outside every allowed root).
-  const dropped = mounts.filter(
-    (m: any) => !resolved.some((r) => r.containerPath.endsWith('/' + m.containerPath)),
-  );
+  const dropped = mounts.filter((m: any) => !resolved.some((r) => r.containerPath.endsWith('/' + m.containerPath)));
 
   console.log(`\n=== ${g.name}  (${g.id})  image=${imageTag}`);
   for (const d of dropped as any[]) {
@@ -113,7 +109,13 @@ for (const g of groups) {
     try {
       probed = probe(imageTag, resolved);
     } catch (err: any) {
-      console.log(`  PROBE FAILED: ${String(err.stderr || err.message).trim().split('\n')[0]}`);
+      console.log(
+        `  PROBE FAILED: ${
+          String(err.stderr || err.message)
+            .trim()
+            .split('\n')[0]
+        }`,
+      );
       failures++;
     }
   }
@@ -130,8 +132,7 @@ for (const g of groups) {
     const agrees = writable === !m.readonly;
     if (!agrees) failures++;
     console.log(
-      `  ${agrees ? 'PASS' : 'FAIL'} ${intent}  ${m.containerPath}  ` +
-        `(write ${verdict})  <- ${m.hostPath}`,
+      `  ${agrees ? 'PASS' : 'FAIL'} ${intent}  ${m.containerPath}  ` + `(write ${verdict})  <- ${m.hostPath}`,
     );
   }
 }

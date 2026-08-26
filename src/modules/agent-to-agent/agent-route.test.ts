@@ -718,18 +718,18 @@ describe('routeAgentMessage session-fragmentation fixes', () => {
     };
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
 
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
 
-    createAgentGroup({ id: A, name: 'Zed', folder: 'a2', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: B, name: 'cache-am', folder: 'b2', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: A, name: 'Zed', folder: 'a2', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: B, name: 'cache-am', folder: 'b2', agent_provider: null, created_at: now() });
 
     for (const mg of ['mg-old', 'mg-new', 'mg-a']) {
-      createMessagingGroup({
+      await createMessagingGroup({
         id: mg,
         channel_type: 'telegram',
         platform_id: `chat-${mg}`,
@@ -762,18 +762,24 @@ describe('routeAgentMessage session-fragmentation fixes', () => {
     });
 
     for (const s of [sourceNull, targetNull, targetChanOld, targetChanNew]) {
-      createSession(s);
+      await createSession(s);
       initSessionFolder(s.agent_group_id, s.id);
     }
 
-    createDestination({
+    await createDestination({
       agent_group_id: A,
       local_name: 'cache-am',
       target_type: 'agent',
       target_id: B,
       created_at: now(),
     });
-    createDestination({ agent_group_id: B, local_name: 'zed', target_type: 'agent', target_id: A, created_at: now() });
+    await createDestination({
+      agent_group_id: B,
+      local_name: 'zed',
+      target_type: 'agent',
+      target_id: A,
+      created_at: now(),
+    });
   });
 
   afterEach(() => {
@@ -793,8 +799,8 @@ describe('routeAgentMessage session-fragmentation fixes', () => {
   });
 
   it('fresh send falls back to the (null, null) session when the target has no channel session', async () => {
-    updateSession(targetChanOld.id, { status: 'closed' });
-    updateSession(targetChanNew.id, { status: 'closed' });
+    await updateSession(targetChanOld.id, { status: 'closed' });
+    await updateSession(targetChanNew.id, { status: 'closed' });
     await route(sourceNull);
     expect(readInbound(B, targetNull.id)).toHaveLength(1);
   });
@@ -822,7 +828,7 @@ describe('routeAgentMessage session-fragmentation fixes', () => {
 
   it('channel-session sender presents as the bare agent name', async () => {
     const chanSource = makeSession({ id: 'sess-A2-chan', agent_group_id: A, messaging_group_id: 'mg-a' });
-    createSession(chanSource);
+    await createSession(chanSource);
     initSessionFolder(A, chanSource.id);
     await route(chanSource);
     expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed');
@@ -834,7 +840,7 @@ describe('routeAgentMessage session-fragmentation fixes', () => {
       agent_group_id: A,
       thread_id: 'system:tasks:weekly-client-status-766f',
     });
-    createSession(taskSource);
+    await createSession(taskSource);
     initSessionFolder(A, taskSource.id);
     await route(taskSource);
     expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [task weekly-client-status-766f]');
@@ -847,7 +853,7 @@ describe('routeAgentMessage session-fragmentation fixes', () => {
       messaging_group_id: 'mg-a',
       thread_id: 'slack:C123:169.42',
     });
-    createSession(threadSource);
+    await createSession(threadSource);
     initSessionFolder(A, threadSource.id);
     await route(threadSource);
     expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [thread]');

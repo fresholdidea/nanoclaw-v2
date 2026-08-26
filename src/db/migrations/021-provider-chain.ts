@@ -4,6 +4,7 @@ import type { Migration } from './index.js';
 export const migration021: Migration = {
   version: 21,
   name: 'provider-chain',
+  sqliteOnly: true,
   up(db: Database.Database) {
     db.prepare('ALTER TABLE container_configs ADD COLUMN provider_chain TEXT').run();
   },

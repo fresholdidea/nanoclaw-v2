@@ -10,6 +10,9 @@ const SCALAR_COLUMNS = new Set([
   'assistant_name',
   'max_messages_per_prompt',
   'cli_scope',
+  'enable_agy_tooling',
+  'enable_opencode_tooling',
+  'provider_chain',
   'timezone',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
@@ -28,11 +31,13 @@ export async function createContainerConfig(config: ContainerConfigRow): Promise
     `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
         max_messages_per_prompt, skills, mcp_servers, packages_apt, packages_npm,
-        additional_mounts, cli_scope, timezone, updated_at
+        additional_mounts, cli_scope, enable_agy_tooling, enable_opencode_tooling,
+        provider_chain, timezone, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @skills, @mcp_servers, @packages_apt, @packages_npm,
-        @additional_mounts, @cli_scope, @timezone, @updated_at
+        @additional_mounts, @cli_scope, @enable_agy_tooling, @enable_opencode_tooling,
+        @provider_chain, @timezone, @updated_at
       )`,
     config,
   );
@@ -85,6 +90,9 @@ export async function updateContainerConfigScalars(
       | 'assistant_name'
       | 'max_messages_per_prompt'
       | 'cli_scope'
+      | 'enable_agy_tooling'
+      | 'enable_opencode_tooling'
+      | 'provider_chain'
       | 'timezone'
     >
   >,
@@ -105,6 +113,16 @@ export async function updateContainerConfigScalars(
   values.updated_at = new Date().toISOString();
 
   await getDb().run(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`, values);
+}
+
+export async function updateContainerConfig(
+  agentGroupId: string,
+  updates: { providerChain?: string[] | null },
+): Promise<void> {
+  if (updates.providerChain === undefined) return;
+  await updateContainerConfigScalars(agentGroupId, {
+    provider_chain: updates.providerChain === null ? null : JSON.stringify(updates.providerChain),
+  });
 }
 
 /** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts. */

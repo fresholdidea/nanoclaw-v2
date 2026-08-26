@@ -22,13 +22,18 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR } from '../src/config.js';
+import { CONTAINER_IMAGE, DATA_DIR, INSTALL_SLUG } from '../src/config.js';
 import { configFromDb } from '../src/container-config.js';
 import { buildAgentGroupImage } from '../src/container-runner.js';
-import { CONTAINER_RUNTIME_BIN, stopContainer } from '../src/container-runtime.js';
+import { CONTAINER_RUNTIME_BIN } from '../src/container-runtime.js';
 import { getAgentGroup } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
-import { getContainerConfig, getAllContainerConfigs, updateContainerConfigScalars } from '../src/db/container-configs.js';
+import {
+  getContainerConfig,
+  getAllContainerConfigs,
+  updateContainerConfigScalars,
+} from '../src/db/container-configs.js';
+import { getSessionDriver } from '../src/drivers/index.js';
 
 function imageCreatedAt(tag: string): string {
   try {
@@ -52,22 +57,16 @@ function imageHas(tag: string, relPath: string): boolean {
   }
 }
 
-function stopGroupContainers(folder: string): string[] {
+async function stopGroupContainers(agentGroupId: string): Promise<string[]> {
   const stopped: string[] = [];
   try {
-    const names = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter "name=nanoclaw-v2-${folder}-" --format "{{.Names}}"`,
-      { encoding: 'utf-8' },
-    )
-      .split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    for (const name of names) {
+    const snapshots = await getSessionDriver().listSessions(INSTALL_SLUG);
+    for (const { handle } of snapshots.filter(({ handle }) => handle.key.agentGroupId === agentGroupId)) {
       try {
-        stopContainer(name);
-        stopped.push(name);
+        await handle.stop('operator-image-rebuild');
+        stopped.push(handle.name);
       } catch (err) {
-        console.error(`  warn: failed to stop ${name}: ${err instanceof Error ? err.message : String(err)}`);
+        console.error(`  warn: failed to stop ${handle.name}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   } catch {
@@ -76,19 +75,17 @@ function stopGroupContainers(folder: string): string[] {
   return stopped;
 }
 
-function resolveIds(args: string[]): string[] {
+async function resolveIds(args: string[]): Promise<string[]> {
   if (args.includes('--all-customized')) {
-    const configs = getAllContainerConfigs();
-    return configs
-      .filter((c) => c.image_tag && c.image_tag !== CONTAINER_IMAGE)
-      .map((c) => c.agent_group_id);
+    const configs = await getAllContainerConfigs();
+    return configs.filter((c) => c.image_tag && c.image_tag !== CONTAINER_IMAGE).map((c) => c.agent_group_id);
   }
   return args.filter((a) => !a.startsWith('--'));
 }
 
 async function main(): Promise<void> {
-  initDb(path.join(DATA_DIR, 'v2.db'));
-  const ids = resolveIds(process.argv.slice(2));
+  await initDb(path.join(DATA_DIR, 'v2.db'), { role: 'tool' });
+  const ids = await resolveIds(process.argv.slice(2));
   if (ids.length === 0) {
     console.error('Usage: tsx scripts/rebuild-agent-image.ts <agentGroupId> [...] | --all-customized');
     process.exit(1);
@@ -97,12 +94,12 @@ async function main(): Promise<void> {
   const results: { id: string; folder: string; ok: boolean; before: string; after: string; err?: string }[] = [];
 
   for (const id of ids) {
-    const group = getAgentGroup(id);
+    const group = await getAgentGroup(id);
     if (!group) {
       results.push({ id, folder: '?', ok: false, before: '-', after: '-', err: 'agent group not found' });
       continue;
     }
-    const row = getContainerConfig(id);
+    const row = await getContainerConfig(id);
     if (!row) {
       results.push({ id, folder: group.folder, ok: false, before: '-', after: '-', err: 'container config not found' });
       continue;
@@ -115,7 +112,7 @@ async function main(): Promise<void> {
     console.log(`  current tag: ${tag}`);
     console.log(`  built:       ${before}`);
 
-    const stopped = stopGroupContainers(group.folder);
+    const stopped = await stopGroupContainers(id);
     if (stopped.length > 0) console.log(`  stopped containers: ${stopped.join(', ')}`);
 
     // No packages → per-agent image adds nothing over base. Reset imageTag
@@ -124,7 +121,7 @@ async function main(): Promise<void> {
     const hasPackages = cfg.packages.apt.length > 0 || cfg.packages.npm.length > 0;
     if (!hasPackages) {
       console.log(`  no apt/npm packages — resetting imageTag to ${CONTAINER_IMAGE}`);
-      updateContainerConfigScalars(id, { image_tag: null });
+      await updateContainerConfigScalars(id, { image_tag: null });
       const after = imageCreatedAt(CONTAINER_IMAGE);
       const hasOpencode = imageHas(CONTAINER_IMAGE, '/app/node_modules/@opencode-ai/sdk');
       console.log(`  now using:   ${CONTAINER_IMAGE}`);

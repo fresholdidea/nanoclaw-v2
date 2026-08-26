@@ -23,20 +23,21 @@ const TEST_DIR = '/tmp/nanoclaw-test-migrate-legacy';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { createSession, findSystemSession, taskThreadId } from '../../db/sessions.js';
-import { inboundDbPath, initSessionFolder, outboundDbPath, resolveTaskSession } from '../../session-manager.js';
-import { insertTaskRow } from './db.js';
+import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { insertTaskRow } from '../../mailbox/sqlite/tasks.js';
+import { initSessionFolder, resolveTaskSession } from '../../session-manager.js';
 import { migrateLegacyTaskSeries } from './migrate-legacy.js';
 
 function now(): string {
   return new Date().toISOString();
 }
 
-function createGroup(id: string): void {
-  createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+async function createGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
 }
 
-function createChatSession(group: string, id: string): void {
-  createSession({
+async function createChatSession(group: string, id: string): Promise<void> {
+  await createSession({
     id,
     agent_group_id: group,
     messaging_group_id: null,
@@ -90,13 +91,13 @@ function liveRows(group: string, session: string): Array<Record<string, unknown>
 }
 
 describe('migrateLegacyTaskSeries', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    const db = initTestDb();
-    runMigrations(db);
-    createGroup('ag-1');
-    createChatSession('ag-1', 'chat-1');
+    const db = await initTestDb();
+    await runMigrations(db);
+    await createGroup('ag-1');
+    await createChatSession('ag-1', 'chat-1');
   });
 
   afterEach(() => {
@@ -111,7 +112,7 @@ describe('migrateLegacyTaskSeries', () => {
     expect(result.migrated).toBe(1);
 
     // Target session exists with the per-series thread id.
-    const target = findSystemSession('ag-1', taskThreadId('legacy-report'));
+    const target = await findSystemSession('ag-1', taskThreadId('legacy-report'));
     expect(target).toBeDefined();
     if (!target) return;
 
@@ -144,7 +145,7 @@ describe('migrateLegacyTaskSeries', () => {
 
     await migrateLegacyTaskSeries();
 
-    const target = findSystemSession('ag-1', taskThreadId('paused-series'));
+    const target = await findSystemSession('ag-1', taskThreadId('paused-series'));
     expect(target).toBeDefined();
     if (!target) return;
     const moved = liveRows('ag-1', target.id);
@@ -159,14 +160,14 @@ describe('migrateLegacyTaskSeries', () => {
     expect((await migrateLegacyTaskSeries()).migrated).toBe(0);
 
     // Still exactly one live row for the series overall.
-    const target = findSystemSession('ag-1', taskThreadId('legacy-report'));
+    const target = await findSystemSession('ag-1', taskThreadId('legacy-report'));
     if (!target) throw new Error('target session missing');
     expect(liveRows('ag-1', target.id)).toHaveLength(1);
   });
 
   it('leaves properly-registered series in task sessions untouched', async () => {
     // A series already living in its own task session must not be re-moved.
-    const { session } = resolveTaskSession('ag-1', 'registered-series');
+    const { session } = await resolveTaskSession('ag-1', 'registered-series');
     seedLegacyTask('ag-1', session.id, 'registered-series');
 
     const result = await migrateLegacyTaskSeries();
@@ -175,7 +176,7 @@ describe('migrateLegacyTaskSeries', () => {
   });
 
   it('skips a series whose task session already has a DIFFERENT live occurrence, leaving the source alone', async () => {
-    const { session } = resolveTaskSession('ag-1', 'clash');
+    const { session } = await resolveTaskSession('ag-1', 'clash');
     seedLegacyTask('ag-1', session.id, 'clash', { id: 'clash-rearmed-occurrence' });
     seedLegacyTask('ag-1', 'chat-1', 'clash');
 
@@ -192,7 +193,7 @@ describe('migrateLegacyTaskSeries', () => {
     // Simulates a crash after target-insert but before source-neutralize:
     // the exact same row id exists live in the task session.
     seedLegacyTask('ag-1', 'chat-1', 'crashed-move');
-    const { session } = resolveTaskSession('ag-1', 'crashed-move');
+    const { session } = await resolveTaskSession('ag-1', 'crashed-move');
     seedLegacyTask('ag-1', session.id, 'crashed-move');
 
     const result = await migrateLegacyTaskSeries();
@@ -226,7 +227,7 @@ describe('migrateLegacyTaskSeries', () => {
     // Target: exactly one live occurrence, and it is a NEW one due at the
     // next cron time — not the already-fired row re-homed with its past
     // process_after.
-    const target = findSystemSession('ag-1', taskThreadId('fired-series'));
+    const target = await findSystemSession('ag-1', taskThreadId('fired-series'));
     expect(target).toBeDefined();
     if (!target) return;
     const moved = liveRows('ag-1', target.id);
@@ -250,7 +251,7 @@ describe('migrateLegacyTaskSeries', () => {
     srcDb.close();
     expect(fired.status).toBe('completed');
     // Nothing live to move → no task session should have been created.
-    expect(findSystemSession('ag-1', taskThreadId('fired-oneshot'))).toBeUndefined();
+    expect(await findSystemSession('ag-1', taskThreadId('fired-oneshot'))).toBeUndefined();
   });
 
   it('leaves completed history rows in the source session', async () => {
