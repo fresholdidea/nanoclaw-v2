@@ -106,13 +106,15 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/l
 ENV NOTEBOOKLM_MCP_CLI_PATH=/workspace/extra/notebooklm
 
 # ---- deepline CLI ------------------------------------------------------------
-# Download the Python binary directly — the full install script runs `npx
-# skills add` at the end to install Claude Code host skills, which hangs in
-# Docker build context. Write the shim manually instead.
-RUN curl -fsSL "https://code.deepline.com/api/v2/cli/python" -o /usr/local/bin/deepline-real && \
-    chmod +x /usr/local/bin/deepline-real && \
-    printf '#!/usr/bin/env sh\nexport DEEPLINE_API_BASE_URL="https://code.deepline.com"\nexport DEEPLINE_CONFIG_SCOPE="code-deepline-com"\nexport DEEPLINE_REAL_BINARY="/usr/local/bin/deepline-real"\nexport DEEPLINE_INSTALL_METHOD="shiv"\nexec "$DEEPLINE_REAL_BINARY" "$@"\n' > /usr/local/bin/deepline && \
-    chmod +x /usr/local/bin/deepline
+# Install the supported npm CLI package directly. The former Python binary
+# endpoint (`/api/v2/cli/python`) now returns 404; the package registry is the
+# documented, versioned distribution and avoids running Deepline's interactive
+# setup during a non-interactive image build.
+ARG DEEPLINE_VERSION=0.3.0
+RUN npm install --global --ignore-scripts --no-audit --no-fund \
+    "deepline@${DEEPLINE_VERSION}" \
+    --registry=https://code.deepline.com/api/v2/npm/
+ENV DEEPLINE_HOST_URL=https://code.deepline.com
 
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
