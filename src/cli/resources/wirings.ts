@@ -45,6 +45,40 @@ function normalizeThreads(v: unknown): number {
   throw new Error(`--threads must be true or false, got "${v}"`);
 }
 
+/** --thread-filter: a full thread id, or a bare platform topic number that is
+ *  expanded against the messaging group's platform id (`<platform_id>:<n>`).
+ *  Empty string clears the filter (stored NULL). */
+export function normalizeThreadFilter(v: unknown, mg: MessagingGroup): string | null {
+  const parts = String(v)
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => t !== '');
+  if (parts.length === 0) return null;
+  const full = parts.map((raw) => {
+    if (/^\d+$/.test(raw)) return `${mg.platform_id}:${raw}`;
+    if (!raw.startsWith(`${mg.platform_id}:`)) {
+      throw new Error(
+        `--thread-filter must be a thread of this messaging group (${mg.platform_id}:<topic>) or a bare topic number, got "${raw}"`,
+      );
+    }
+    return raw;
+  });
+  return [...new Set(full)].join(',');
+}
+
+/** A thread filter is meaningless when the wiring's thread policy resolves
+ *  off (effective thread id is always NULL, so it could never match). Reuse
+ *  the per-thread coherence check by validating as if session_mode were
+ *  'per-thread'. */
+function requireThreadsForFilter(w: EngageValues, mg: MessagingGroup): void {
+  if (w.thread_filter === undefined || w.thread_filter === null) return;
+  try {
+    validateEngageAgainstChannel({ ...w, engage_mode: undefined, session_mode: 'per-thread' }, mg);
+  } catch (err) {
+    throw new Error(`--thread-filter ${String((err as Error).message).replace(/^session_mode 'per-thread' /, '')}`);
+  }
+}
+
 registerResource({
   name: 'wiring',
   plural: 'wirings',
@@ -118,6 +152,13 @@ registerResource({
       updatable: true,
     },
     {
+      name: 'thread_filter',
+      type: 'string',
+      description:
+        'Scope this wiring to ONE thread/topic of the messaging group. Pass the full thread id (e.g. telegram:-100123:4) or just the platform topic number (4); comma-separate several. The agent then engages only in that thread, and while it matches, unscoped wirings on the same chat stand down — so an orchestrator wired without a filter answers every other topic. Requires honored thread ids (see --threads). Empty string clears.',
+      updatable: true,
+    },
+    {
       name: 'priority',
       type: 'number',
       description: 'Fanout order when multiple agents are wired to the same messaging group — higher priority first.',
@@ -137,8 +178,10 @@ registerResource({
   preUpdate: async (updates, current) => {
     const mg = await requireMessagingGroup(current.messaging_group_id);
     if (updates.threads !== undefined) updates.threads = normalizeThreads(updates.threads);
+    if (updates.thread_filter !== undefined) updates.thread_filter = normalizeThreadFilter(updates.thread_filter, mg);
 
     const merged: EngageValues = { ...current, ...updates };
+    if (updates.thread_filter !== undefined || updates.threads !== undefined) requireThreadsForFilter(merged, mg);
     // Legacy rows can be engage_mode='pattern' with a NULL pattern (the
     // router treats that as match-all). Don't reject unrelated updates to
     // them — only enforce the pairing when the pattern fields change.
@@ -167,7 +210,7 @@ registerResource({
     create: {
       access: 'approval',
       description:
-        'Wire a messaging group to an agent group. Identify the messaging group by --messaging-group-id OR --channel-type + --platform-id (+ --instance); identify the agent by --agent-group-id OR --agent-group <folder>. Idempotent on (messaging group, agent group). Engagement flags: --engage-mode, --engage-pattern, --session-mode, --sender-scope, --ignored-message-policy, --threads, --priority. Omitted engage flags default from the channel adapter declaration.',
+        'Wire a messaging group to an agent group. Identify the messaging group by --messaging-group-id OR --channel-type + --platform-id (+ --instance); identify the agent by --agent-group-id OR --agent-group <folder>. Idempotent on (messaging group, agent group). Engagement flags: --engage-mode, --engage-pattern, --session-mode, --sender-scope, --ignored-message-policy, --threads, --thread-filter, --priority. Omitted engage flags default from the channel adapter declaration.',
       handler: async (args) => {
         // Resolve the messaging group.
         let mgId = args.messaging_group_id as string | undefined;
@@ -224,6 +267,7 @@ registerResource({
         // Pass-2 parity: context-aware defaults + cross-column validation.
         const mg = await requireMessagingGroup(values.messaging_group_id);
         if (values.threads !== undefined) values.threads = normalizeThreads(values.threads);
+        if (args.thread_filter !== undefined) values.thread_filter = normalizeThreadFilter(args.thread_filter, mg);
 
         const channelKey = mg.instance ?? mg.channel_type;
         // Undeclared (stale) channels: leave engage_mode unset so the static
@@ -247,6 +291,7 @@ registerResource({
         // May mutate values.engage_mode (mention-sticky→mention coercion) —
         // must run after declaration resolution and threads normalization.
         validateEngageAgainstChannel(values, mg);
+        requireThreadsForFilter(values, mg);
 
         // Pass-3 parity: static defaults for whatever is still unset. threads
         // is intentionally left absent when omitted — column NULL = inherit

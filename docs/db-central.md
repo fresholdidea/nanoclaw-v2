@@ -440,6 +440,8 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 20 | `container-config-timezone` | `020-container-config-timezone.ts` | `container_configs.timezone` — per-agent-group timezone override (NULL = install-global) |
 | 21 | `approval-question-render-metadata` | `021-approval-question.ts` | `question` card-body column on all three approval tables so terminal edits retain the original request |
 | 22 | `messaging-group-detached-at` | `022-messaging-group-detached.ts` | `messaging_groups.detached_at` — records when the bot left a channel without deleting its wiring |
+| 23 | `approvals-instance` | `023-approvals-instance.ts` | `pending_approvals.instance` — adapter instance the approval card was delivered through |
+| 24 | `wiring-thread-filter` | `024-wiring-thread-filter.ts` | `messaging_group_agents.thread_filter` — scope a wiring to one thread/topic (NULL = unscoped); scoped match makes unscoped wirings stand down |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

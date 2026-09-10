@@ -204,3 +204,14 @@ Configuration and workspace files only; no code.
 6. Repeat per room. The `ads` Agentz group is already a supergroup and stays `shared` (mention mode).
 
 **Effect on spend:** a topic session carries only that topic's context, so long-lived client rooms stop dragging one 165k-token history into every reply; idle topic containers stop after 10 minutes.
+
+## 11. Topic-scoped wirings (2026-09-10)
+
+Daily Ops (`mg-1789059587692-r4utvv`, `telegram:-1004336052033`, forum supergroup) is the orchestrator room: Zed (dm-with-brad) is wired unscoped, specialists are wired per topic.
+
+- Migration 024 adds `messaging_group_agents.thread_filter` (exact effective thread id; NULL = unscoped).
+- Router fan-out (`src/router.ts`): a scoped wiring engages only in its thread; when a scoped wiring matches, unscoped wirings on that messaging group stand down for the message (no double answers). Scoped wirings never accumulate outside their thread.
+- CLI: `ncl wirings create|update … --thread-filter <topic-number|full-thread-id>` (bare number expands to `<platform_id>:<n>`; `""` clears). Rejected when the wiring's thread policy resolves off.
+- Tests: `src/router-thread-filter.test.ts`, `src/cli/resources/wirings.test.ts` (thread_filter block).
+- Wired: meshberg-am → `telegram:-1004336052033:4` (wiring `367b8477-…`). Topic ids come from the host log line `Session created … threadId=telegram:-1004336052033:<n>` after the first message in a topic.
+- Not yet: a `messaging-groups topics` lister (Telegram's Bot API has no list-topics call; names only arrive on the topic-creation service message).

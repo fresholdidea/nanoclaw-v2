@@ -152,6 +152,15 @@ export interface MessagingGroupAgent {
    * updating.
    */
   threads?: number | null;
+  /**
+   * Per-wiring thread filter (migration 024). NULL = unscoped. Otherwise the
+   * exact effective thread id this wiring is confined to (e.g. a Telegram
+   * forum topic `telegram:-100123:4`): the wiring engages only in that
+   * thread, and while it matches, unscoped wirings on the same messaging
+   * group stand down. Lets one chat fan out by topic to specialist agents
+   * with an orchestrator as the catch-all.
+   */
+  thread_filter?: string | null;
   created_at: string;
 }
 

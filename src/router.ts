@@ -371,17 +371,14 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   let accumulatedCount = 0;
   let subscribed = false;
 
-  for (const agent of agents) {
-    const agentGroup = await getAgentGroup(agent.agent_group_id);
-    if (!agentGroup) continue;
-
-    // Effective thread id for THIS wiring: the event-derived address is
-    // policy-stripped when the wiring (or its channel declaration) opts out
-    // of threads. event.replyTo is operator intent from the CLI admin
-    // transport and is never nulled. Guard: platform thread ids must never
-    // collide with the reserved 'system:%' session namespace
-    // (src/db/sessions.ts) — they are platform-native identifiers, and this
-    // is the only place an inbound thread id enters session resolution.
+  // Resolve each wiring's thread policy once. The effective thread id for a
+  // wiring is the event-derived address, policy-stripped when the wiring (or
+  // its channel declaration) opts out of threads. event.replyTo is operator
+  // intent from the CLI admin transport and is never nulled. Guard: platform
+  // thread ids must never collide with the reserved 'system:%' session
+  // namespace (src/db/sessions.ts) — they are platform-native identifiers,
+  // and this is the only place an inbound thread id enters session resolution.
+  const candidates = agents.map((agent) => {
     const threadsEnabled = resolveThreadPolicy(
       agent.threads ?? null,
       channelDefaults,
@@ -389,6 +386,30 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       supportsThreads,
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
+    return { agent, threadsEnabled, effectiveThreadId };
+  });
+
+  // Thread-scoped wirings (migration 024): a wiring with `thread_filter` is
+  // confined to that one thread — it never sees messages elsewhere, not even
+  // to accumulate. When a scoped wiring claims this message, every unscoped
+  // wiring on the messaging group stands down so an orchestrator catch-all
+  // does not double-answer beside the specialist. Threads with no scoped
+  // wiring fall through to the unscoped wirings as before.
+  const inFilter = (c: (typeof candidates)[number]): boolean =>
+    c.effectiveThreadId !== null && threadFilterList(c.agent.thread_filter).includes(c.effectiveThreadId);
+  const scopedClaim = candidates.some((c) => c.agent.thread_filter != null && inFilter(c));
+  const fanout = candidates.filter((c) => (c.agent.thread_filter != null ? inFilter(c) : !scopedClaim));
+  if (scopedClaim) {
+    log.debug('Thread-scoped wiring claimed message; unscoped wirings stand down', {
+      messagingGroupId: mg.id,
+      threadId: event.threadId,
+      agentGroupIds: fanout.map((c) => c.agent.agent_group_id),
+    });
+  }
+
+  for (const { agent, threadsEnabled, effectiveThreadId } of fanout) {
+    const agentGroup = await getAgentGroup(agent.agent_group_id);
+    if (!agentGroup) continue;
 
     const engages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId);
 
@@ -474,6 +495,15 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
  *                      a thread has engaged us once, follow-ups arrive
  *                      with no mention and should still fire.
  */
+/** `thread_filter` holds one or more comma-separated effective thread ids. */
+export function threadFilterList(filter: string | null | undefined): string[] {
+  if (!filter) return [];
+  return filter
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => t !== '');
+}
+
 async function evaluateEngage(
   agent: MessagingGroupAgent,
   text: string,

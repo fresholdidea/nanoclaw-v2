@@ -26,6 +26,7 @@ import { migration021 as migration021ProviderChain } from './021-provider-chain.
 import { migration021 } from './021-approval-question.js';
 import { migration022 } from './022-messaging-group-detached.js';
 import { migration023 } from './023-approvals-instance.js';
+import { migration024 } from './024-wiring-thread-filter.js';
 
 interface MigrationBase {
   version: number;
@@ -93,6 +94,7 @@ export const migrations: Migration[] = [
   migration021,
   migration022,
   migration023,
+  migration024,
 ];
 
 /**
