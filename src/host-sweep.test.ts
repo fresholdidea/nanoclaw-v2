@@ -358,3 +358,54 @@ describe('shouldCloseTaskSession', () => {
     expect(shouldCloseTaskSession(null, false, 0)).toBe(false);
   });
 });
+
+describe('decideStuckAction idle shutdown', () => {
+  const IDLE = 10 * 60 * 1000;
+
+  it('stops a quiet container with no claims, no due work, and no tool in flight', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - (IDLE + 1),
+      containerState: null,
+      claims: [],
+      idleMs: IDLE,
+      hasDueWork: false,
+    });
+    expect(res).toEqual({ action: 'kill-idle', heartbeatAgeMs: IDLE + 1, idleMs: IDLE });
+  });
+
+  it('does not treat a container holding a claim, or with due work, as idle', () => {
+    const base = { now: BASE, heartbeatMtimeMs: BASE - (IDLE + 1), containerState: null, idleMs: IDLE };
+    expect(decideStuckAction({ ...base, claims: [], hasDueWork: true }).action).toBe('ok');
+    // A held claim is the stuck path's business; within its tolerance it is fine.
+    expect(decideStuckAction({ ...base, claims: [claim('m', 1000)], hasDueWork: false }).action).toBe('ok');
+  });
+
+  it('is inert within the idle window and when no window is given', () => {
+    expect(
+      decideStuckAction({
+        now: BASE,
+        heartbeatMtimeMs: BASE - (IDLE - 1),
+        containerState: null,
+        claims: [],
+        idleMs: IDLE,
+        hasDueWork: false,
+      }).action,
+    ).toBe('ok');
+    expect(
+      decideStuckAction({ now: BASE, heartbeatMtimeMs: BASE - (IDLE + 1), containerState: null, claims: [] }).action,
+    ).toBe('ok');
+  });
+
+  it('still prefers the absolute ceiling once it is exceeded', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - JUST_OVER_CEILING_MS,
+      containerState: null,
+      claims: [],
+      idleMs: IDLE,
+      hasDueWork: false,
+    });
+    expect(res.action).toBe('kill-ceiling');
+  });
+});

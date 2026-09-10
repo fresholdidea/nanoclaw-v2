@@ -65,7 +65,7 @@ export interface AppServer {
   exitHandlers: Array<(err: Error) => void>;
 }
 
-export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 // Codex runs unrestricted inside the container. NanoClaw's container isolation and
 // the OneCLI allow-list are the security boundary — not Codex's own sandbox/approval

@@ -267,3 +267,36 @@ describe('host/container validation parity', () => {
     }
   });
 });
+
+describe('configFromDb install-wide model/effort defaults', () => {
+  beforeEach(async () => {
+    await runMigrations(await initTestDb());
+    await createAgentGroup(GROUP);
+    await ensureContainerConfig(GROUP.id);
+  });
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('applies the install defaults when the row leaves model and effort unset', async () => {
+    const row = (await getContainerConfig(GROUP.id))!;
+    const cfg = configFromDb(row, GROUP, { model: 'claude-opus-5', effort: 'medium' });
+    expect(cfg.model).toBe('claude-opus-5');
+    expect(cfg.effort).toBe('medium');
+  });
+
+  it('lets a group value win over the install default', async () => {
+    await updateContainerConfigScalars(GROUP.id, { model: 'claude-sonnet-5', effort: 'low' });
+    const row = (await getContainerConfig(GROUP.id))!;
+    const cfg = configFromDb(row, GROUP, { model: 'claude-opus-5', effort: 'medium' });
+    expect(cfg.model).toBe('claude-sonnet-5');
+    expect(cfg.effort).toBe('low');
+  });
+
+  it('leaves both undefined when neither the row nor the install sets them', async () => {
+    const row = (await getContainerConfig(GROUP.id))!;
+    const cfg = configFromDb(row, GROUP, {});
+    expect(cfg.model).toBeUndefined();
+    expect(cfg.effort).toBeUndefined();
+  });
+});

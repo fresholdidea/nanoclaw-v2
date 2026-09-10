@@ -30,7 +30,7 @@ import {
 } from './codex-app-server.js';
 
 const TURN_TIMEOUT_MS = 10 * 60 * 1000;
-const SUPPORTED_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const SUPPORTED_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 
 export interface CodexRuntimeDeps {
   writeCodexConfigToml: typeof writeCodexConfigToml;

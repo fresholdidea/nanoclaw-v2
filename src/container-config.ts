@@ -11,7 +11,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { GROUPS_DIR, TIMEZONE } from './config.js';
+import { DEFAULT_EFFORT, DEFAULT_MODEL, GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { isValidTimezone } from './timezone.js';
@@ -374,7 +374,19 @@ export function parseSkillSelection(raw: string | undefined, groupName: string):
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
-export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
+/** Install-wide fallbacks applied by configFromDb when the row leaves a field unset. */
+export interface ContainerConfigDefaults {
+  model?: string;
+  effort?: string;
+}
+
+const INSTALL_DEFAULTS: ContainerConfigDefaults = { model: DEFAULT_MODEL, effort: DEFAULT_EFFORT };
+
+export function configFromDb(
+  row: ContainerConfigRow,
+  group: AgentGroup,
+  defaults: ContainerConfigDefaults = INSTALL_DEFAULTS,
+): ContainerConfig {
   return {
     mcpServers: sanitizeStoredMcpServers(JSON.parse(row.mcp_servers), group.name),
     packages: {
@@ -392,8 +404,8 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
-    model: row.model ?? undefined,
-    effort: row.effort ?? undefined,
+    model: row.model || defaults.model || undefined,
+    effort: row.effort || defaults.effort || undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
   };

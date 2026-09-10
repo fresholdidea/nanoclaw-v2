@@ -4,8 +4,10 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
+import path from 'path';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
-import { CENTRAL_DB_PATH } from './config.js';
+import { CENTRAL_DB_PATH, PROJECT_ROOT } from './config.js';
+import { rotateHostLogs } from './log-rotate.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { adoptRunningSessions } from './container-runner.js';
 import { closeDb, initDb } from './db/connection.js';
@@ -61,6 +63,8 @@ import {
 } from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
+  // Bound the launchd-captured logs before anything else writes to them.
+  for (const copy of rotateHostLogs(path.join(PROJECT_ROOT, 'logs'))) log.info('Rotated host log', { copy });
   log.info('NanoClaw starting');
 
   // 0. Circuit breaker — backoff on rapid restarts

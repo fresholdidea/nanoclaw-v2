@@ -1,3 +1,4 @@
+import { touchHeartbeat } from '../heartbeat.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -247,6 +248,7 @@ const preToolUseHook: HookCallback = async (input) => {
   // tool: no declared timeout.
   const declaredTimeoutMs =
     toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
+  touchHeartbeat();
   try {
     setContainerToolInFlight(toolName, declaredTimeoutMs);
   } catch (err) {
@@ -257,6 +259,7 @@ const preToolUseHook: HookCallback = async (input) => {
 
 /** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
 const postToolUseHook: HookCallback = async () => {
+  touchHeartbeat();
   try {
     clearContainerToolInFlight();
   } catch (err) {
@@ -453,6 +456,9 @@ function transcriptStartMs(transcriptPath: string): number | null {
  */
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
 
+/** Operator override: ENABLE_TOOL_SEARCH=false in the host env loads every MCP schema upfront again. */
+const ENABLE_TOOL_SEARCH = process.env.ENABLE_TOOL_SEARCH || 'true';
+
 /**
  * Stale-session detection. Matches Claude Code's error text when a
  * resumed session can't be found — missing transcript .jsonl, unknown
@@ -498,6 +504,12 @@ export class ClaudeProvider implements AgentProvider {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
       CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+      // Defer MCP tool schemas behind Claude Code's tool search instead of
+      // loading every schema into the prompt. Auto mode is meant to kick in
+      // above 10% of context but has a history of not firing; force it. The
+      // nanoclaw server opts out via `alwaysLoad` (see index.ts) so the
+      // send/ask/schedule tools are always in the first prompt.
+      ENABLE_TOOL_SEARCH,
     };
   }
 
@@ -626,8 +638,25 @@ export class ClaudeProvider implements AgentProvider {
           // (e.g. a non-retryable 403 billing_error) carry their message in
           // `errors[]` instead. Surface either so the poll-loop can deliver a
           // billing/quota notice to the user rather than dropping the turn.
-          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
+          const m = message as {
+            result?: string;
+            is_error?: boolean;
+            errors?: string[];
+            total_cost_usd?: number;
+            num_turns?: number;
+            usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+          };
           const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
+          if (m.usage) {
+            // One line per turn so per-group spend can be read straight from
+            // container logs / the run log without a metrics pipeline.
+            const u = m.usage;
+            log(
+              `Turn usage: in=${u.input_tokens ?? 0} out=${u.output_tokens ?? 0} ` +
+                `cache_read=${u.cache_read_input_tokens ?? 0} cache_write=${u.cache_creation_input_tokens ?? 0} ` +
+                `turns=${m.num_turns ?? '?'} cost_usd=${m.total_cost_usd != null ? m.total_cost_usd.toFixed(4) : '?'}`,
+            );
+          }
           yield { type: 'result', text, isError: m.is_error === true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };

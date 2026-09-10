@@ -30,6 +30,7 @@
  */
 import fs from 'fs';
 
+import { IDLE_CHAT_SHUTDOWN_MS, IDLE_TASK_SHUTDOWN_MS } from './config.js';
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { getActiveSessions, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -53,6 +54,7 @@ const BACKOFF_BASE_MS = 5000;
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
+  | { action: 'kill-idle'; heartbeatAgeMs: number; idleMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
 /**
@@ -66,8 +68,15 @@ export function decideStuckAction(args: {
   containerStartedAtMs?: number; // fallback when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ messageId: string; statusChanged: string }>;
+  /**
+   * Idle window for this session kind (IDLE_*_SHUTDOWN_MS). Omitted = no idle
+   * shutdown, only the stuck checks.
+   */
+  idleMs?: number;
+  /** Messages due this tick; due work means "not idle". */
+  hasDueWork?: boolean;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerStartedAtMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerStartedAtMs, containerState, claims, idleMs, hasDueWork } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
 
   // Ceiling check prefers the heartbeat file's mtime. A freshly-spawned
@@ -92,6 +101,18 @@ export function decideStuckAction(args: {
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
     if (heartbeatAge > ceiling) {
       return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
+    }
+
+    // Idle shutdown — the "not stuck, just done" case. The runner has no
+    // self-shutdown, so without this a finished container idles until the
+    // ceiling reaps it and logs a warning. Every condition says no work is
+    // happening: no 'processing' claim (a turn holds one until the provider's
+    // result event), nothing due, no tool in flight, quiet past the window. A
+    // message claimed between this decision and the kill costs a retry, not a
+    // message: the caller resets the claim and the next tick respawns.
+    const toolInFlight = containerState?.currentTool != null;
+    if (idleMs !== undefined && claims.length === 0 && !hasDueWork && !toolInFlight && heartbeatAge > idleMs) {
+      return { action: 'kill-idle', heartbeatAgeMs: heartbeatAge, idleMs };
     }
   }
 
@@ -178,7 +199,7 @@ async function sweepSession(session: Session): Promise<void> {
       dueCount = mailbox.countDueMessages();
       shouldWake = dueCount > 0 && !isContainerRunning(session.id);
       if (!shouldWake) {
-        await maintainSessionMailbox(mailbox, session, agentGroup.id, false);
+        await maintainSessionMailbox(mailbox, session, agentGroup.id, false, dueCount);
       }
       return true;
     });
@@ -193,7 +214,7 @@ async function sweepSession(session: Session): Promise<void> {
     await wakeContainer(session);
 
     await withExistingMailboxSession(agentGroup.id, session.id, async (mailbox) => {
-      await maintainSessionMailbox(mailbox, session, agentGroup.id, true);
+      await maintainSessionMailbox(mailbox, session, agentGroup.id, true, dueCount);
     });
   } catch (err) {
     log.error('Session mailbox sweep failed', {
@@ -209,10 +230,11 @@ async function maintainSessionMailbox(
   session: Session,
   agentGroupId: string,
   justWoke: boolean,
+  dueCount: number,
 ): Promise<void> {
   const alive = isContainerRunning(session.id);
   if (alive && !justWoke) {
-    enforceRunningContainerSla(mailbox, mailbox, session, agentGroupId);
+    enforceRunningContainerSla(mailbox, mailbox, session, agentGroupId, dueCount);
   }
   if (!alive) {
     resetStuckProcessingRows(mailbox, mailbox, session, 'container not running');
@@ -261,6 +283,7 @@ function enforceRunningContainerSla(
   outDb: OutboundMailbox,
   session: Session,
   agentGroupId: string,
+  dueCount: number,
 ): void {
   const decision = decideStuckAction({
     now: Date.now(),
@@ -268,6 +291,8 @@ function enforceRunningContainerSla(
     containerStartedAtMs: getContainerStartedAtMs(session.id),
     containerState: outDb.getContainerState(),
     claims: outDb.getProcessingClaims(),
+    idleMs: isTaskThread(session.thread_id) ? IDLE_TASK_SHUTDOWN_MS : IDLE_CHAT_SHUTDOWN_MS,
+    hasDueWork: dueCount > 0,
   });
 
   if (decision.action === 'ok') return;
@@ -280,6 +305,18 @@ function enforceRunningContainerSla(
     });
     killContainer(session.id, 'absolute-ceiling');
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
+    return;
+  }
+
+  if (decision.action === 'kill-idle') {
+    // Info, not warn: the normal end of a container's life, not a fault.
+    log.info('Stopping idle container', {
+      sessionId: session.id,
+      heartbeatAgeMs: decision.heartbeatAgeMs,
+      idleMs: decision.idleMs,
+    });
+    killContainer(session.id, 'idle');
+    resetStuckProcessingRows(inDb, outDb, session, 'idle');
     return;
   }
 

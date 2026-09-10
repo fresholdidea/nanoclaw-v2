@@ -21,6 +21,7 @@ import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
+import { codeWrapUnlinkableUrls } from './telegram-unlinkable-urls.js';
 
 /**
  * Dedicated bot identity, non-threaded platform (supportsThreads:false), so
@@ -386,11 +387,14 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     extractReplyContext,
     supportsThreads: false,
     defaults: TELEGRAM_DEFAULTS,
-    // No transformOutboundText: @chat-adapter/telegram >= 4.29 parses
-    // CommonMark and renders escaped MarkdownV2 itself. The legacy-Markdown
-    // sanitizer this replaced was written for the old converter and, run in
-    // front of the new one, downgraded **bold** to *single-star* — which the
-    // adapter then parsed as emphasis and rendered as _italic_.
+    // @chat-adapter/telegram >= 4.29 parses CommonMark and renders escaped
+    // MarkdownV2 itself, so no markdown sanitizing here (the legacy-Markdown
+    // sanitizer, run in front of the new converter, downgraded **bold** to
+    // *single-star* which then rendered as _italic_). The one transform that
+    // remains is content-level: Telegram rejects a whole message when a bare
+    // URL autolinks to a host it cannot resolve (loopback, private ranges),
+    // which is exactly what a pasted OneCLI connect link is. Code-wrap those.
+    transformOutboundText: codeWrapUnlinkableUrls,
     maxTextLength: 4000,
   });
 

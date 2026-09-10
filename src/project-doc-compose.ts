@@ -21,6 +21,7 @@ import path from 'path';
 
 import { parseSkillSelection, sanitizeStoredMcpServers } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
+import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
 import { readGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
@@ -83,6 +84,38 @@ const BASE_DOC_SECTION = 'NanoClaw Runtime Contract';
 // scheduling teaches `ncl tasks`.
 const NCL_DEPENDENT_MODULES = new Set(['cli', 'scheduling']);
 
+// Module docs that only make sense on Slack (canvases, shared rooms, the
+// Slack-bot flavour of create_agent). A group with no Slack wiring pays for
+// ~10 KB of them on every turn and can never act on any of it.
+export const SLACK_ONLY_MODULES = new Set(['canvas', 'rooms', 'create-agent-slack']);
+
+// Module docs for the sub-query tools, which are only registered when the
+// matching container-config flag is on (`enable_agy_tooling`,
+// `enable_opencode_tooling`). Teaching a tool that is not there wastes tokens
+// and invites the agent to try it.
+const TOOLING_GATED_MODULES: Record<string, 'agy' | 'opencode'> = {
+  'query-agy': 'agy',
+  'query-opencode': 'opencode',
+};
+
+/** What the group actually has, so the composer can leave out what it cannot use. */
+export interface ModuleContext {
+  cliDisabled: boolean;
+  hasSlack: boolean;
+  agyTooling: boolean;
+  opencodeTooling: boolean;
+}
+
+/** Pure: does this module's instruction doc belong in the group's document? */
+export function moduleApplies(moduleName: string, ctx: ModuleContext): boolean {
+  if (ctx.cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) return false;
+  if (!ctx.hasSlack && SLACK_ONLY_MODULES.has(moduleName)) return false;
+  const gate = TOOLING_GATED_MODULES[moduleName];
+  if (gate === 'agy' && !ctx.agyTooling) return false;
+  if (gate === 'opencode' && !ctx.opencodeTooling) return false;
+  return true;
+}
+
 // Resolved at call time (process.cwd() = project root) so tests can swap cwd.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
@@ -133,14 +166,20 @@ export async function composeGroupProjectDoc(group: AgentGroup, groupDir: string
 
   // Module instructions — every MCP/CLI module shipping a sibling
   // `<name>.instructions.md`, describing how to use that module's tools.
-  const cliDisabled = configRow?.cli_scope === 'disabled';
+  const wired = await getMessagingGroupsByAgentGroup(group.id);
+  const moduleCtx: ModuleContext = {
+    cliDisabled: configRow?.cli_scope === 'disabled',
+    hasSlack: wired.some((mg) => mg.channel_type.startsWith('slack')),
+    agyTooling: configRow?.enable_agy_tooling === 1,
+    opencodeTooling: configRow?.enable_opencode_tooling === 1,
+  };
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
     for (const entry of fs.readdirSync(mcpToolsHostDir).sort()) {
       const match = entry.match(/^(.+)\.instructions\.md$/);
       if (!match) continue;
       const moduleName = match[1];
-      if (cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) continue;
+      if (!moduleApplies(moduleName, moduleCtx)) continue;
       push(`NanoClaw Module: ${moduleName}`, fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8'), true);
     }
   }

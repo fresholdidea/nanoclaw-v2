@@ -94,6 +94,9 @@ async function main(): Promise<void> {
       command: 'bun',
       args: ['run', mcpServerPath],
       env: {},
+      // Never deferred behind tool search: send_message / ask_user_question /
+      // scheduling must be in the first prompt or the agent cannot reply.
+      alwaysLoad: true,
     },
   };
 

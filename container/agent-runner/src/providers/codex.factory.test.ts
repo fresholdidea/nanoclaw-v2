@@ -4,7 +4,11 @@ import { CodexProvider } from './codex.js';
 
 describe('CodexProvider', () => {
   it('rejects unsupported reasoning effort values', () => {
-    expect(() => new CodexProvider({ effort: 'max' })).toThrow(/Unsupported Codex reasoning effort/);
+    expect(() => new CodexProvider({ effort: 'ultra' })).toThrow(/Unsupported Codex reasoning effort/);
+  });
+
+  it('accepts max, the top of the GPT-5.6 effort ladder', () => {
+    expect(new CodexProvider({ effort: 'max' })).toBeInstanceOf(CodexProvider);
   });
 
   it('normalizes supported reasoning effort values', () => {

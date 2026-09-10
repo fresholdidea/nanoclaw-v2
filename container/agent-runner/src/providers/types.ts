@@ -137,8 +137,13 @@ export type McpServerConfig =
        * (cwd-shim.ts) or drop it — never launch in the wrong directory.
        */
       cwd?: string;
+      /**
+       * Keep this server's tools in the prompt even when the provider defers
+       * MCP schemas behind a tool-search step (Claude Code ENABLE_TOOL_SEARCH).
+       */
+      alwaysLoad?: boolean;
     }
-  | { type: 'http'; url: string; headers?: Record<string, string> };
+  | { type: 'http'; url: string; headers?: Record<string, string>; alwaysLoad?: boolean };
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */

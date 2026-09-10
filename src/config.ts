@@ -21,7 +21,17 @@ const envConfig = readEnvFile([
   'ONECLI_GATEWAY_CONTAINER',
   'NANOCLAW_IDLE_CHAT_MS',
   'NANOCLAW_IDLE_TASK_MS',
+  'NANOCLAW_DEFAULT_MODEL',
+  'NANOCLAW_DEFAULT_EFFORT',
 ]);
+
+// Install-wide default model and reasoning effort for agent containers, applied
+// at spawn to any group that has not set its own (`ncl groups config update
+// --model/--effort`). Unset means the provider SDK's own default. Unlike
+// DEFAULT_AGENT_PROVIDER these are read at spawn, not stamped at creation, so a
+// change takes effect on the next container start for every unpinned group.
+export const DEFAULT_MODEL = process.env.NANOCLAW_DEFAULT_MODEL || envConfig.NANOCLAW_DEFAULT_MODEL || '';
+export const DEFAULT_EFFORT = process.env.NANOCLAW_DEFAULT_EFFORT || envConfig.NANOCLAW_DEFAULT_EFFORT || '';
 
 /**
  * @deprecated WhatsApp adapter copies now read the ASSISTANT_NAME .env key
@@ -50,7 +60,7 @@ export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 
 // Absolute paths needed for container mounts
-const PROJECT_ROOT = process.cwd();
+export const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers

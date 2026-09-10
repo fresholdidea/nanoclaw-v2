@@ -1,6 +1,6 @@
 # NanoClaw v2: performance, autonomy, and token-spend scope
 
-Date: 2026-09-08. Status: Phase 0 applied 2026-09-08 (see §7); threading decision: Telegram forum topics (option A). Evidence gathered read-only from the live install.
+Date: 2026-09-08. Status: Phase 0 applied 2026-09-08 (§7), Phase 1 applied 2026-09-10 (§8); threading decision: Telegram forum topics (option A). Evidence gathered read-only from the live install.
 
 ## 1. Health verdict
 
@@ -15,7 +15,7 @@ The install is healthy enough to build on, with four things worth fixing before 
 | Logs | `nanoclaw.log` 14.8 MB and `nanoclaw.error.log` 6.9 MB, single files since Apr 30, no rotation |
 | Container ceiling kills | 460 "killed past absolute ceiling" events since Apr 30. Zed DM session 66, two Zed task sessions 102, Ads task session 46, Falcone 20 |
 
-The ceiling kills are the one health item that also burns tokens: a container that runs 30 minutes without touching the heartbeat is killed mid-task, and the next wake starts over. The concentration in scheduled-task sessions says long tool calls (browser, MCP fetches) are not refreshing the heartbeat. Worth one debugging session before adding more crons.
+**Correction (2026-09-10):** the ceiling kills were not mid-task kills. The runner has no self-shutdown, so a container that finished its turn idled until the 30-minute ceiling reaped it and logged a warning. A local commit from 2026-07-30 (`47dc5934`) had added a proper idle shutdown (10 min chat, 2 min task, `NANOCLAW_IDLE_CHAT_MS` / `NANOCLAW_IDLE_TASK_MS`), but the sweep half of it was lost in the 2026-08-17 merge reconcile while the config keys survived. Phase 1 restores it (§8). No tokens were being lost; the cost was ~320 MB of RAM per idle container and a noisy error log.
 
 ## 2. Findings
 
@@ -158,3 +158,19 @@ Relative, not measured: no usage logging exists in the install today, and adding
 - Skipped: removing paid-media's duplicate MCP servers. The ads/paid-media split needs both to hold the servers; tool scoping is Phase 1 (`allowedTools`).
 - Cron pack created for cache, cadco, cubby, instabooks, meadow, meshberg, falcone (21 series): `<client>-daily-triage` (weekdays 08:15), `<client>-weekly-status` (Fri 15:00), `<client>-open-items` (Mon 09:00). All carry the "send nothing if nothing notable" rule and the plain-text style. p22-am skipped: no Telegram room wired. Ad-anomaly and monthly-review tasks deferred to Phase 2 (need per-client account IDs and thresholds).
 - Changes take effect at each group's next container spawn; no restart performed.
+
+## 8. Phase 1 execution log (2026-09-10)
+
+Code changes, uncommitted, host rebuilt (`pnpm run build`) and restarted; agent-runner source is bind-mounted so no image rebuild was needed.
+
+- **Reply style** block added to `container/CLAUDE.md` (lead with the answer, one message under ~800 chars, no headers/bold-spam, no filler, send nothing when nothing is notable, loopback URLs in inline code).
+- **Install-wide defaults**: `NANOCLAW_DEFAULT_MODEL` / `NANOCLAW_DEFAULT_EFFORT` read from `.env` at spawn (`src/config.ts`, applied in `configFromDb`); a group's own value wins. Set to `claude-opus-5` / `medium` in `.env`.
+- **Per-group module selection** in `project-doc-compose.ts`: `canvas`, `rooms`, `create-agent-slack` only for groups wired to a Slack channel; `query-agy` / `query-opencode` only when the matching tooling flag is on. Pure gate `moduleApplies()` with tests. This also puts Codex fallback back under its 32 KB cap and fixes the previously failing `codex-agents-md` test.
+- **Tool search**: `ENABLE_TOOL_SEARCH=true` in the Claude provider env (override with `ENABLE_TOOL_SEARCH=false` on the host); the `nanoclaw` MCP server is marked `alwaysLoad` so send/ask/schedule tools stay in the first prompt.
+- **Codex effort `max`** accepted.
+- **Idle shutdown restored** in `src/host-sweep.ts` (`kill-idle`: no claims, nothing due, no tool in flight, quiet past the idle window; logged at info). Heartbeat is also touched from the Claude PreToolUse/PostToolUse hooks.
+- **Per-turn usage line** in the Claude provider log (`Turn usage: in= out= cache_read= cache_write= turns= cost_usd=`), so spend can be read from container logs.
+- **Host log rotation** at startup (`src/log-rotate.ts`): copy-then-truncate over 20 MB, keep 5. Works with launchd's append-mode fds.
+- **Telegram URL drops fixed**: `transformOutboundText` code-wraps bare loopback/private-host URLs (the OneCLI connect links) before the adapter autolinks them (`src/channels/telegram-unlinkable-urls.ts`).
+- **Auto-sync hook removed** from this repo's `.claude/settings.json` so session-boundary commits can no longer trip the upgrade tripwire.
+- Deferred to Phase 2/3: AM ad-anomaly and monthly-review crons; Telegram forum-topic threading.
