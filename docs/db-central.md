@@ -442,6 +442,7 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 22 | `messaging-group-detached-at` | `022-messaging-group-detached.ts` | `messaging_groups.detached_at` — records when the bot left a channel without deleting its wiring |
 | 23 | `approvals-instance` | `023-approvals-instance.ts` | `pending_approvals.instance` — adapter instance the approval card was delivered through |
 | 24 | `wiring-thread-filter` | `024-wiring-thread-filter.ts` | `messaging_group_agents.thread_filter` — scope a wiring to one thread/topic (NULL = unscoped); scoped match makes unscoped wirings stand down |
+| 25 | `destination-thread` | `025-destination-thread.ts` | `agent_destinations.thread_id` — pin a channel destination to one thread/topic (NULL = session thread / top level) |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

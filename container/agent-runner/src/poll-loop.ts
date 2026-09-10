@@ -1145,7 +1145,9 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: destRouting?.threadId ?? null,
+    // A destination pinned to a thread (host agent_destinations.thread_id)
+    // wins over the inbound-derived thread.
+    thread_id: dest.threadId ?? destRouting?.threadId ?? null,
     content: JSON.stringify({ text: body }),
   });
 }

@@ -28,6 +28,7 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
         type: 'channel',
         channelType: mg.channel_type,
         platformId: mg.platform_id,
+        threadId: row.thread_id ?? null,
         agentGroupId: null,
       });
     } else if (row.target_type === 'agent') {

@@ -266,6 +266,12 @@ export interface AgentDestination {
   local_name: string;
   target_type: 'channel' | 'agent';
   target_id: string;
+  /**
+   * Channel destinations only (migration 025): pin sends to one thread/topic
+   * of the target chat. NULL = follow the session thread when replying, top
+   * level otherwise.
+   */
+  thread_id?: string | null;
   created_at: string;
 }
 

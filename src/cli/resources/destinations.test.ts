@@ -25,7 +25,7 @@ vi.mock('../../config.js', async () => {
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-destinations';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { initSessionFolder } from '../../session-manager.js';
@@ -39,10 +39,13 @@ function now(): string {
 
 function readSessionDestinations(agentGroupId: string, sessionId: string) {
   const db = new Database(inboundDbPath(agentGroupId, sessionId), { readonly: true });
-  const rows = db.prepare('SELECT name, type, agent_group_id FROM destinations ORDER BY name').all() as Array<{
+  const rows = db
+    .prepare('SELECT name, type, agent_group_id, thread_id FROM destinations ORDER BY name')
+    .all() as Array<{
     name: string;
     type: string;
     agent_group_id: string | null;
+    thread_id: string | null;
   }>;
   db.close();
   return rows;
@@ -147,5 +150,65 @@ describe('destinations CLI custom ops project to inbound.db (#2465)', () => {
     expect(resp.ok).toBe(true);
     expect(readSessionDestinations(SOURCE, SESSION_A)).toEqual([]);
     expect(readSessionDestinations(SOURCE, SESSION_B)).toEqual([]);
+  });
+
+  it('add --thread pins a channel destination to a topic and projects it (bare number expands)', async () => {
+    await createMessagingGroup({
+      id: 'mg-ops',
+      channel_type: 'telegram',
+      platform_id: 'telegram:-100',
+      instance: 'telegram',
+      name: 'Daily Ops',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    const resp = await dispatch(
+      {
+        id: 'req-thread',
+        command: 'destinations-add',
+        args: {
+          agent_group_id: SOURCE,
+          local_name: 'daily-ops',
+          target_type: 'channel',
+          target_id: 'mg-ops',
+          thread: '4',
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(resp.ok).toBe(true);
+    expect(resp.ok && (resp.data as { thread_id: string }).thread_id).toBe('telegram:-100:4');
+    expect(readSessionDestinations(SOURCE, SESSION_A)[0]).toMatchObject({
+      name: 'daily-ops',
+      thread_id: 'telegram:-100:4',
+    });
+
+    // Re-add replaces the pin in place.
+    await dispatch(
+      {
+        id: 'req-thread-2',
+        command: 'destinations-add',
+        args: {
+          agent_group_id: SOURCE,
+          local_name: 'daily-ops',
+          target_type: 'channel',
+          target_id: 'mg-ops',
+          thread: 'telegram:-100:9',
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(readSessionDestinations(SOURCE, SESSION_A)[0].thread_id).toBe('telegram:-100:9');
+
+    const bad = await dispatch(
+      {
+        id: 'req-thread-3',
+        command: 'destinations-add',
+        args: { agent_group_id: SOURCE, local_name: 'x', target_type: 'agent', target_id: TARGET, thread: '4' },
+      },
+      { caller: 'host' },
+    );
+    expect(bad.ok).toBe(false);
   });
 });

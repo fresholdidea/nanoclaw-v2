@@ -215,3 +215,11 @@ Daily Ops (`mg-1789059587692-r4utvv`, `telegram:-1004336052033`, forum supergrou
 - Tests: `src/router-thread-filter.test.ts`, `src/cli/resources/wirings.test.ts` (thread_filter block).
 - Wired: meshberg-am → `telegram:-1004336052033:4` (wiring `367b8477-…`). Topic ids come from the host log line `Session created … threadId=telegram:-1004336052033:<n>` after the first message in a topic.
 - Not yet: a `messaging-groups topics` lister (Telegram's Bot API has no list-topics call; names only arrive on the topic-creation service message).
+
+### 11.1 Thread-pinned destinations + Daily Ops rollout (2026-09-10)
+
+- Migration 025 `agent_destinations.thread_id`; projection, container resolution (`send_message`/`send_file`/`<message to>`), `ncl destinations add --thread`, list shows it.
+- Every Daily Ops topic mapped: 4 Meshberg, 8 CADCo + 20 Mean Green Mowers (cadco-am, multi-topic `thread_filter`), 11 Cache, 14 Cubby, 17 Meadow, 23 Instabooks, 26 P22, 29 Falcone. Zed unscoped.
+- Each AM's `daily-ops` destination pinned to its topic (cadco-am also has `daily-ops-mgm` → topic 20). All 23 AM task prompts retargeted from the old room destination to `daily-ops` (`princess-followup` untouched — it sends to Zed).
+- Stale crm-revops sessions/destination and Zed's pre-wiring per-topic sessions removed (session dirs parked in `~/Documents/_attic/2026-09-10/daily-ops-sessions/`).
+- Per-client rooms: to be cut by Brad (decision 2026-09-10).

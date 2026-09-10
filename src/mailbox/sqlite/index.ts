@@ -194,6 +194,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
             channel_type: record.channelType,
             platform_id: record.platformId,
             agent_group_id: record.agentGroupId,
+            thread_id: record.type === 'channel' ? record.threadId : null,
           };
         }),
       ),

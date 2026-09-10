@@ -253,6 +253,8 @@ interface DestinationRow {
   channel_type: string | null;
   platform_id: string | null;
   agent_group_id: string | null;
+  /** Absent on projections written by a pre-025 host. */
+  thread_id?: string | null;
 }
 
 function destination(row: DestinationRow): Destination {
@@ -262,6 +264,7 @@ function destination(row: DestinationRow): Destination {
     type: row.type,
     channelType: row.channel_type,
     platformId: row.platform_id,
+    threadId: row.type === 'channel' ? (row.thread_id ?? null) : null,
     agentGroupId: row.agent_group_id,
   });
 }

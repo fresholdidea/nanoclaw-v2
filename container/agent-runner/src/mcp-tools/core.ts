@@ -43,10 +43,11 @@ function destinationList(): string {
 /**
  * Resolve a destination name to routing fields.
  *
- * Look up the explicitly named destination. If it resolves to
- * the same channel the session is bound to, the session's thread_id is
- * preserved so replies land in the correct thread. Otherwise thread_id
- * is null (a cross-destination send starts a new conversation).
+ * Look up the explicitly named destination. A destination pinned to a
+ * thread (host `agent_destinations.thread_id`) always routes there. Otherwise,
+ * if it resolves to the same channel the session is bound to, the session's
+ * thread_id is preserved so replies land in the correct thread; else
+ * thread_id is null (a cross-destination send starts a new conversation).
  */
 function resolveRouting(
   to: string,
@@ -58,7 +59,8 @@ function resolveRouting(
     // preserve the thread_id so replies land in the correct thread.
     const session = getSessionRouting();
     const threadId =
-      session.channel_type === dest.channelType && session.platform_id === dest.platformId ? session.thread_id : null;
+      dest.threadId ??
+      (session.channel_type === dest.channelType && session.platform_id === dest.platformId ? session.thread_id : null);
     return {
       channel_type: dest.channelType!,
       platform_id: dest.platformId!,
