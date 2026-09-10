@@ -1,6 +1,6 @@
 # NanoClaw v2: performance, autonomy, and token-spend scope
 
-Date: 2026-09-08. Status: Phase 0 applied 2026-09-08 (§7), Phase 1 applied 2026-09-10 (§8); threading decision: Telegram forum topics (option A). Evidence gathered read-only from the live install.
+Date: 2026-09-08. Status: Phase 0 applied 2026-09-08 (§7), Phase 1 applied and committed 2026-09-10 (§8, commit 3bb92916), Phase 2 applied 2026-09-10 (§9), Phase 3 code live 2026-09-10 (§10, rooms still need Topics enabled); threading decision: Telegram forum topics (option A). Evidence gathered read-only from the live install.
 
 ## 1. Health verdict
 
@@ -174,3 +174,33 @@ Code changes, uncommitted, host rebuilt (`pnpm run build`) and restarted; agent-
 - **Telegram URL drops fixed**: `transformOutboundText` code-wraps bare loopback/private-host URLs (the OneCLI connect links) before the adapter autolinks them (`src/channels/telegram-unlinkable-urls.ts`).
 - **Auto-sync hook removed** from this repo's `.claude/settings.json` so session-boundary commits can no longer trip the upgrade tripwire.
 - Deferred to Phase 2/3: AM ad-anomaly and monthly-review crons; Telegram forum-topic threading.
+
+## 9. Phase 2 execution log (2026-09-10)
+
+Configuration and workspace files only; no code.
+
+- **Monitors moved off Zed.** `meshberg-rss-monitor.mjs` + current state copied to `groups/meshberg-am/scripts/` (the AM's stale Aug-7 state kept as `.bak-20260807`); new series `meshberg-content-monitor-e1f7` on meshberg-am (Mon/Wed/Fri 08:30) writes briefs into the client tree itself and checkpoints in the Meshberg room. `falcone-rss-monitor.mjs` + state copied to `groups/falcone/scripts/`; new series `falcone-trade-monitor-3699` on falcone, created **paused** to mirror Zed's copy. Zed's `meshberg-content-monitor-25be` paused (its `falcone-trade-monitor-2e5c` was already paused). Neither Zed copy deleted.
+- **Ad anomaly checks** on the `ads` group (holds the Google/Meta/LinkedIn MCPs and the client tree read-only): `cache-ad-anomaly-8302`, `cadco-ad-anomaly-e1a2`, `meadow-ad-anomaly-375b`, weekdays 08:30. Account IDs are read from the client folder; thresholds: spend ±40% vs 7-day avg, CTR −35%, CPC +50%, active campaign with zero delivery, disapprovals. Silent unless flagged; read-only; capped at 12 tool calls. Delivered to the client's AM via new agent destinations `ads → cache-am / cadco-am / meadow-am`, per the monitor → gatekeeper role split.
+- **Cache monthly review** `cache-monthly-review-0c06` on `ads`, 2nd of the month 09:00: writes `_inbox/monthly-review-YYYY-MM.md` in the Cache client folder (ads has RW on `_inbox`), then a 5-line summary to cache-am.
+- Not done: p22-am tasks (no Telegram room wired); the host-side `cache-monthly-review` Claude Code skill is not available inside containers, so the monthly task carries its own spec.
+
+## 10. Phase 3 execution log (2026-09-10): Telegram forum topics
+
+**What was found.** The Chat SDK Telegram adapter (4.29) already carries forum topics: inbound thread ids are `telegram:<chat>` for General / plain groups and `telegram:<chat>:<topic>` for a topic message, and `postMessage` sets `message_thread_id` from the same id. NanoClaw discarded this only because `src/channels/telegram.ts` declared `supportsThreads: false`. The router already forces per-thread sessions for any group wiring whose thread policy resolves on.
+
+**Code (uncommitted, host rebuilt and restarted 12:50):**
+- `supportsThreads: true`; `TELEGRAM_DEFAULTS.group.threads: true` (DMs unchanged).
+- `normalizeTelegramThreadId()` collapses the topic-less id to `null` in the inbound interceptor, so General-topic and plain-group traffic keeps the room's existing shared session and replies to it go to the chat, not a topic. Non-forum rooms therefore behave exactly as before.
+- Tests: `src/channels/telegram-topics.test.ts`.
+- The seven AM wirings set explicitly to `session_mode=per-thread, threads=1` (the router would force it anyway).
+- `scripts/telegram-repoint-room.ts` for the chat-id migration below (dry-run by default).
+
+**Operator runbook, one room at a time (start with one pilot room):**
+1. All seven AM rooms are plain groups (`telegram:-5…`), not supergroups. Enabling Topics converts the group to a supergroup and Telegram assigns a NEW chat id (`-100…`). Nothing in NanoClaw or the SDK handles that migration automatically.
+2. In Telegram: room → Edit → enable **Topics**. Telegram converts the group.
+3. Post any message in the room. The router sees an unknown chat; find the new id with `pnpm exec tsx src/cli/client.ts messaging-groups list` (a new auto-created `telegram:-100…` row) or from the host log.
+4. `pnpm exec tsx scripts/telegram-repoint-room.ts telegram:<old> telegram:-100<new>` (dry run), then add `--apply`. Wirings, sessions, and destinations follow the row id, so nothing else changes.
+5. Post in the room again: the reply should land in the same topic. Each topic now gets its own session and container; General keeps the room's history.
+6. Repeat per room. The `ads` Agentz group is already a supergroup and stays `shared` (mention mode).
+
+**Effect on spend:** a topic session carries only that topic's context, so long-lived client rooms stop dragging one 165k-token history into every reply; idle topic containers stop after 10 minutes.
