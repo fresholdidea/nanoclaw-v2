@@ -172,6 +172,15 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
     chmod +x /usr/local/bin/ncl
 
+# ---- gws-account wrapper ------------------------------------------------------
+# Same pattern as ncl: the real helper lives in the mounted skills dir at
+# /app/skills/google-workspace/gws-account, which is not on PATH. The
+# google-workspace SKILL.md documents the bare `gws-account` command, so without
+# this shim every group except one with its own private copy hit
+# "command not found" and concluded GWS was unavailable to them.
+RUN printf '#!/bin/sh\nexec /app/skills/google-workspace/gws-account "$@"\n' > /usr/local/bin/gws-account && \
+    chmod +x /usr/local/bin/gws-account
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

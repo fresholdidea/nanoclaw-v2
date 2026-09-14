@@ -29,8 +29,9 @@ gws-account jaybhess@gmail.com drive files list --params '{"q":"name contains \"
 ## How it works
 
 - The helper reads `/workspace/extra/gws-config/accounts/<account>.json` (refresh token) and `/workspace/extra/gws-config/client_secret.json` (OAuth client) — both mounted read-only.
-- It composes a temp credentials file (chmod 600 in `/tmp`), execs `gws`, and deletes the temp file on exit.
+- It composes a temp credentials file (chmod 600, in a private `/tmp` dir), runs `gws`, then deletes that dir and returns `gws`'s own exit code.
 - The credentials file never enters environment variables and never lands in your home directory.
+- It clears the cached `gws` token before each run, so switching accounts within one session always re-authenticates as the account you asked for. Google API hosts also bypass the OneCLI proxy, which would otherwise overwrite the OAuth header.
 
 ## Account selection
 

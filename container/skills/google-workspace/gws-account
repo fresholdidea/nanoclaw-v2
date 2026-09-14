@@ -13,6 +13,12 @@
 
 set -e
 
+# Bypass the OneCLI proxy for Google OAuth/API domains. gws performs its own
+# OAuth and sends its own Authorization header; routing these hosts through the
+# proxy lets injected credentials clobber it.
+export NO_PROXY="googleapis.com,accounts.google.com,google.com,oauth2.googleapis.com,calendar.googleapis.com,gmail.googleapis.com,www.googleapis.com,drive.googleapis.com,docs.googleapis.com,sheets.googleapis.com,generativelanguage.googleapis.com"
+export no_proxy="$NO_PROXY"
+
 GWS_DIR="/workspace/extra/gws-config"
 ACCOUNTS_DIR="$GWS_DIR/accounts"
 CLIENT_FILE="$GWS_DIR/client_secret.json"
@@ -24,6 +30,7 @@ usage() {
   if [ -d "$ACCOUNTS_DIR" ]; then
     for f in "$ACCOUNTS_DIR"/*.json; do
       [ -f "$f" ] || continue
+      [[ "$f" == *.bak* ]] && continue
       node -e "try{const d=require('$f');if(d.email)console.log('  '+d.email);}catch(e){}" 2>/dev/null
     done
   else
@@ -54,6 +61,7 @@ shift
 ACCT_FILE=""
 for f in "$ACCOUNTS_DIR"/*.json; do
   [ -f "$f" ] || continue
+  [[ "$f" == *.bak* ]] && continue
   match=$(node -e "try{const d=require('$f');console.log(d.email||'')}catch(e){}")
   if [ "$match" = "$EMAIL" ]; then
     ACCT_FILE="$f"
@@ -68,9 +76,25 @@ if [ -z "$ACCT_FILE" ]; then
   exit 1
 fi
 
-CRED_FILE=$(mktemp /tmp/gws-creds-XXXXXX.json)
+# Remove the literal-named file left behind by older versions of this script,
+# whose mktemp template put the X's before the .json suffix — BSD mktemp does
+# not substitute those, so it created /tmp/gws-creds-XXXXXX.json verbatim and
+# every subsequent run then failed with "File exists".
+rm -f /tmp/gws-creds-XXXXXX.json 2>/dev/null || true
+
+# Sweep credential dirs abandoned by older runs. Only ones untouched for 10+
+# minutes, so a concurrent invocation's live dir is never pulled out from under
+# it.
+find /tmp -maxdepth 1 -name 'gws-creds-*' -type d -mmin +10 -exec rm -rf {} + 2>/dev/null || true
+
+# X's must be trailing to be substituted, so make a private dir and put the
+# .json inside it rather than relying on a suffixed template.
+CRED_DIR=$(mktemp -d /tmp/gws-creds-XXXXXX)
+chmod 700 "$CRED_DIR"
+CRED_FILE="$CRED_DIR/credentials.json"
+trap 'rm -rf "$CRED_DIR"' EXIT
+: > "$CRED_FILE"
 chmod 600 "$CRED_FILE"
-trap 'rm -f "$CRED_FILE"' EXIT
 
 node -e "
   const acct = require('$ACCT_FILE');
@@ -92,5 +116,19 @@ node -e "
   }));
 "
 
+# Clear any cached gws token so a previous account's token is never reused for
+# this one. The mounted GWS_DIR is read-only, so the writable HOME copy is the
+# one that actually matters here.
+rm -f "$GWS_DIR/token_cache.json" 2>/dev/null || true
+rm -f "$HOME/.config/gws/token_cache.json" 2>/dev/null || true
+
 export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE="$CRED_FILE"
-exec gws "$@"
+export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
+
+# Deliberately not `exec` — exec would replace this shell and the EXIT trap
+# would never run, leaving a live refresh token on disk after every call.
+gws "$@"
+status=$?
+rm -rf "$CRED_DIR"
+trap - EXIT
+exit $status
