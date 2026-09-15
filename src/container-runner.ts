@@ -310,6 +310,32 @@ async function finishAndResolve(sessionId: string, failure?: SessionFailure): Pr
   }
 }
 
+/**
+ * A session whose container dies at boot gets re-woken on the next due message,
+ * forever. Nothing counted those deaths and `started-then-died` logged at info,
+ * so a crash loop read exactly like a clean exit: the `ads` group spawned
+ * 5,549 containers over five days in Aug 2026 and was only broken by an
+ * unrelated host restart. Count consecutive boot deaths per session and raise
+ * the level once a session is plainly looping, so it reaches the error log.
+ */
+const BOOT_FAILURE_ALERT_AFTER = 3;
+const consecutiveBootFailures = new Map<string, number>();
+
+export type SessionEndLog = { level: 'info' } | { level: 'error'; consecutiveBootFailures: number };
+
+/** How this session's end should be logged, given how its recent ends went. */
+export function describeSessionEnd(sessionId: string, failure?: SessionFailure): SessionEndLog {
+  const diedAtBoot =
+    failure?.kind === 'started-then-died' && typeof failure.exitCode === 'number' && failure.exitCode !== 0;
+  if (!diedAtBoot) {
+    consecutiveBootFailures.delete(sessionId);
+    return { level: 'info' };
+  }
+  const streak = (consecutiveBootFailures.get(sessionId) ?? 0) + 1;
+  consecutiveBootFailures.set(sessionId, streak);
+  return streak >= BOOT_FAILURE_ALERT_AFTER ? { level: 'error', consecutiveBootFailures: streak } : { level: 'info' };
+}
+
 async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?: SessionFailure): Promise<void> {
   const { containerName } = runtime;
   try {
@@ -326,11 +352,18 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   if (failure && failure.kind !== 'started-then-died') {
     log.error('Session failed', { sessionId, containerName, kind: failure.kind, retryable: failure.retryable });
   } else {
-    log.info('Session ended', {
-      sessionId,
-      containerName,
-      exitCode: failure && failure.kind === 'started-then-died' ? failure.exitCode : undefined,
-    });
+    const exitCode = failure && failure.kind === 'started-then-died' ? failure.exitCode : undefined;
+    const end = describeSessionEnd(sessionId, failure);
+    if (end.level === 'error') {
+      log.error('Session crash-looping at boot', {
+        sessionId,
+        containerName,
+        exitCode,
+        consecutiveBootFailures: end.consecutiveBootFailures,
+      });
+    } else {
+      log.info('Session ended', { sessionId, containerName, exitCode });
+    }
   }
 
   if (activeContainers.get(sessionId) === runtime) {

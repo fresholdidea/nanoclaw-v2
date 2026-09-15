@@ -17,6 +17,7 @@ import type { ContainerConfig } from './container-config.js';
 import {
   armSessionLifecycle,
   composeSessionSpec,
+  describeSessionEnd,
   parseMemoryMb,
   parsePidsLimit,
   resolveProviderName,
@@ -24,6 +25,7 @@ import {
   toMountSpecs,
 } from './container-runner.js';
 import type { SupervisedHandle } from './drivers/session-events.js';
+import type { SessionFailure } from './drivers/types.js';
 import { log } from './log.js';
 import type { VolumeMount } from './providers/provider-container-registry.js';
 import type { AgentGroup, Session } from './types.js';
@@ -490,5 +492,54 @@ describe('syncSkillSymlinks', () => {
       expect.stringContaining('Shared skill not symlinked'),
       expect.objectContaining({ skill: 'welcome' }),
     );
+  });
+});
+
+describe('describeSessionEnd', () => {
+  const died = (exitCode: number): SessionFailure => ({
+    kind: 'started-then-died',
+    retryable: false,
+    exitCode,
+  });
+
+  it('reports a clean end at info', () => {
+    expect(describeSessionEnd('s-clean', undefined)).toEqual({ level: 'info' });
+  });
+
+  it('treats a zero exit as a clean end, not a failure', () => {
+    expect(describeSessionEnd('s-zero', died(0))).toEqual({ level: 'info' });
+  });
+
+  it('stays at info while a session is below the alert threshold', () => {
+    expect(describeSessionEnd('s-below', died(1))).toEqual({ level: 'info' });
+    expect(describeSessionEnd('s-below', died(1))).toEqual({ level: 'info' });
+  });
+
+  it('escalates to error once a session dies at boot three times running', () => {
+    describeSessionEnd('s-loop', died(1));
+    describeSessionEnd('s-loop', died(1));
+    expect(describeSessionEnd('s-loop', died(1))).toEqual({
+      level: 'error',
+      consecutiveBootFailures: 3,
+    });
+  });
+
+  it('keeps escalating, and keeps counting, past the threshold', () => {
+    for (let i = 0; i < 3; i++) describeSessionEnd('s-long', died(1));
+    expect(describeSessionEnd('s-long', died(1))).toEqual({
+      level: 'error',
+      consecutiveBootFailures: 4,
+    });
+  });
+
+  it('clears the streak once the session comes back up', () => {
+    for (let i = 0; i < 3; i++) describeSessionEnd('s-recover', died(1));
+    expect(describeSessionEnd('s-recover', undefined)).toEqual({ level: 'info' });
+    expect(describeSessionEnd('s-recover', died(1))).toEqual({ level: 'info' });
+  });
+
+  it('counts each session separately', () => {
+    for (let i = 0; i < 3; i++) describeSessionEnd('s-noisy', died(1));
+    expect(describeSessionEnd('s-quiet', died(1))).toEqual({ level: 'info' });
   });
 });
