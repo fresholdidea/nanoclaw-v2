@@ -61,3 +61,7 @@ falcone-spawn.mjs
 .agents.backup/
 AGENTS.md.backup
 scripts/spike/
+
+# Operator scripts for THIS install — hardcode local OneCLI agent/secret ids,
+# so they must never reach the public upstream. Keep them runnable on disk.
+scripts/ops/
