@@ -133,15 +133,15 @@ function realResolve(p: string): string {
 }
 
 function hasSafeStatePaths(state: UpdateState, projectRoot: string, transactionRoot: string, id: string): boolean {
-  const result =
+  return (
     state.id === id &&
     realResolve(state.projectRoot) === realResolve(projectRoot) &&
     realResolve(state.transactionRoot) === realResolve(transactionRoot) &&
     realResolve(state.stageRoot) === path.join(realResolve(transactionRoot), 'worktree') &&
     state.stageBranch === `update-nanoclaw/${id}` &&
     /^backup\/pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupBranch) &&
-    /^pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupTag);
-  return result;
+    /^pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupTag)
+  );
 }
 
 function saveState(state: UpdateState): void {
@@ -562,14 +562,13 @@ export async function cutoverUpdate(
   assertMutableRootsResolvable(state.projectRoot);
 
   state.service = runtime.detectService(state.projectRoot);
+  // Service first, containers second: with the host down nothing can spawn a
+  // replacement, so the drain (which stops the labeled set itself) is
+  // race-free. If it fails the catch below restarts the old service.
+  await runtime.stopService(state.service);
   try {
-    await runtime.stopService(state.service);
     await runtime.drainContainers(state.projectRoot);
-    // A retry after a build or health failure keeps the original snapshot so
-    // rollback always returns to the pre-cutover state. Re-copying into that
-    // snapshot would collide with preserved symlinks and can fail before the
-    // transaction reaches the reset step.
-    if (!state.snapshot) state.snapshot = createSnapshot(state);
+    state.snapshot = createSnapshot(state);
     saveState(state);
     git(runtime, state.projectRoot, ['reset', '--hard', state.targetHead]);
     installAndBuild(state.projectRoot, state, runtime);

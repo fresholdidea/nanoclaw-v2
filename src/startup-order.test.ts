@@ -9,11 +9,13 @@ const state = vi.hoisted(() => ({
   ready: vi.fn(),
 }));
 vi.mock('./backfill-container-configs.js', () => ({ backfillContainerConfigs: vi.fn() }));
-vi.mock('./config.js', () => ({ CENTRAL_DB_PATH: ':memory:' }));
+vi.mock('./config.js', () => ({ CENTRAL_DB_PATH: ':memory:', PROJECT_ROOT: '/nonexistent-nanoclaw-root' }));
+vi.mock('./log-rotate.js', () => ({ rotateHostLogs: vi.fn(() => []) }));
 vi.mock('./circuit-breaker.js', () => ({ enforceStartupBackoff: vi.fn(), resetCircuitBreaker: vi.fn() }));
 vi.mock('./upgrade-state.js', () => ({ enforceUpgradeTripwire: vi.fn() }));
 vi.mock('./db/connection.js', () => ({ initDb: async () => ({ dialect: 'sqlite' }), closeDb: vi.fn() }));
 vi.mock('./db/migrations/index.js', () => ({ runMigrations: vi.fn() }));
+vi.mock('./modules/scheduling/migrate-legacy.js', () => ({ migrateLegacyTaskSeries: vi.fn() }));
 vi.mock('./drivers/index.js', () => ({ getSessionDriver: () => ({ ensureReady: vi.fn() }) }));
 vi.mock('./container-runner.js', () => ({
   adoptRunningSessions: async () => {
@@ -61,7 +63,7 @@ vi.mock('./modules/index.js', () => ({}));
 vi.mock('./cli/commands/index.js', () => ({}));
 vi.mock('./cli/delivery-action.js', () => ({}));
 vi.mock('./cli/socket-server.js', () => ({ startCliServer: state.ready, stopCliServer: vi.fn() }));
-vi.mock('./log.js', () => ({ log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), fatal: vi.fn() } }));
+vi.mock('./log.js', () => ({ log: { debug: vi.fn(), info: vi.fn(), error: vi.fn(), warn: vi.fn(), fatal: vi.fn() } }));
 vi.mock('./channels/channel-registry.js', () => ({
   createChannelDeliveryAdapter: () => ({}),
   teardownChannelAdapters: vi.fn(),

@@ -189,9 +189,14 @@ export function detectService(projectRoot: string, env: ServiceEnvironment): Ser
 export async function stopService(handle: ServiceHandle, env: ServiceEnvironment): Promise<void> {
   if (!handle.active) return;
   if (handle.mode === 'launchd') {
-    const result = env.runner.tryRun('launchctl', ['bootout', `gui/${env.uid}/${handle.name}`]);
-    if (!result.ok && env.runner.tryRun('launchctl', ['print', `gui/${env.uid}/${handle.name}`]).ok) {
-      throw new Error(result.stdout || `Could not stop launchd service ${handle.name}`);
+    try {
+      env.runner.run('launchctl', ['bootout', `gui/${env.uid}/${handle.name}`]);
+    } catch (err) {
+      // Already unloaded is success: launchctl says so in its own words, or
+      // the job is simply gone. Anything else with the job still loaded must
+      // abort before the caller destroys anything.
+      if (/No such process/i.test(err instanceof Error ? err.message : String(err))) return;
+      if (env.runner.tryRun('launchctl', ['print', `gui/${env.uid}/${handle.name}`]).ok) throw err;
     }
   } else if (handle.mode === 'systemd-user') {
     env.runner.run('systemctl', ['--user', 'stop', handle.name!]);
