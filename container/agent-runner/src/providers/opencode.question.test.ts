@@ -11,15 +11,16 @@ import {
 /**
  * Fake `/v2` question client — captures every reply/list call so tests can
  * assert what OpenCodeProvider sends back without spawning a real server.
- * This simulates the `question.asked` event path end to end: a caller hands
- * this fake the same `{ id, sessionID, questions }` shape the real SSE
- * stream would deliver in its `properties`, and we assert the auto-answer
- * that goes out the other side.
+ * These unit tests check reply/list behavior for native request shapes.
+ * opencode.shared-runtime.test.ts separately drives question.asked through
+ * the production event pump and requires its reply before the turn completes.
  */
-function createFakeQuestionClient(opts: {
-  pending?: Array<{ id: string; sessionID?: string; questions?: unknown[] }>;
-  replyError?: unknown;
-} = {}): { client: QuestionClient; replyCalls: Array<{ requestID: string; answers: string[][] }> } {
+function createFakeQuestionClient(
+  opts: {
+    pending?: Array<{ id: string; sessionID?: string; questions?: unknown[] }>;
+    replyError?: unknown;
+  } = {},
+): { client: QuestionClient; replyCalls: Array<{ requestID: string; answers: string[][] }> } {
   const replyCalls: Array<{ requestID: string; answers: string[][] }> = [];
   const client: QuestionClient = {
     question: {
@@ -100,9 +101,7 @@ describe('handleQuestionAsked', () => {
       questions: [{}],
     });
 
-    expect(replyCalls).toEqual([
-      { requestID: 'que_foreign_session', answers: [[QUESTION_STEERING_TEXT]] },
-    ]);
+    expect(replyCalls).toEqual([{ requestID: 'que_foreign_session', answers: [[QUESTION_STEERING_TEXT]] }]);
   });
 
   it('answers regardless of whether sessionID is present at all', async () => {
@@ -111,13 +110,10 @@ describe('handleQuestionAsked', () => {
     expect(replyCalls.map((c) => c.requestID)).toEqual(['que_no_session']);
   });
 
-  it('gives up after its timeout and logs, so a never-resolving reply cannot stall the turn', async () => {
-    // Mirrors drainPendingQuestions' own timeout test: `.reply()` here never
-    // resolves, simulating a hung round-trip on the per-turn event path.
-    // handleQuestionAsked is awaited inline from the `question.asked` case in
-    // the provider's event loop, so it must return on its own timeout budget
-    // rather than stall the turn forever. A short budget keeps this
-    // deterministic instead of waiting out the real 10s production default.
+  it('returns after its timeout and logs a never-resolving reply', async () => {
+    // The event pump does not await this handler. Its own bounded wait
+    // still reports a hung reply and returns without throwing. A short
+    // budget avoids waiting out the real 10s production default.
     const client: QuestionClient = {
       question: {
         reply: () => new Promise(() => {}),

@@ -21,35 +21,17 @@ import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
-import { codeWrapUnlinkableUrls } from './telegram-unlinkable-urls.js';
 
 /**
- * Dedicated bot identity. Threads are Telegram forum topics: a supergroup with
- * Topics enabled delivers `message_thread_id` on every topic message, and the
- * Chat SDK adapter encodes it as `telegram:<chat>:<topic>` on both inbound and
- * outbound (`postMessage` sets `message_thread_id` from it). A plain group or
- * the General topic carries no topic id, so its thread id is the bare
- * `telegram:<chat>` — which normalizeTelegramThreadId collapses to null so the
- * room's pre-existing shared session keeps serving it. DMs have no topics.
+ * Dedicated bot identity, non-threaded platform (supportsThreads:false), so
+ * group engagement can never be sticky-per-thread — 'mention' keeps a group
+ * wiring from staying engaged forever in the single shared session.
  */
 const TELEGRAM_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'request_approval' },
-  group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
+  group: { engageMode: 'mention', threads: false, unknownSenderPolicy: 'request_approval' },
   mentions: 'platform',
 };
-
-/**
- * Collapse a chat-level thread id to null. The adapter hands every message a
- * thread id; only a forum-topic message carries a third `:<topic>` segment.
- * Treating the topic-less id as "no thread" keeps General-topic and
- * plain-group traffic on the session that existed before topics were honored
- * (session lookup keys per-thread rows on thread_id, NULL = the shared row),
- * and keeps replies to it addressed to the chat rather than to a topic.
- */
-export function normalizeTelegramThreadId(platformId: string, threadId: string | null): string | null {
-  if (threadId === null || threadId === platformId) return null;
-  return threadId;
-}
 
 /**
  * Retry a one-shot operation that can fail on transient network errors at
@@ -236,8 +218,7 @@ export function createTelegramInboundInterceptor(
   token: string,
   instanceKey: string,
 ): ChannelSetup['onInbound'] {
-  return async (platformId, rawThreadId, message) => {
-    const threadId = normalizeTelegramThreadId(platformId, rawThreadId);
+  return async (platformId, threadId, message) => {
     const { text, authorUserId } = readInboundFields(message);
     const botUsername = await botUsernamePromise;
 
@@ -403,18 +384,13 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
     concurrency: 'concurrent',
     extractReplyContext,
-    // Forum topics. See TELEGRAM_DEFAULTS; the inbound interceptor collapses
-    // topic-less thread ids so non-forum groups behave exactly as before.
-    supportsThreads: true,
+    supportsThreads: false,
     defaults: TELEGRAM_DEFAULTS,
-    // @chat-adapter/telegram >= 4.29 parses CommonMark and renders escaped
-    // MarkdownV2 itself, so no markdown sanitizing here (the legacy-Markdown
-    // sanitizer, run in front of the new converter, downgraded **bold** to
-    // *single-star* which then rendered as _italic_). The one transform that
-    // remains is content-level: Telegram rejects a whole message when a bare
-    // URL autolinks to a host it cannot resolve (loopback, private ranges),
-    // which is exactly what a pasted OneCLI connect link is. Code-wrap those.
-    transformOutboundText: codeWrapUnlinkableUrls,
+    // No transformOutboundText: @chat-adapter/telegram >= 4.29 parses
+    // CommonMark and renders escaped MarkdownV2 itself. The legacy-Markdown
+    // sanitizer this replaced was written for the old converter and, run in
+    // front of the new one, downgraded **bold** to *single-star* — which the
+    // adapter then parsed as emphasis and rendered as _italic_.
     maxTextLength: 4000,
   });
 

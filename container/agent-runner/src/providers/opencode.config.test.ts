@@ -1,18 +1,18 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 
-import { buildOpenCodeConfig } from './opencode.js';
+import { buildOpenCodeConfig, resolveOpenCodePromptModel } from './opencode-config.js';
 
 const ENV_KEYS = [
   'OPENCODE_PROVIDER',
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
   'ANTHROPIC_BASE_URL',
+  'OPENCODE_BASE_URL',
   'OPENCODE_MODEL_CONTEXT_LIMIT',
   'OPENCODE_MODEL_OUTPUT_LIMIT',
   'OPENCODE_MODEL_INPUT_MODALITIES',
 ] as const;
 const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
-
 afterEach(() => {
   for (const k of ENV_KEYS) {
     if (saved[k] === undefined) delete process.env[k];
@@ -20,12 +20,58 @@ afterEach(() => {
   }
 });
 
+describe('resolveOpenCodePromptModel', () => {
+  it('splits the configured provider/model for the prompt API', () => {
+    expect(resolveOpenCodePromptModel({ model: 'openai/gpt-5.6-sol' })).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-5.6-sol',
+    });
+    expect(resolveOpenCodePromptModel({ model: 'openrouter/anthropic/claude-sonnet-4' })).toEqual({
+      providerID: 'openrouter',
+      modelID: 'anthropic/claude-sonnet-4',
+    });
+  });
+
+  it('leaves OpenCode its default for a missing or malformed model', () => {
+    expect(resolveOpenCodePromptModel({})).toBeUndefined();
+    expect(resolveOpenCodePromptModel({ model: 'gpt-5.6-sol' })).toBeUndefined();
+    expect(resolveOpenCodePromptModel({ model: 'openai/' })).toBeUndefined();
+  });
+});
+
 describe('buildOpenCodeConfig provider transport', () => {
-  it('anthropic provider gets no provider options', () => {
+  it('allows the core five-minute human-question window plus transport overhead', () => {
+    expect(buildOpenCodeConfig({}).experimental).toMatchObject({ mcp_timeout: 330_000 });
+  });
+  it('treats a custom provider prefix literally rather than as a regular expression', () => {
+    process.env.OPENCODE_PROVIDER = 'local[1]';
+    process.env.OPENCODE_MODEL = 'local[1]/model';
+    process.env.OPENCODE_SMALL_MODEL = 'local[1]/small';
+    const config = buildOpenCodeConfig({});
+    expect(config.provider).toMatchObject({
+      'local[1]': { models: { model: { id: 'model' }, small: { id: 'small' } } },
+    });
+  });
+  it('uses ProviderOptions.model before the compatibility env fallback', () => {
+    process.env.OPENCODE_PROVIDER = 'openai';
+    process.env.OPENCODE_MODEL = 'openai/legacy-model';
+    const config = buildOpenCodeConfig({ model: 'openai/typed-model' });
+    expect(config.model).toBe('openai/typed-model');
+  });
+
+  it('falls back to OPENCODE_MODEL when ProviderOptions.model is omitted', () => {
+    process.env.OPENCODE_PROVIDER = 'openai';
+    process.env.OPENCODE_MODEL = 'openai/legacy-model';
+    const config = buildOpenCodeConfig({});
+    expect(config.model).toBe('openai/legacy-model');
+  });
+
+  it('native cloud providers receive the OneCLI placeholder without an endpoint override', () => {
     process.env.OPENCODE_PROVIDER = 'anthropic';
+    process.env.OPENCODE_MODEL = 'anthropic/claude-sonnet-4-6';
     delete process.env.ANTHROPIC_BASE_URL;
     const config = buildOpenCodeConfig({});
-    expect(config.provider).toEqual({});
+    expect(config.provider).toMatchObject({ anthropic: { options: { apiKey: 'nc-opencode-token-v1' } } });
   });
 
   it('custom base URL pins the Chat Completions transport', () => {
@@ -35,16 +81,18 @@ describe('buildOpenCodeConfig provider transport', () => {
     const config = buildOpenCodeConfig({});
     const entry = (config.provider as Record<string, Record<string, unknown>>).openai;
     expect(entry.npm).toBe('@ai-sdk/openai-compatible');
-    expect(entry.options).toEqual({ apiKey: 'placeholder', baseURL: 'https://inference.example.test/v1' });
+    expect(entry.options).toEqual({ apiKey: 'nc-opencode-token-v1', baseURL: 'https://inference.example.test/v1' });
   });
 
-  it('no base URL leaves the provider default transport', () => {
+  it('no base URL keeps the native transport and still passes inference overrides', () => {
     process.env.OPENCODE_PROVIDER = 'openai';
     process.env.OPENCODE_MODEL = 'openai/gpt-5.2';
     delete process.env.ANTHROPIC_BASE_URL;
-    const config = buildOpenCodeConfig({});
+    const config = buildOpenCodeConfig({ effort: 'high' });
     const entry = (config.provider as Record<string, Record<string, unknown>>).openai;
+    expect(entry.options).toEqual({ apiKey: 'nc-opencode-token-v1' });
     expect(entry.npm).toBeUndefined();
+    expect(entry.models).toMatchObject({ 'gpt-5.2': { options: { reasoningEffort: 'high' } } });
   });
 
   it('openrouter with a base URL keeps its native transport (no pin)', () => {
@@ -306,5 +354,30 @@ describe('buildOpenCodeConfig reasoning effort', () => {
     const config = buildOpenCodeConfig({ effort: 'high' });
     expect(modelOptions(config, 'deepseek-v4-flash')).toEqual({ reasoningEffort: 'high' });
     expect(modelOptions(config, 'deepseek-v4-flash-lite')).toBeUndefined();
+  });
+});
+
+describe('provider-owned endpoint defaults', () => {
+  it('uses OpenCode endpoint without changing the historical shared fallback', () => {
+    process.env.OPENCODE_PROVIDER = 'openai';
+    process.env.ANTHROPIC_BASE_URL = 'https://claude.example.test';
+    process.env.OPENCODE_BASE_URL = 'http://localhost:8891/v1';
+    const config = buildOpenCodeConfig({ model: 'openai/test' });
+    expect(config.provider).toMatchObject({ openai: { options: { baseURL: 'http://localhost:8891/v1' } } });
+    expect(process.env.ANTHROPIC_BASE_URL).toBe('https://claude.example.test');
+  });
+  it('explicit native endpoint suppresses a shared Claude URL and preserves model limits', () => {
+    process.env.OPENCODE_PROVIDER = 'openai';
+    process.env.OPENCODE_BASE_URL = 'native';
+    process.env.ANTHROPIC_BASE_URL = 'https://claude.example.test';
+    process.env.OPENCODE_MODEL_CONTEXT_LIMIT = '32768';
+    process.env.OPENCODE_MODEL_OUTPUT_LIMIT = '4096';
+    const config = buildOpenCodeConfig({ model: 'openai/test', effort: 'high' });
+    const entry = (config.provider as Record<string, Record<string, unknown>>).openai;
+    expect(entry.options).toEqual({ apiKey: 'nc-opencode-token-v1' });
+    expect(entry.npm).toBeUndefined();
+    expect(entry.models).toMatchObject({
+      test: { limit: { context: 32768, output: 4096 }, options: { reasoningEffort: 'high' } },
+    });
   });
 });

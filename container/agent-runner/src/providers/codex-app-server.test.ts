@@ -7,11 +7,15 @@ import {
   type AppServer,
   CODEX_APP_SERVER_ARGS,
   attachCodexAutoApproval,
+  buildCodexConfigPlan,
   buildCodexProcessEnv,
+  codexInferenceSection,
+  renderCodexConfigToml,
   startOrResumeCodexThread,
   tomlBasicString,
   writeCodexConfigToml,
 } from './codex-app-server.js';
+import { CodexProvider } from './codex.js';
 
 const MEMORY_SESSION_HOOK = {
   command: 'bun /app/src/memory/hook.ts',
@@ -31,6 +35,98 @@ afterEach(() => {
 });
 
 describe('Codex config TOML', () => {
+  it('builds every declared configuration capability before rendering', () => {
+    const mcpServers = { nanoclaw: { command: 'bun', args: ['run', 'server.ts'] } };
+    const plan = buildCodexConfigPlan(mcpServers, { model: 'gpt-5', effort: 'medium', fastMode: true });
+
+    expect(plan).toEqual({
+      executionPolicy: {
+        sandboxMode: 'danger-full-access',
+        approvalPolicy: 'never',
+        projectDocumentMaxBytes: 32768,
+      },
+      inference: { model: 'gpt-5', effort: 'medium', fastMode: true },
+      memory: { memories: false, useMemories: false, generateMemories: false },
+      mcpServers,
+    });
+    expect(renderCodexConfigToml(plan)).toContain('[mcp_servers.nanoclaw]');
+  });
+
+  it('renders the exact bytes, pinning line order and the trailing newline', () => {
+    const content = renderCodexConfigToml(
+      buildCodexConfigPlan(
+        {
+          nanoclaw: { command: 'bun', args: ['run', '/app/src/mcp-tools/index.ts'], env: { FOO: 'bar' } },
+          docs: { type: 'http', url: 'https://mcp.example.com/mcp', headers: { 'X-Api-Version': '2024-06' } },
+        },
+        { model: 'gpt-5', effort: 'medium', fastMode: true },
+      ),
+    );
+    expect(content).toBe(
+      [
+        'sandbox_mode = "danger-full-access"',
+        'approval_policy = "never"',
+        'project_doc_max_bytes = 32768',
+        'mcp_optional_startup_grace_ms = 0',
+        'model = "gpt-5"',
+        'model_reasoning_effort = "medium"',
+        'service_tier = "fast"',
+        '',
+        '[features]',
+        'memories = false',
+        '',
+        '[memories]',
+        'use_memories = false',
+        'generate_memories = false',
+        '',
+        '[mcp_servers.nanoclaw]',
+        'required = true',
+        'command = "bun"',
+        'args = ["run", "/app/src/mcp-tools/index.ts"]',
+        '[mcp_servers.nanoclaw.env]',
+        'FOO = "bar"',
+        '',
+        '[mcp_servers.docs]',
+        'url = "https://mcp.example.com/mcp"',
+        '[mcp_servers.docs.http_headers]',
+        '"X-Api-Version" = "2024-06"',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  // Core's speed property → Codex's service tier. `fast` is the only value
+  // with a Codex rendering; `standard` (the core default) and anything else
+  // emit no tier line, so Codex's own default serving tier stays in force.
+  it('renders service_tier = "fast" only for speed fast', () => {
+    const fast = renderCodexConfigToml({
+      ...buildCodexConfigPlan({}, {}),
+      inference: codexInferenceSection({ speed: 'fast' }),
+    });
+    expect(fast).toContain('service_tier = "fast"');
+    // The tier is a plain top-level key: no feature flag rides along with it.
+    expect(fast).not.toContain('fast_mode');
+
+    const standard = renderCodexConfigToml({
+      ...buildCodexConfigPlan({}, {}),
+      inference: codexInferenceSection({ speed: 'standard' }),
+    });
+    expect(standard).not.toContain('service_tier');
+
+    const unset = renderCodexConfigToml(buildCodexConfigPlan({}, {}));
+    expect(unset).not.toContain('service_tier');
+  });
+
+  it('treats speed as a fast-or-default flag — other tier names are dropped, not passed through', () => {
+    expect(codexInferenceSection({ speed: 'ultrafast' }).fastMode).toBeUndefined();
+    const rendered = renderCodexConfigToml({
+      ...buildCodexConfigPlan({}, {}),
+      inference: codexInferenceSection({ speed: 'ultrafast' }),
+    });
+    expect(rendered).not.toContain('service_tier');
+    expect(rendered).not.toContain('ultrafast');
+  });
+
   it('escapes basic strings', () => {
     expect(tomlBasicString('a "quoted" \\\\ value')).toBe('"a \\"quoted\\" \\\\\\\\ value"');
   });
@@ -43,7 +139,7 @@ describe('Codex config TOML', () => {
     expect(() => tomlBasicString('bad\nvalue')).toThrow(/newline/);
   });
 
-  it('hardcodes danger-full-access + never and writes model, effort, and MCP servers', () => {
+  it('hardcodes danger-full-access + never and writes model, effort, fast mode, and MCP servers', () => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
     process.env.HOME = tmpHome;
 
@@ -61,7 +157,7 @@ describe('Codex config TOML', () => {
         },
       },
       MEMORY_SESSION_HOOK,
-      { model: 'gpt-5', effort: 'medium' },
+      { model: 'gpt-5', effort: 'medium', fastMode: true },
     );
 
     const content = fs.readFileSync(path.join(tmpHome, '.codex', 'config.toml'), 'utf-8');
@@ -70,6 +166,7 @@ describe('Codex config TOML', () => {
     expect(content).toContain('project_doc_max_bytes = 32768');
     expect(content).toContain('model = "gpt-5"');
     expect(content).toContain('model_reasoning_effort = "medium"');
+    expect(content).toContain('service_tier = "fast"');
     expect(content).toContain('[features]\nmemories = false');
     expect(content).toContain('[memories]\nuse_memories = false\ngenerate_memories = false');
     expect(content).not.toContain('[sandbox_workspace_write]');
@@ -204,6 +301,38 @@ describe('Codex config TOML', () => {
       },
     ]);
   });
+
+  it('replaces config.toml before malformed hooks.json fails', () => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    process.env.HOME = tmpHome;
+    const codexDir = path.join(tmpHome, '.codex');
+    const configPath = path.join(codexDir, 'config.toml');
+    const hooksPath = path.join(codexDir, 'hooks.json');
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(configPath, 'stale config');
+    fs.writeFileSync(hooksPath, '{');
+
+    expect(() => writeCodexConfigToml({}, MEMORY_SESSION_HOOK, { model: 'gpt-5' })).toThrow();
+    expect(fs.readFileSync(configPath, 'utf-8')).toContain('model = "gpt-5"');
+    expect(fs.readFileSync(configPath, 'utf-8')).not.toContain('stale config');
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{');
+  });
+
+  it('replaces config.toml before an existing empty hooks.json fails', () => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    process.env.HOME = tmpHome;
+    const codexDir = path.join(tmpHome, '.codex');
+    const configPath = path.join(codexDir, 'config.toml');
+    const hooksPath = path.join(codexDir, 'hooks.json');
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(configPath, 'stale config');
+    fs.writeFileSync(hooksPath, '');
+
+    expect(() => writeCodexConfigToml({}, MEMORY_SESSION_HOOK, { model: 'gpt-5' })).toThrow();
+    expect(fs.readFileSync(configPath, 'utf-8')).toContain('model = "gpt-5"');
+    expect(fs.readFileSync(configPath, 'utf-8')).not.toContain('stale config');
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('');
+  });
 });
 
 describe('Codex thread SessionStart source', () => {
@@ -213,16 +342,64 @@ describe('Codex thread SessionStart source', () => {
     await startOrResumeCodexThread(server, undefined, { cwd: '/workspace/agent' });
 
     expect(requests[0].method).toBe('thread/start');
+    expect(requests[0].params.personality).toBe('friendly');
+    expect(requests[0].params.config).toEqual({ bypass_hook_trust: true });
     expect(requests[0].params.sessionStartSource).toBe('startup');
   });
 
   it('does not send startup when resuming', async () => {
     const { server, requests } = autoRespondingServer();
 
-    await startOrResumeCodexThread(server, 'thread-existing', { cwd: '/workspace/agent' });
+    await startOrResumeCodexThread(server, 'thread-existing', { cwd: '/workspace/agent', personality: 'pragmatic' });
 
     expect(requests[0].method).toBe('thread/resume');
+    expect(requests[0].params.personality).toBe('pragmatic');
+    expect(requests[0].params.config).toEqual({ bypass_hook_trust: true });
     expect(requests[0].params.sessionStartSource).toBeUndefined();
+  });
+});
+
+// With the nanoclaw server required, Codex fails thread/start and thread/resume
+// when it cannot start. The resume failure must surface as an error, not be
+// read as a stale thread: that would start a new thread and silently drop the
+// conversation. Error strings are verbatim from codex 0.155.1, the pinned
+// version (0.146.0 words the failure without the repeated tail).
+describe('Codex thread resume failures', () => {
+  const REQUIRED_MCP_FAILURE =
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: ' +
+    'nanoclaw: handshaking with MCP server failed: connection closed: initialize response: ' +
+    'connection closed: initialize response';
+  const REQUIRED_MCP_TIMEOUT =
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: ' +
+    'nanoclaw: timed out handshaking with MCP server after 29.99999975s';
+  const STALE_THREAD = 'no rollout found for thread id 01a0caf8-0000-7000-a000-000000000000';
+
+  for (const [label, message] of [
+    ['fails to start', REQUIRED_MCP_FAILURE],
+    ['times out', REQUIRED_MCP_TIMEOUT],
+  ] as const) {
+    it(`keeps the thread when the required nanoclaw server ${label}`, async () => {
+      const { server, requests } = autoRespondingServer({ 'thread/resume': message });
+
+      const err = await startOrResumeCodexThread(server, 'thread-existing', { cwd: '/workspace/agent' }).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe(`thread/resume failed: ${message}`);
+      expect(requests.map((r) => r.method)).toEqual(['thread/resume']);
+      expect(new CodexProvider().isSessionInvalid(err)).toBe(false);
+    });
+  }
+
+  it('still starts a fresh thread when the stored thread is gone', async () => {
+    const { server, requests } = autoRespondingServer({ 'thread/resume': STALE_THREAD });
+
+    const threadId = await startOrResumeCodexThread(server, 'thread-existing', { cwd: '/workspace/agent' });
+
+    expect(requests.map((r) => r.method)).toEqual(['thread/resume', 'thread/start']);
+    expect(threadId).toBe('thread-new');
+    expect(new CodexProvider().isSessionInvalid(new Error(STALE_THREAD))).toBe(true);
   });
 });
 
@@ -333,7 +510,7 @@ function fakeServer(): { server: AppServer; writes: string[] } {
   return { server, writes };
 }
 
-function autoRespondingServer(): {
+function autoRespondingServer(errors: Record<string, string> = {}): {
   server: AppServer;
   requests: Array<{ id: number; method: string; params: Record<string, unknown> }>;
 } {
@@ -345,6 +522,11 @@ function autoRespondingServer(): {
         write: (line: string) => {
           const request = JSON.parse(line) as { id: number; method: string; params: Record<string, unknown> };
           requests.push(request);
+          const error = errors[request.method];
+          if (error) {
+            server.pending.get(request.id)?.resolve({ id: request.id, error: { code: -32603, message: error } });
+            return;
+          }
           const threadId = (request.params.threadId as string | undefined) ?? 'thread-new';
           server.pending.get(request.id)?.resolve({ id: request.id, result: { thread: { id: threadId } } });
         },
