@@ -40,7 +40,16 @@ git show origin/providers:container/agent-runner/src/providers/opencode.ts      
 git show origin/providers:container/agent-runner/src/providers/mcp-to-opencode.ts      > container/agent-runner/src/providers/mcp-to-opencode.ts
 git show origin/providers:container/agent-runner/src/providers/mcp-to-opencode.test.ts > container/agent-runner/src/providers/mcp-to-opencode.test.ts
 git show origin/providers:container/agent-runner/src/providers/opencode.factory.test.ts > container/agent-runner/src/providers/opencode.factory.test.ts
+git show origin/providers:container/agent-runner/src/providers/opencode.attachments.test.ts > container/agent-runner/src/providers/opencode.attachments.test.ts
+git show origin/providers:container/agent-runner/src/providers/opencode.compaction.test.ts > container/agent-runner/src/providers/opencode.compaction.test.ts
+git show origin/providers:container/agent-runner/src/providers/opencode.config.test.ts > container/agent-runner/src/providers/opencode.config.test.ts
+git show origin/providers:container/agent-runner/src/providers/opencode.memory.test.ts > container/agent-runner/src/providers/opencode.memory.test.ts
+git show origin/providers:container/agent-runner/src/providers/opencode.question.test.ts > container/agent-runner/src/providers/opencode.question.test.ts
+git show origin/providers:container/agent-runner/src/providers/cwd-shim.ts             > container/agent-runner/src/providers/cwd-shim.ts.new && mv container/agent-runner/src/providers/cwd-shim.ts.new container/agent-runner/src/providers/cwd-shim.ts
+git show origin/providers:container/agent-runner/src/providers/cwd-shim.test.ts        > container/agent-runner/src/providers/cwd-shim.test.ts.new && mv container/agent-runner/src/providers/cwd-shim.test.ts.new container/agent-runner/src/providers/cwd-shim.test.ts
 ```
+
+(`cwd-shim.ts` is byte-identical to the trunk copy on current trunks — `mcp-to-opencode.ts` imports it, so copying it keeps the payload self-sufficient on trunks that predate it. These two overwrite real trunk files, so they go through a `.new` + `mv` guard: on a providers branch that predates the cwd payload, `git show` fails without truncating the live copy the default provider imports.)
 
 ### 3. Append the self-registration imports
 
@@ -110,6 +119,7 @@ for overlay in data/v2-sessions/*/agent-runner-src/providers/; do
   [ -d "$overlay" ] || continue
   cp container/agent-runner/src/providers/opencode.ts "$overlay"
   cp container/agent-runner/src/providers/mcp-to-opencode.ts "$overlay"
+  cp container/agent-runner/src/providers/cwd-shim.ts "$overlay"
   cp container/agent-runner/src/providers/index.ts "$overlay"
   echo "Updated: $overlay"
 done
@@ -127,6 +137,11 @@ These variables are read **on the host** and passed into the container only when
 - `OPENCODE_MODEL` — full model id in `provider/model` form, e.g. `deepseek/deepseek-chat`.
 - `OPENCODE_SMALL_MODEL` — optional second model for lighter tasks; defaults to `OPENCODE_MODEL` if unset.
 - `ANTHROPIC_BASE_URL` — **required for non-`anthropic` providers.** The opencode container provider passes this as the `baseURL` for the upstream provider config so requests route through OneCLI's credential proxy or directly to the provider's API. Set it to the provider's API base URL (e.g. `https://api.deepseek.com/v1`, `https://openrouter.ai/api/v1`).
+- `OPENCODE_MODEL_CONTEXT_LIMIT` — optional context window, in tokens, declared for **`OPENCODE_MODEL` only** (not the small model); OpenCode auto-compacts as a session approaches it, and a model its registry does not know resolves to `0` and so never compacts. Anything but a positive integer is logged and treated as unset, which emits no limit and leaves behavior unchanged.
+- `OPENCODE_MODEL_OUTPUT_LIMIT` — optional max output tokens for the same main model, only applied alongside a valid context limit (without one it is logged and ignored). Anything but a positive integer is logged and treated as unset.
+- `OPENCODE_MODEL_INPUT_MODALITIES` — optional comma-separated subset of `text,audio,image,video,pdf`, declared for **`OPENCODE_MODEL` only**. OpenCode drops any file part whose modality the model does not declare, so images and PDFs never reach a registry-unknown custom model unless this is set. Unrecognized entries are logged and skipped; unset declares nothing and leaves behavior unchanged. A distinct `OPENCODE_SMALL_MODEL` never inherits this; it keeps the undeclared-model default regardless.
+
+  Declaring the modality only opens OpenCode's gate for the file part to reach the model call. It does not by itself mean an attachment arrives as media today: the runner produces a file part from a channel attachment only once the attachment plumbing lands on `main` ([nanoclaw#3156](https://github.com/nanocoai/nanoclaw/issues/3156)). Until then, attachments are still described in the prompt text the formatter renders, same as every other provider.
 
 Credentials: register provider API keys in OneCLI with the matching `--host-pattern` (e.g. `api.deepseek.com`, `openrouter.ai`). OneCLI injects them via `HTTPS_PROXY` in the container — the key never lives in `.env` or the container environment.
 

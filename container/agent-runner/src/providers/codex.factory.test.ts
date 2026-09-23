@@ -1,80 +1,131 @@
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import { describe, expect, it } from 'bun:test';
 
-import { describe, it, expect } from 'bun:test';
+import { type AppServer, codexRuntimeOwnership, type writeCodexConfigToml } from './codex-app-server.js';
+import { CodexProvider, type CodexRuntimeDeps } from './codex.js';
 
-import { createProvider } from './factory.js';
-import { CodexProvider, resolveClaudeImports } from './codex.js';
+const MEMORY_HOOK = { command: 'bun /app/src/memory/hook.ts', legacyCommands: [], sources: ['startup'] };
 
-describe('createProvider (codex)', () => {
-  it('returns CodexProvider for codex', () => {
-    expect(createProvider('codex')).toBeInstanceOf(CodexProvider);
+/**
+ * Runtime deps that record config writes and stop the query at the app-server
+ * handshake, so no codex binary is ever spawned.
+ */
+function recordingRuntime(): { runtime: CodexRuntimeDeps; writes: Parameters<typeof writeCodexConfigToml>[] } {
+  const writes: Parameters<typeof writeCodexConfigToml>[] = [];
+  const runtime: CodexRuntimeDeps = {
+    writeCodexConfigToml: (...args) => {
+      writes.push(args);
+    },
+    spawnCodexAppServer: () =>
+      ({
+        process: { stdin: { write: () => true } },
+        readline: { close: () => {} },
+        pending: new Map(),
+        notificationHandlers: [],
+        exitHandlers: [],
+        serverRequestHandlers: [],
+      }) as unknown as AppServer,
+    attachCodexAutoApproval: () => {},
+    initializeCodexAppServer: async () => {
+      throw new Error('handshake stopped by test');
+    },
+    startOrResumeCodexThread: async () => 'thread-unreached',
+    startCodexTurn: async () => 'turn-unreached',
+    steerCodexTurn: async () => {},
+    interruptCodexTurn: async () => {},
+    killCodexAppServer: () => {},
+  };
+  return { runtime, writes };
+}
+
+async function runQueryToHandshake(provider: CodexProvider): Promise<void> {
+  provider.registerMemorySessionHook(MEMORY_HOOK);
+  const query = provider.query({ prompt: 'hello', cwd: '/workspace/agent' });
+  await expect(query.events.next()).rejects.toThrow('handshake stopped by test');
+}
+
+describe('CodexProvider', () => {
+  it('rejects unsupported reasoning effort values', () => {
+    expect(() => new CodexProvider({ effort: 'max' })).toThrow(/Unsupported Codex reasoning effort/);
   });
 
-  it('flags stale thread errors as session-invalid', () => {
-    const p = new CodexProvider();
-    expect(p.isSessionInvalid(new Error('thread not found'))).toBe(true);
-    expect(p.isSessionInvalid(new Error('unknown thread 123'))).toBe(true);
-    expect(p.isSessionInvalid(new Error('No such thread: abc'))).toBe(true);
+  it('normalizes supported reasoning effort values', () => {
+    expect(new CodexProvider({ effort: 'HIGH' })).toBeInstanceOf(CodexProvider);
   });
 
-  it('does not flag unrelated errors as session-invalid', () => {
-    const p = new CodexProvider();
-    expect(p.isSessionInvalid(new Error('rate limit exceeded'))).toBe(false);
-    expect(p.isSessionInvalid(new Error('connection reset'))).toBe(false);
-    expect(p.isSessionInvalid(new Error('codex app-server exited: code=1'))).toBe(false);
+  it('accepts supported reasoning effort values', () => {
+    expect(new CodexProvider({ effort: 'xhigh' })).toBeInstanceOf(CodexProvider);
   });
 
-  it('declares no native slash command support', () => {
-    const p = new CodexProvider();
-    expect(p.supportsNativeSlashCommands).toBe(false);
-  });
-});
-
-describe('resolveClaudeImports', () => {
-  function scratchDir(): string {
-    return fs.mkdtempSync(path.join(os.tmpdir(), 'codex-imports-'));
-  }
-
-  it('inlines a single relative import', () => {
-    const dir = scratchDir();
-    fs.writeFileSync(path.join(dir, 'fragment.md'), 'FRAGMENT CONTENT');
-    const resolved = resolveClaudeImports('before\n@./fragment.md\nafter', dir);
-    expect(resolved).toContain('FRAGMENT CONTENT');
-    expect(resolved).not.toContain('@./fragment.md');
-    expect(resolved).toMatch(/before[\s\S]*FRAGMENT CONTENT[\s\S]*after/);
+  it('requires the shared memory hook before starting a query', () => {
+    expect(() => new CodexProvider({}).query({ prompt: 'hello', cwd: '/workspace/agent' })).toThrow(/not registered/);
   });
 
-  it('expands nested imports relative to the parent file', () => {
-    const dir = scratchDir();
-    fs.mkdirSync(path.join(dir, 'sub'));
-    fs.writeFileSync(path.join(dir, 'sub', 'inner.md'), 'INNER');
-    fs.writeFileSync(path.join(dir, 'sub', 'outer.md'), '@./inner.md');
-    const resolved = resolveClaudeImports('@./sub/outer.md', dir);
-    expect(resolved).toBe('INNER');
+  it('writes the runtime files exactly once per query when no contract owns them', async () => {
+    const previous = codexRuntimeOwnership.contractOwnsRuntimeFiles;
+    codexRuntimeOwnership.contractOwnsRuntimeFiles = false;
+    try {
+      const { runtime, writes } = recordingRuntime();
+      const servers = { nanoclaw: { command: 'bun' } };
+      await runQueryToHandshake(
+        new CodexProvider({ mcpServers: servers, model: 'gpt-5', effort: 'HIGH', speed: 'fast' }, runtime),
+      );
+      expect(writes).toHaveLength(1);
+      const [mcpServers, hook, inference] = writes[0];
+      expect(mcpServers).toEqual(servers);
+      expect(hook).toEqual(MEMORY_HOOK);
+      // The same normalized values the contract path renders from.
+      expect(inference).toEqual({ model: 'gpt-5', effort: 'high', fastMode: true });
+    } finally {
+      codexRuntimeOwnership.contractOwnsRuntimeFiles = previous;
+    }
   });
 
-  it('drops missing imports to empty text rather than leaving raw @path', () => {
-    const dir = scratchDir();
-    const resolved = resolveClaudeImports('before\n@./does-not-exist.md\nafter', dir);
-    expect(resolved).not.toContain('@./does-not-exist.md');
-    expect(resolved).toContain('before');
-    expect(resolved).toContain('after');
+  it('leaves the runtime files to the contract when its module owns them', async () => {
+    const previous = codexRuntimeOwnership.contractOwnsRuntimeFiles;
+    codexRuntimeOwnership.contractOwnsRuntimeFiles = true;
+    try {
+      const { runtime, writes } = recordingRuntime();
+      await runQueryToHandshake(new CodexProvider({ model: 'gpt-5' }, runtime));
+      expect(writes).toHaveLength(0);
+    } finally {
+      codexRuntimeOwnership.contractOwnsRuntimeFiles = previous;
+    }
   });
 
-  it('breaks cycles', () => {
-    const dir = scratchDir();
-    fs.writeFileSync(path.join(dir, 'a.md'), '@./b.md');
-    fs.writeFileSync(path.join(dir, 'b.md'), '@./a.md');
-    // Just needs to terminate without a stack overflow.
-    const resolved = resolveClaudeImports('@./a.md', dir);
-    expect(typeof resolved).toBe('string');
+  it('consumes core-resolved configuration instead of re-deriving it', async () => {
+    const previous = codexRuntimeOwnership.contractOwnsRuntimeFiles;
+    codexRuntimeOwnership.contractOwnsRuntimeFiles = false;
+    try {
+      const { runtime, writes } = recordingRuntime();
+      const resolvedServers = { resolved: { command: 'resolved-bin' } };
+      const provider = new CodexProvider({ mcpServers: { ignored: { command: 'x' } }, model: 'ignored' }, runtime, {
+        executionPolicy: {},
+        inference: { model: 'gpt-5', effort: 'high', fastMode: undefined },
+        mcpServers: resolvedServers,
+      });
+      await runQueryToHandshake(provider);
+      const [mcpServers, , inference] = writes[0];
+      expect(mcpServers).toEqual(resolvedServers);
+      expect(inference).toEqual({ model: 'gpt-5', effort: 'high', fastMode: undefined });
+    } finally {
+      codexRuntimeOwnership.contractOwnsRuntimeFiles = previous;
+    }
   });
 
-  it('leaves non-import @ mentions alone (only line-anchored @<path> is imported)', () => {
-    const dir = scratchDir();
-    const resolved = resolveClaudeImports('email @someone for details', dir);
-    expect(resolved).toBe('email @someone for details');
+  it.each([undefined, 'pragmatic'])('passes resolved tone to thread settings (%j)', async (personality) => {
+    const { runtime } = recordingRuntime();
+    runtime.initializeCodexAppServer = async () => {};
+    runtime.startOrResumeCodexThread = async (_server, _thread, settings) => {
+      expect(settings.personality).toBe(personality ?? 'friendly');
+      throw new Error('thread settings captured');
+    };
+    const provider = new CodexProvider({}, runtime, {
+      inference: {},
+      mcpServers: {},
+      ...(personality ? { tone: { personality } } : {}),
+    });
+    provider.registerMemorySessionHook(MEMORY_HOOK);
+    const query = provider.query({ prompt: 'hi', cwd: '/workspace/agent' });
+    await expect(query.events.next()).rejects.toThrow('thread settings captured');
   });
 });
