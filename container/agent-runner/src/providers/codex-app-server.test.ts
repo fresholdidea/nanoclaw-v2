@@ -15,6 +15,7 @@ import {
   tomlBasicString,
   writeCodexConfigToml,
 } from './codex-app-server.js';
+import { CodexProvider } from './codex.js';
 
 const MEMORY_SESSION_HOOK = {
   command: 'bun /app/src/memory/hook.ts',
@@ -66,6 +67,7 @@ describe('Codex config TOML', () => {
         'sandbox_mode = "danger-full-access"',
         'approval_policy = "never"',
         'project_doc_max_bytes = 32768',
+        'mcp_optional_startup_grace_ms = 0',
         'model = "gpt-5"',
         'model_reasoning_effort = "medium"',
         'service_tier = "fast"',
@@ -78,6 +80,7 @@ describe('Codex config TOML', () => {
         'generate_memories = false',
         '',
         '[mcp_servers.nanoclaw]',
+        'required = true',
         'command = "bun"',
         'args = ["run", "/app/src/mcp-tools/index.ts"]',
         '[mcp_servers.nanoclaw.env]',
@@ -356,6 +359,50 @@ describe('Codex thread SessionStart source', () => {
   });
 });
 
+// With the nanoclaw server required, Codex fails thread/start and thread/resume
+// when it cannot start. The resume failure must surface as an error, not be
+// read as a stale thread: that would start a new thread and silently drop the
+// conversation. Error strings are verbatim from codex 0.155.1, the pinned
+// version (0.146.0 words the failure without the repeated tail).
+describe('Codex thread resume failures', () => {
+  const REQUIRED_MCP_FAILURE =
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: ' +
+    'nanoclaw: handshaking with MCP server failed: connection closed: initialize response: ' +
+    'connection closed: initialize response';
+  const REQUIRED_MCP_TIMEOUT =
+    'error resuming thread: Fatal error: Failed to initialize session: required MCP servers failed to initialize: ' +
+    'nanoclaw: timed out handshaking with MCP server after 29.99999975s';
+  const STALE_THREAD = 'no rollout found for thread id 01a0caf8-0000-7000-a000-000000000000';
+
+  for (const [label, message] of [
+    ['fails to start', REQUIRED_MCP_FAILURE],
+    ['times out', REQUIRED_MCP_TIMEOUT],
+  ] as const) {
+    it(`keeps the thread when the required nanoclaw server ${label}`, async () => {
+      const { server, requests } = autoRespondingServer({ 'thread/resume': message });
+
+      const err = await startOrResumeCodexThread(server, 'thread-existing', { cwd: '/workspace/agent' }).catch(
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe(`thread/resume failed: ${message}`);
+      expect(requests.map((r) => r.method)).toEqual(['thread/resume']);
+      expect(new CodexProvider().isSessionInvalid(err)).toBe(false);
+    });
+  }
+
+  it('still starts a fresh thread when the stored thread is gone', async () => {
+    const { server, requests } = autoRespondingServer({ 'thread/resume': STALE_THREAD });
+
+    const threadId = await startOrResumeCodexThread(server, 'thread-existing', { cwd: '/workspace/agent' });
+
+    expect(requests.map((r) => r.method)).toEqual(['thread/resume', 'thread/start']);
+    expect(threadId).toBe('thread-new');
+    expect(new CodexProvider().isSessionInvalid(new Error(STALE_THREAD))).toBe(true);
+  });
+});
+
 describe('Codex auto-approval', () => {
   // NanoClaw (container isolation + OneCLI) is the boundary, so the handler accepts
   // every request unconditionally — even paths/commands a sandbox policy would refuse.
@@ -463,7 +510,7 @@ function fakeServer(): { server: AppServer; writes: string[] } {
   return { server, writes };
 }
 
-function autoRespondingServer(): {
+function autoRespondingServer(errors: Record<string, string> = {}): {
   server: AppServer;
   requests: Array<{ id: number; method: string; params: Record<string, unknown> }>;
 } {
@@ -475,6 +522,11 @@ function autoRespondingServer(): {
         write: (line: string) => {
           const request = JSON.parse(line) as { id: number; method: string; params: Record<string, unknown> };
           requests.push(request);
+          const error = errors[request.method];
+          if (error) {
+            server.pending.get(request.id)?.resolve({ id: request.id, error: { code: -32603, message: error } });
+            return;
+          }
           const threadId = (request.params.threadId as string | undefined) ?? 'thread-new';
           server.pending.get(request.id)?.resolve({ id: request.id, result: { thread: { id: threadId } } });
         },
