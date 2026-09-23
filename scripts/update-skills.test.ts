@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { detectInstalledSkills, refreshInstalledSkills } from './update-skills.js';
 
@@ -34,7 +34,19 @@ function commit(root: string, message: string): void {
   run(root, 'git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', message]);
 }
 
+// These tests exercise remote resolution; an operator's ambient registry
+// override (e.g. a fork-hosted registry during /update-nanoclaw) must not leak in.
+const REGISTRY_ENV = ['NANOCLAW_REGISTRY_REMOTE', 'NANOCLAW_CHANNELS_REMOTE'] as const;
+const savedRegistryEnv = REGISTRY_ENV.map((key) => [key, process.env[key]] as const);
+beforeEach(() => {
+  for (const key of REGISTRY_ENV) delete process.env[key];
+});
+
 afterEach(() => {
+  for (const [key, value] of savedRegistryEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
