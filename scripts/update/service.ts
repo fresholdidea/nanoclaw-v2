@@ -120,7 +120,11 @@ export function detectService(projectRoot: string, env: ServiceEnvironment): Ser
     const legacyDefinition = path.join(env.home, 'Library', 'LaunchAgents', `${legacyName}.plist`);
     if (fs.existsSync(legacyDefinition)) {
       const plist = env.runner.tryRun('/usr/libexec/PlistBuddy', ['-c', 'Print :WorkingDirectory', legacyDefinition]);
-      const program = env.runner.tryRun('/usr/libexec/PlistBuddy', ['-c', 'Print :ProgramArguments:1', legacyDefinition]);
+      const program = env.runner.tryRun('/usr/libexec/PlistBuddy', [
+        '-c',
+        'Print :ProgramArguments:1',
+        legacyDefinition,
+      ]);
       const workingDirectory = plist.ok ? plist.stdout.trim() : '';
       const entrypoint = program.ok ? program.stdout.trim() : '';
       if (workingDirectory === projectRoot && entrypoint === path.join(projectRoot, 'dist', 'index.js')) {
@@ -186,9 +190,37 @@ export function detectService(projectRoot: string, env: ServiceEnvironment): Ser
  * throws: a service that is genuinely still running must abort the caller
  * before anything is destroyed.
  */
+const PROCESS_EXIT_TIMEOUT_MS = 60_000;
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function waitForProcessExit(pid: number, env: ServiceEnvironment): Promise<void> {
+  const deadline = Date.now() + PROCESS_EXIT_TIMEOUT_MS;
+  while (processAlive(pid)) {
+    if (Date.now() > deadline)
+      throw new Error(`Service process ${pid} did not exit within ${PROCESS_EXIT_TIMEOUT_MS}ms`);
+    await env.sleep(250);
+  }
+}
+
 export async function stopService(handle: ServiceHandle, env: ServiceEnvironment): Promise<void> {
   if (!handle.active) return;
   if (handle.mode === 'launchd') {
+    // `launchctl bootout` can return while the host is still exiting — and a
+    // SQLite host checkpoints and deletes its -wal/-shm files on the way out.
+    // A snapshot taken in that window lists files that then vanish (ENOENT)
+    // or copies a database mid-checkpoint. Capture the pid first and wait
+    // for the process itself to be gone.
+    const printed = env.runner.tryRun('launchctl', ['print', `gui/${env.uid}/${handle.name}`]);
+    const pidMatch = printed.ok ? /^\s*pid = (\d+)\s*$/m.exec(printed.stdout) : null;
+    const pid = pidMatch ? Number(pidMatch[1]) : undefined;
     try {
       env.runner.run('launchctl', ['bootout', `gui/${env.uid}/${handle.name}`]);
     } catch (err) {
@@ -198,6 +230,7 @@ export async function stopService(handle: ServiceHandle, env: ServiceEnvironment
       if (/No such process/i.test(err instanceof Error ? err.message : String(err))) return;
       if (env.runner.tryRun('launchctl', ['print', `gui/${env.uid}/${handle.name}`]).ok) throw err;
     }
+    if (pid !== undefined) await waitForProcessExit(pid, env);
   } else if (handle.mode === 'systemd-user') {
     env.runner.run('systemctl', ['--user', 'stop', handle.name!]);
   } else if (handle.mode === 'systemd-system') {

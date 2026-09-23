@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -143,9 +143,7 @@ describe('service-mode detection and control', () => {
 
     const detected = detectService(root, env);
     expect(detected).toMatchObject({ mode: 'launchd', active: true, name: 'com.nanoclaw', definition: plist });
-    expect(calls).toContain(
-      `/usr/libexec/PlistBuddy -c Print :WorkingDirectory ${plist}`,
-    );
+    expect(calls).toContain(`/usr/libexec/PlistBuddy -c Print :WorkingDirectory ${plist}`);
   });
 
   it('restarts a WSL/nohup install through its recorded start script', () => {
@@ -166,9 +164,29 @@ describe('service-mode detection and control', () => {
 
     await expect(stopService({ mode: 'launchd', active: true, name: 'com.nanoclaw' }, env)).resolves.toBeUndefined();
     expect(calls).toEqual([
+      'launchctl print gui/1000/com.nanoclaw',
       'launchctl bootout gui/1000/com.nanoclaw',
       'launchctl print gui/1000/com.nanoclaw',
     ]);
+  });
+
+  it('waits for the launchd host process to exit after bootout', async () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 300)']);
+    const { env } = makeEnv('darwin', {
+      'launchctl print gui/1000/com.nanoclaw': { ok: true, stdout: `\tpid = ${child.pid}\n` },
+    });
+    const sleep = env.sleep;
+    let slept = 0;
+    env.sleep = async (ms) => {
+      slept += 1;
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      await sleep(ms);
+    };
+
+    await stopService({ mode: 'launchd', active: true, name: 'com.nanoclaw' }, env);
+
+    expect(slept).toBeGreaterThan(0);
+    expect(() => process.kill(child.pid!, 0)).toThrow();
   });
 
   it('refuses to mutate under an unmanaged pnpm-dev process', async () => {
