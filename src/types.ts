@@ -9,6 +9,14 @@ export interface AgentGroup {
   created_at: string;
 }
 
+/**
+ * A provider-declared speed tier name (`inference.speedTiers` on the provider's
+ * host contract; `standard` | `fast` for Claude). Validated at `ncl groups
+ * config update --speed` time against the group's provider, then stored and
+ * passed through by core as an opaque token.
+ */
+export type ContainerSpeed = string;
+
 /** Per-agent-group container runtime config. Source of truth in the DB;
  *  materialized to `groups/<folder>/container.json` at spawn time. */
 export interface ContainerConfigRow {
@@ -30,6 +38,7 @@ export interface ContainerConfigRow {
   /** JSON array of provider names, or NULL to derive from instance default. Added by migration 021. */
   provider_chain: string | null;
   timezone: string | null; // IANA id; NULL = follow the install-global timezone
+  speed: ContainerSpeed | null; // NULL = install/provider default
   /**
    * Session isolation tier ('container' | 'vm') — see SessionSpec.runtimeTier.
    * Optional on the TS type because the trunk schema does not carry the
@@ -245,7 +254,7 @@ export interface PendingApproval {
   instance: string | null;
   platform_message_id: string | null;
   /**
-   * For OneCLI credential rows, the gateway's request TTL. For a module
+   * For gateway approval rows, the provider request TTL. For a module
    * approval held by "Reject with reason…", the deadline after which the
    * host sweep finalizes a plain reject (set by markApprovalAwaitingReason).
    */

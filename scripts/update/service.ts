@@ -10,34 +10,44 @@ import { getInstallSlug } from '../../src/install-slug.js';
 // report). Keep the controller's captured output bounded, but large enough
 // that a successful validation is not misreported as ENOBUFS.
 const MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024;
+export interface RunOptions {
+  /** Kill the subprocess and fail the call after this long. Unset = no bound. */
+  timeoutMs?: number;
+}
 
 export interface CommandRunner {
-  run(command: string, args: string[], cwd?: string): string;
-  tryRun(command: string, args: string[], cwd?: string): { ok: boolean; stdout: string };
+  run(command: string, args: string[], cwd?: string, options?: RunOptions): string;
+  tryRun(command: string, args: string[], cwd?: string, options?: RunOptions): { ok: boolean; stdout: string };
 }
 
 export function createCommandRunner(): CommandRunner {
-  const run = (command: string, args: string[], cwd?: string): string =>
+  const run = (command: string, args: string[], cwd?: string, options?: RunOptions): string =>
     execFileSync(command, args, {
       cwd,
       encoding: 'utf8',
       maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
       stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: options?.timeoutMs,
+      // Node's default maxBuffer is 1 MiB; a full vitest run on a large repo
+      // exceeds it and the whole validate step dies as `spawnSync pnpm
+      // ENOBUFS` with the tests never judged. 64 MiB is far above any real
+      // build/test output while still bounding a runaway.
+      maxBuffer: 64 * 1024 * 1024,
     }).trim();
   return {
     run,
-    tryRun(command, args, cwd) {
+    tryRun(command, args, cwd, options) {
       try {
-        return { ok: true, stdout: run(command, args, cwd) };
+        return { ok: true, stdout: run(command, args, cwd, options) };
       } catch (err) {
-        const failed = err as { stdout?: Buffer | string; stderr?: Buffer | string };
-        return {
-          ok: false,
-          stdout: [failed.stdout, failed.stderr]
-            .map((part) => part?.toString().trim())
-            .filter(Boolean)
-            .join('\n'),
-        };
+        const failed = err as { code?: string; stdout?: Buffer | string; stderr?: Buffer | string };
+        const output = [failed.stdout, failed.stderr]
+          .map((part) => part?.toString().trim())
+          .filter(Boolean)
+          .join('\n');
+        // A timed-out or unspawnable command has no output of its own; the
+        // error code (ETIMEDOUT, ENOENT) is the only thing worth reporting.
+        return { ok: false, stdout: output || (failed.code ? String(failed.code) : '') };
       }
     },
   };
@@ -59,6 +69,8 @@ export interface ServiceEnvironment {
   uid: number;
   runner: CommandRunner;
   sleep(ms: number): Promise<void>;
+  /** Progress line for a wait the operator would otherwise read as a hang. */
+  log?(message: string): void;
 }
 
 export function defaultServiceEnvironment(runner = createCommandRunner()): ServiceEnvironment {
@@ -68,6 +80,8 @@ export function defaultServiceEnvironment(runner = createCommandRunner()): Servi
     uid: process.getuid?.() ?? 0,
     runner,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // stderr: stdout carries the controller's JSON result.
+    log: (message) => process.stderr.write(`[update] ${message}\n`),
   };
 }
 
@@ -161,6 +175,17 @@ export function detectService(projectRoot: string, env: ServiceEnvironment): Ser
   return { mode: 'none', active: false };
 }
 
+/**
+ * Idempotent per mode: stopping an already-stopped service is success, in the
+ * service manager's own vocabulary — `launchctl bootout` fails a not-loaded
+ * job with "No such process", `process.kill` raises ESRCH, and `systemctl
+ * stop` of a stopped-but-loaded unit already exits 0. The rollback path stops
+ * a handle captured before cutover (which stopped the service itself), so
+ * without this the restore died on its own stop and left the live checkout on
+ * the target commit with the service down. Any OTHER stop failure still
+ * throws: a service that is genuinely still running must abort the caller
+ * before anything is destroyed.
+ */
 export async function stopService(handle: ServiceHandle, env: ServiceEnvironment): Promise<void> {
   if (!handle.active) return;
   if (handle.mode === 'launchd') {
@@ -173,7 +198,12 @@ export async function stopService(handle: ServiceHandle, env: ServiceEnvironment
   } else if (handle.mode === 'systemd-system') {
     env.runner.run('systemctl', ['stop', handle.name!]);
   } else if (handle.mode === 'nohup' && handle.pid) {
-    process.kill(handle.pid, 'SIGTERM');
+    try {
+      process.kill(handle.pid, 'SIGTERM');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err;
+      return;
+    }
     for (let i = 0; i < 60 && processExists(handle.pid); i += 1) await env.sleep(500);
     if (processExists(handle.pid)) throw new Error(`NanoClaw process ${handle.pid} did not stop`);
   } else if (handle.mode === 'unmanaged') {
@@ -197,20 +227,81 @@ export function startService(handle: ServiceHandle, projectRoot: string, env: Se
   }
 }
 
-export async function drainContainers(
-  projectRoot: string,
-  env: ServiceEnvironment,
-  timeoutMs = 300_000,
-): Promise<void> {
+/**
+ * Grace between cutover's `stop` and the runtime's SIGKILL. Longer than the
+ * host's own 1 s (`STOP_GRACE_SECONDS` in container-runner.ts): a customized
+ * image that does handle SIGTERM gets a real window to flush, and a stock one
+ * that ignores it costs nothing extra beyond these seconds.
+ */
+export const CUTOVER_STOP_GRACE_SECONDS = 10;
+
+/**
+ * Bound on the `docker stop` CLI call itself. `-t` only bounds how long the
+ * container gets before the daemon SIGKILLs it; a daemon that never answers
+ * would otherwise block the (synchronous) call forever, and cutover would sit
+ * with the service down and never reach its rollback path. Comfortably above
+ * the grace so a healthy stop is never cut short.
+ */
+export const CUTOVER_STOP_CLI_TIMEOUT_MS = 30_000;
+
+/** Bound on each `docker ps` poll, for the same reason. */
+export const CUTOVER_LIST_CLI_TIMEOUT_MS = 15_000;
+
+/**
+ * Stop this install's containers, then wait until the runtime lists none.
+ *
+ * The host is the only thing that ever stops an idle agent container: it keeps
+ * them alive between turns by design, and its SIGTERM path leaves them running
+ * so the next start can adopt them. `cutoverUpdate` stops the host before
+ * calling this, so a poll-only drain waited on an exit nothing could produce
+ * and timed out five minutes later with the service already down (#3828).
+ *
+ * Stopping here, after the service is down, is race-free: nothing is left that
+ * could spawn a replacement (the manual `docker stop` before cutover was not).
+ * The filter is the install label alone — the set the host's own residue
+ * reaping and `setup/uninstall` act on: agent containers plus any per-session
+ * auxiliary. The OneCLI gateway is a separate compose project without this
+ * label and is never touched.
+ *
+ * A container mid-turn is stopped as well. The agent-runner has no SIGTERM
+ * handler and the controller cannot read turn state from outside the host
+ * DB, so waiting would not preserve the turn, and the update rebuilds the
+ * image that container came from anyway. A non-zero `stop` is not fatal on
+ * its own (a container that exited between the list and the stop makes
+ * `docker stop` fail for that id while the rest still stop); only a
+ * container still listed at the timeout is, and the caller restores the old
+ * service.
+ */
+export async function drainContainers(projectRoot: string, env: ServiceEnvironment, timeoutMs = 60_000): Promise<void> {
   const runtime = process.env.CONTAINER_RUNTIME ?? 'docker';
   const label = `nanoclaw-install=${getInstallSlug(projectRoot)}`;
+  const list = (): { ok: boolean; ids: string[] } => {
+    const listed = env.runner.tryRun(runtime, ['ps', '-q', '--filter', `label=${label}`], undefined, {
+      timeoutMs: CUTOVER_LIST_CLI_TIMEOUT_MS,
+    });
+    return { ok: listed.ok, ids: listed.stdout.split('\n').filter(Boolean) };
+  };
+  const initial = list();
+  if (!initial.ok) throw new Error(`Cannot inspect active NanoClaw containers with ${runtime}`);
+  if (initial.ids.length === 0) return;
+
+  // One deadline for stop AND poll: the clock starts before the stop call, so
+  // a slow or stalled stop eats into the bound instead of extending it.
   const started = Date.now();
+  env.log?.(`Stopping ${initial.ids.length} NanoClaw container(s) for cutover: ${initial.ids.join(', ')}`);
+  const stopped = env.runner.tryRun(
+    runtime,
+    ['stop', '-t', String(CUTOVER_STOP_GRACE_SECONDS), ...initial.ids],
+    undefined,
+    { timeoutMs: CUTOVER_STOP_CLI_TIMEOUT_MS },
+  );
   while (true) {
-    const listed = env.runner.tryRun(runtime, ['ps', '-q', '--filter', `label=${label}`]);
-    if (!listed.ok) throw new Error(`Cannot inspect active NanoClaw containers with ${runtime}`);
-    if (!listed.stdout) return;
+    const current = list();
+    if (!current.ok) throw new Error(`Cannot inspect active NanoClaw containers with ${runtime}`);
+    if (current.ids.length === 0) return;
     if (Date.now() - started >= timeoutMs) {
-      throw new Error(`Timed out waiting for active NanoClaw containers: ${listed.stdout.split('\n').join(', ')}`);
+      const detail = stopped.ok ? '' : ` (${runtime} stop failed: ${stopped.stdout || 'no output'})`;
+      throw new Error(`Timed out waiting for NanoClaw containers to stop: ${current.ids.join(', ')}${detail}`);
     }
     await env.sleep(1_000);
   }

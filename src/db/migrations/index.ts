@@ -26,8 +26,10 @@ import { migration021 as migration021ProviderChain } from './021-provider-chain.
 import { migration021 } from './021-approval-question.js';
 import { migration022 } from './022-messaging-group-detached.js';
 import { migration023 } from './023-approvals-instance.js';
-import { migration024 } from './024-wiring-thread-filter.js';
-import { migration025 } from './025-destination-thread.js';
+import { migration024 as migration024WiringThreadFilter } from './024-wiring-thread-filter.js';
+import { migration025 as migration025DestinationThread } from './025-destination-thread.js';
+import { migration024 } from './024-host-coordination.js';
+import { migration025 } from './025-container-config-speed.js';
 
 interface MigrationBase {
   version: number;
@@ -95,6 +97,8 @@ export const migrations: Migration[] = [
   migration021,
   migration022,
   migration023,
+  migration024WiringThreadFilter,
+  migration025DestinationThread,
   migration024,
   migration025,
 ];
@@ -208,8 +212,13 @@ async function applyMigration(db: DbDriver, migration: Migration): Promise<void>
   // no-op inside one); foreign_key_check runs INSIDE so a violating
   // recreate rolls back atomically with nothing committed.
   if (disableForeignKeys) raw!.pragma('foreign_keys = OFF');
+  let applied = false;
   try {
-    await db.transaction(async () => {
+    applied = await db.transaction(async () => {
+      // Another process may have migrated since we selected the pending list.
+      // SQLite's BEGIN IMMEDIATE holds the write lock for this recheck and up().
+      if (await db.get('SELECT name FROM schema_version WHERE name = ?', migration.name)) return false;
+
       // Snapshot violations BEFORE up() runs: live DBs can carry latent
       // FK orphans. A migration must fail only for violations it introduces.
       const preexisting = disableForeignKeys
@@ -239,9 +248,10 @@ async function applyMigration(db: DbDriver, migration: Migration): Promise<void>
         migration.name,
         new Date().toISOString(),
       );
+      return true;
     });
   } finally {
     if (disableForeignKeys) raw!.pragma('foreign_keys = ON');
   }
-  log.info('Migration applied', { name: migration.name });
+  if (applied) log.info('Migration applied', { name: migration.name });
 }

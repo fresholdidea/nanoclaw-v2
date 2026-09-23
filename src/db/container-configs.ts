@@ -14,6 +14,7 @@ const SCALAR_COLUMNS = new Set([
   'enable_opencode_tooling',
   'provider_chain',
   'timezone',
+  'speed',
 ]);
 const JSON_COLUMNS = new Set([
   'skills',
@@ -39,12 +40,12 @@ export async function createContainerConfig(config: ContainerConfigRow): Promise
         agent_group_id, provider, model, effort, image_tag, assistant_name,
         max_messages_per_prompt, skills, mcp_servers, packages_apt, packages_npm,
         additional_mounts, cli_scope, enable_agy_tooling, enable_opencode_tooling,
-        provider_chain, timezone, updated_at
+        provider_chain, timezone, speed, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @skills, @mcp_servers, @packages_apt, @packages_npm,
         @additional_mounts, @cli_scope, @enable_agy_tooling, @enable_opencode_tooling,
-        @provider_chain, @timezone, @updated_at
+        @provider_chain, @timezone, @speed, @updated_at
       )`,
     config,
   );
@@ -101,6 +102,7 @@ export async function updateContainerConfigScalars(
       | 'enable_opencode_tooling'
       | 'provider_chain'
       | 'timezone'
+      | 'speed'
     >
   >,
 ): Promise<void> {

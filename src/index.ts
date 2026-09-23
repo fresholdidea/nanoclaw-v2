@@ -9,14 +9,23 @@ import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { CENTRAL_DB_PATH, PROJECT_ROOT } from './config.js';
 import { rotateHostLogs } from './log-rotate.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
-import { adoptRunningSessions } from './container-runner.js';
+import {
+  abortGatewaySessionObservers,
+  adoptRunningSessions,
+  resumeGatewaySessionAdmission,
+  stopGatewaySessionsForUnavailability,
+} from './container-runner.js';
 import { closeDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
+import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { migrateLegacyTaskSeries } from './modules/scheduling/migrate-legacy.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
+import { startGatewayApprovalCoordinator, stopGatewayApprovalCoordinator } from './gateway-approval-coordinator.js';
+import { startGatewayAvailabilityMonitor } from './gateway-availability.js';
+import { getGatewayProvider } from './gateway-providers/index.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { readEnvFile } from './env.js';
@@ -62,6 +71,8 @@ import {
   createChannelDeliveryAdapter,
 } from './channels/channel-registry.js';
 
+let stopGatewayAvailabilityMonitor: (() => void) | undefined;
+
 async function main(): Promise<void> {
   // Bound the launchd-captured logs before anything else writes to them.
   for (const copy of rotateHostLogs(path.join(PROJECT_ROOT, 'logs'))) log.info('Rotated host log', { copy });
@@ -74,6 +85,9 @@ async function main(): Promise<void> {
   // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
   enforceUpgradeTripwire();
 
+  // Select once and fail before serving if the configured package is absent.
+  const gatewayProvider = getGatewayProvider();
+
   // 1. Init central DB
   const db = await initDb(CENTRAL_DB_PATH, { role: 'host' });
   await runMigrations(db, undefined, { mode: 'auto' });
@@ -84,11 +98,13 @@ async function main(): Promise<void> {
   if (db.dialect === 'sqlite') await backfillContainerConfigs();
   else log.info('Skipping local container.json backfill for non-local central DB');
 
-  // 2. Session runtime: prove it is reachable, then reconcile what survived a
-  // restart. Adoption replaces the old reap-everything cleanup — a session that
-  // is still running keeps running, and only true orphans are stopped.
+  // Prepare the runtime; inbound routing waits until approval health and adoption are ready.
   await getSessionDriver().ensureReady?.();
-  await adoptRunningSessions();
+  await startHostInstanceLease();
+  let releaseInbound!: () => void;
+  const inboundReady = new Promise<void>((resolve) => {
+    releaseInbound = resolve;
+  });
 
   // 2b. Move legacy task series (living in chat/system sessions, where
   // group-scoped `ncl tasks` can't see them) into per-series task sessions.
@@ -97,37 +113,43 @@ async function main(): Promise<void> {
   // polls, and the sweep (nothing else touches session DBs during the move).
   await migrateLegacyTaskSeries();
 
-  // 3. Channel adapters
+  // 2. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
-        routeInbound({
-          channelType: adapter.channelType,
-          // The one host-side stamping seam: adapters stay instance-blind,
-          // the host stamps the receiving instance on every inbound event.
-          instance: adapter.instance ?? adapter.channelType,
-          platformId,
-          threadId,
-          message: {
-            id: message.id,
-            kind: message.kind,
-            content: JSON.stringify(message.content),
-            timestamp: message.timestamp,
-            isMention: message.isMention,
-            isGroup: message.isGroup,
-          },
-        }).catch((err) => {
-          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
-        });
+        inboundReady
+          .then(() =>
+            routeInbound({
+              channelType: adapter.channelType,
+              // The one host-side stamping seam: adapters stay instance-blind,
+              // the host stamps the receiving instance on every inbound event.
+              instance: adapter.instance ?? adapter.channelType,
+              platformId,
+              threadId,
+              message: {
+                id: message.id,
+                kind: message.kind,
+                content: JSON.stringify(message.content),
+                timestamp: message.timestamp,
+                isMention: message.isMention,
+                isGroup: message.isGroup,
+              },
+            }),
+          )
+          .catch((err) => {
+            log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+          });
       },
       onInboundEvent(event) {
-        routeInbound(event).catch((err) => {
-          log.error('Failed to route inbound event', {
-            sourceAdapter: adapter.channelType,
-            targetChannelType: event.channelType,
-            err,
+        inboundReady
+          .then(() => routeInbound(event))
+          .catch((err) => {
+            log.error('Failed to route inbound event', {
+              sourceAdapter: adapter.channelType,
+              targetChannelType: event.channelType,
+              err,
+            });
           });
-        });
       },
       onMetadata(platformId, name, isGroup) {
         log.info('Channel metadata discovered', {
@@ -137,17 +159,16 @@ async function main(): Promise<void> {
           isGroup,
         });
       },
-      onAction(questionId, selectedOption, userId) {
+      onAction(questionId, selectedOption, userId, address) {
         dispatchResponse({
           questionId,
           value: selectedOption,
           userId,
           channelType: adapter.channelType,
-          // platformId/threadId aren't surfaced by the current onAction
-          // signature — registered handlers look them up from the
-          // pending_question / pending_approval row.
-          platformId: '',
-          threadId: null,
+          instance: address?.instance ?? adapter.instance ?? adapter.channelType,
+          messageId: address?.messageId,
+          platformId: address?.platformId ?? '',
+          threadId: address?.threadId ?? null,
         }).catch((err) => {
           log.error('Failed to handle question response', { questionId, err });
         });
@@ -155,26 +176,41 @@ async function main(): Promise<void> {
     };
   });
 
-  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
+  // 3. Delivery adapter bridge — dispatches to channel adapters by EXACT
   // registry key (instance ?? channelType): a named instance with an
   // offline adapter is never rerouted through a sibling bot. See
   // createChannelDeliveryAdapter in channels/channel-registry.ts.
-  setDeliveryAdapter(createChannelDeliveryAdapter());
+  const deliveryAdapter = createChannelDeliveryAdapter();
+  setDeliveryAdapter(deliveryAdapter);
 
-  // 5. Start registered host modules. Imports only registered callbacks; the
+  // 4. Core starts the selected gateway's normalized approval subscription
+  // only after persistence and delivery are ready.
+  await startGatewayApprovalCoordinator(gatewayProvider, deliveryAdapter, stopGatewaySessionsForUnavailability, {
+    onAvailable: resumeGatewaySessionAdmission,
+    waitUntilReady: true,
+  });
+  stopGatewayAvailabilityMonitor = await startGatewayAvailabilityMonitor(
+    gatewayProvider,
+    stopGatewaySessionsForUnavailability,
+    resumeGatewaySessionAdmission,
+  );
+  await adoptRunningSessions();
+  releaseInbound();
+
+  // 6. Start registered host modules. Imports only registered callbacks; the
   // actual work begins here, after DB + delivery are ready and before polls.
-  await startHostModules({ db, signal: hostAbortController.signal });
+  await startHostModules({ db, deliveryAdapter, signal: hostAbortController.signal });
 
   // 6. Start delivery polls
   startActiveDeliveryPoll();
   startSweepDeliveryPoll();
   log.info('Delivery polls started');
 
-  // 7. Start host sweep
+  // 8. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7a. Dashboard (optional)
+  // 8a. Dashboard (optional)
   const dashboardEnv = readEnvFile(['DASHBOARD_SECRET', 'DASHBOARD_PORT']);
   const dashboardSecret = process.env.DASHBOARD_SECRET || dashboardEnv.DASHBOARD_SECRET;
   const dashboardPort = parseInt(process.env.DASHBOARD_PORT || dashboardEnv.DASHBOARD_PORT || '3100', 10);
@@ -191,7 +227,7 @@ async function main(): Promise<void> {
     log.info('Dashboard disabled (no DASHBOARD_SECRET)');
   }
 
-  // 7b. mnemon sync — snapshot refresh + container write-queue replay.
+  // 8b. mnemon sync — snapshot refresh + container write-queue replay.
   // No-ops (with a log line) when no ~/.mnemon store exists.
   try {
     const { startMnemonSync } = await import('./mnemon-sync.js');
@@ -200,7 +236,7 @@ async function main(): Promise<void> {
     log.error('Failed to start mnemon sync', { err });
   }
 
-  // 8. Start the `ncl` CLI socket server (data/ncl.sock).
+  // 9. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
   log.info('NanoClaw running');
@@ -224,7 +260,12 @@ async function shutdown(signal: string): Promise<void> {
     /* ignore if not started */
   }
   hostAbortController.abort();
+  stopGatewayAvailabilityMonitor?.();
+  await stopGatewayApprovalCoordinator();
+  await abortGatewaySessionObservers();
   await stopHostModules();
+  // Stamp the durable stop before the DB closes below.
+  await stopHostInstanceLease();
   stopDeliveryPolls();
   stopHostSweep();
   await stopCliServer();

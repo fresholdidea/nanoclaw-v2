@@ -69,6 +69,7 @@ export async function backfillContainerConfigs(): Promise<void> {
       enable_opencode_tooling: 0,
       provider_chain: null,
       timezone: null,
+      speed: null,
       updated_at: new Date().toISOString(),
     };
 
