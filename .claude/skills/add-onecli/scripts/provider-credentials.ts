@@ -273,8 +273,8 @@ export function encodeOneCliValue(target: GatewayCredentialTarget, value: string
   if (typeof value === 'string' || value.profile !== target.oauth.profile) {
     throw new Error(`This connection stores the ${target.oauth.profile} OAuth profile.`);
   }
-  // NanoClaw's pinned OneCLI cannot refresh this record on its own; see
-  // .claude/skills/add-opencode/ONECLI-LEGACY.md for the manual procedure.
+  // OneCLI 1.43.1+ refreshes this record itself; 1.41.0–1.43.0 (incl. the skill's 1.41.0 pin) omit
+  // client_id and can't, so reauthenticate manually: .claude/skills/add-opencode/ONECLI-LEGACY.md.
   return JSON.stringify({
     tokens: {
       access_token: value.accessToken,

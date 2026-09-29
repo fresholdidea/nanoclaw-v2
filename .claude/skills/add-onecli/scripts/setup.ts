@@ -19,6 +19,7 @@ import { fileURLToPath } from 'url';
 
 import { log } from '../../../../src/log.js';
 import { emitStatus } from '../../../../setup/status.js';
+import { gatewayVersionForInstall } from './gateway-version.js';
 
 const LOCAL_BIN = path.join(os.homedir(), '.local', 'bin');
 
@@ -104,16 +105,17 @@ function writeEnvOnecliUrl(url: string): void {
   writeEnvVar('ONECLI_URL', url);
 }
 
-// The SANCTIONED gateway version: fresh installs pin to it. Upgrading an
-// existing gateway is NOT done here — the gateway is a separate out-of-band
-// component, and the migrator is the user's coding agent following
-// docs/onecli-upgrades.md during /update-nanoclaw. The pin lives in
-// versions.json ("onecli-gateway") so that flow can diff it across updates and
-// route the agent to the doc; bump it there deliberately on a new release.
+// The SANCTIONED gateway version: fresh installs pin to it, except that a newer
+// (or unpinned) ONECLI_VERSION already in ~/.onecli/.env is kept instead — setup
+// never downgrades the gateway (gateway-version.ts). Upgrading an existing
+// gateway is NOT done here — the gateway is a separate out-of-band component,
+// and the migrator is the user's coding agent following docs/onecli-upgrades.md
+// when an update moves the pin. The pin lives in this skill's versions.json
+// ("onecli-gateway"); bump it there deliberately on a new release.
 const pins = JSON.parse(
   fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'versions.json'), 'utf8'),
 ) as Record<string, string>;
-const ONECLI_GATEWAY_VERSION = pins['onecli-gateway'];
+const ONECLI_GATEWAY_VERSION = gatewayVersionForInstall(pins['onecli-gateway']);
 // The CLI binary follows the same convention: installed at its pin
 // ("onecli-cli" in versions.json), never at whatever "latest" means today.
 const ONECLI_CLI_VERSION = pins['onecli-cli'];

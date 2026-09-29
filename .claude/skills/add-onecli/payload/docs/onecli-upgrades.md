@@ -1,32 +1,43 @@
 # Upgrading the OneCLI gateway
 
-NanoClaw talks to the OneCLI gateway (credential vault + egress proxy) through `@onecli-sh/sdk`. The gateway is an external component with its own release line, so NanoClaw pins the **sanctioned gateway version** in [`versions.json`](../versions.json) under `onecli-gateway`. When an update moves that pin, the gateway must be upgraded — this doc is the migration path. It is written to be handed to a coding agent verbatim: detect → upgrade → verify → rollback.
+NanoClaw talks to the OneCLI gateway (credential vault + egress proxy) through `@onecli-sh/sdk`. The gateway is an external component with its own release line, so NanoClaw pins the **sanctioned gateway version** in [`.claude/skills/add-onecli/versions.json`](../.claude/skills/add-onecli/versions.json) under `onecli-gateway`. When an update moves that pin above the version you run, the gateway must be upgraded — this doc is the migration path. A gateway already at or above the pin stays where it is: **never downgrade it**. It is written to be handed to a coding agent verbatim: detect → upgrade → verify → rollback.
 
-There is deliberately **no runtime version check, and setup does not migrate the gateway for you**: the gateway is a separate out-of-band component, and the migrator is your coding agent running `/update-nanoclaw` — it diffs `versions.json` across the update and routes you here when the `onecli-gateway` pin moved. (Setup detects a pre-`/v1` gateway and points at this doc, but never upgrades it.) Run the steps below verbatim.
+There is deliberately **no runtime version check, and setup does not migrate the gateway for you**: the gateway is a separate out-of-band component, and the migrator is your coding agent running `/update-nanoclaw` — follow this doc when the update's changed files include that `versions.json` with a new `onecli-gateway` pin. (Setup detects a pre-`/v1` gateway and points at this doc, but never upgrades it; a fresh install never replaces a newer or unpinned `ONECLI_VERSION` in `~/.onecli/.env` with the pin.) Run the steps below verbatim.
 
 ## 1. Detect
 
 Find out what is running and what is required:
 
 ```bash
-cat versions.json                                   # the sanctioned pin
-curl -s http://127.0.0.1:10254/api/health           # liveness check; `version` field is typically "unknown", not the gateway version
+jq -r '."onecli-gateway"' .claude/skills/add-onecli/versions.json   # the sanctioned pin
+onecli version | jq -r .server_version                              # the running gateway version
+grep '^ONECLI_VERSION=' ~/.onecli/.env                              # what the next `docker compose up` starts
 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10254/v1/health
 ```
 
-If the last command prints `404`, the server predates the `/v1` API that `@onecli-sh/sdk` 2.x requires — every SDK call will fail with 404s that look transient but are permanent. If your gateway is remote, substitute its host for `127.0.0.1` (it's `ONECLI_URL` in `.env`; `NANOCLAW_ONECLI_API_HOST` is a setup-time override only, not persisted to `.env`).
+If `server_version` prints `null` or an error, the gateway did not answer; `docker inspect -f '{{.Config.Image}}' onecli` shows the tag it was started from. If the last command prints `404`, the server predates the `/v1` API that `@onecli-sh/sdk` 2.x requires — every SDK call will fail with 404s that look transient but are permanent. If your gateway is remote, substitute its host for `127.0.0.1` (it's `ONECLI_URL` in `.env`; `NANOCLAW_ONECLI_API_HOST` is a setup-time override only, not persisted to `.env`).
+
+**Never downgrade.** The target version is the pin, raised to **1.43.1** when the vault holds a ChatGPT/Codex OAuth credential — OneCLI 1.41.0–1.43.0 omit `client_id` when refreshing it, so Codex groups stop authenticating once their token expires. This counts such credentials (above `0` means the floor applies; ask the API, because `onecli secrets list` returns only 20 rows unless given `--max`):
+
+```bash
+curl -s http://127.0.0.1:10254/v1/secrets | jq '[.[] | select(.type == "openai")] | length'
+```
+
+If the running `server_version` is already at or above the target, stop here and change nothing — a pin older than your gateway only means the pin lags behind it (if `/update-nanoclaw` sent you here, the requirement is satisfied and there is nothing to roll back). No step below, rollback included, may take a gateway holding such a credential under 1.43.1.
 
 Why gateways fall behind: the OneCLI installer's docker-compose tracks the `latest` image tag, but Docker never re-pulls a tag — the server freezes at whatever `latest` meant on install day.
 
 ## 2. Upgrade
 
-The gateway runs as a Docker service in `~/.onecli`. Upgrade just that container to the pinned `onecli-gateway` version — vault data lives in named Docker volumes and survives. This upgrades only the gateway; the CLI binary is pinned separately (see below).
+The gateway runs as a Docker service in `~/.onecli`. Upgrade just that container to the target version from Detect — vault data lives in named Docker volumes and survives. This upgrades only the gateway; the CLI binary is pinned separately (see below).
 
 **Local gateway (the common case):**
 
 ```bash
-cd ~/.onecli && ONECLI_VERSION=<onecli-gateway pin from versions.json> docker compose pull onecli && ONECLI_VERSION=<onecli-gateway pin from versions.json> docker compose up -d
+cd ~/.onecli && ONECLI_VERSION=<target version from Detect> docker compose pull onecli && ONECLI_VERSION=<target version from Detect> docker compose up -d
 ```
+
+Then set `ONECLI_VERSION=<target version>` in `~/.onecli/.env` (add the line if it is missing): compose reads that file on every later `up`, and setup treats it as the installed version, so a stale value there brings the old gateway back.
 
 **Remote gateway** — run the same command on the gateway's host (NanoClaw can't reach it over SSH).
 
@@ -45,7 +56,7 @@ docker run --rm --add-host=host.docker.internal:host-gateway \
   curlimages/curl -s -o /dev/null -w '%{http_code}' http://host.docker.internal:10254/v1/health
 ```
 
-This must print `200`. If it can't connect while the host-side check passed, set the bind address in `~/.onecli/.env` to the docker-bridge IP (or `0.0.0.0` on a host with a closed firewall) and `cd ~/.onecli && ONECLI_VERSION=<onecli-gateway pin from versions.json> docker compose up -d`. Symptom if skipped: host log clean, agents fail all API calls.
+This must print `200`. If it can't connect while the host-side check passed, set the bind address (`ONECLI_BIND_HOST`) in `~/.onecli/.env` to the docker-bridge IP (or `0.0.0.0` on a host with a closed firewall), make sure `ONECLI_VERSION` there is the running `server_version`, and recreate the gateway at that version — never the pin: `cd ~/.onecli && ONECLI_VERSION=$(onecli version | jq -r .server_version) docker compose up -d`. Symptom if skipped: host log clean, agents fail all API calls.
 
 Finally, restart the NanoClaw service (per-install names — derive with `setup/lib/install-slug.sh`):
 
@@ -62,11 +73,13 @@ source setup/lib/install-slug.sh && systemctl --user restart $(systemd_unit)
 cd ~/.onecli && ONECLI_VERSION=<old-version> docker compose up -d
 ```
 
+`<old-version>` is the `server_version` Detect showed before the upgrade — never anything older, and never under the 1.43.1 floor where it applies. Put it back in `~/.onecli/.env` too.
+
 If the NanoClaw update itself is being rolled back, also pin `@onecli-sh/sdk` back to its previous version in `package.json` and run `pnpm install`. Vault data is unaffected in both directions.
 
 ## The CLI binary (`onecli-cli` pin)
 
-The `onecli` host CLI is pinned the same way, under `onecli-cli` in `versions.json`. Setup installs exactly that version by direct release download — it never resolves "latest". When an update moves this pin, replace the binary with the pinned release:
+The `onecli` host CLI is pinned the same way, under `onecli-cli` in the same `versions.json`. Setup installs exactly that version by direct release download — it never resolves "latest". When an update moves this pin, replace the binary with the pinned release:
 
 ```bash
 onecli version                                              # detect: what is installed
