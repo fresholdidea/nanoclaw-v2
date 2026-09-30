@@ -17,7 +17,7 @@ import { getUserRoles, getAdminsOfAgentGroup } from './modules/permissions/db/us
 import { getUserDmsForUser } from './modules/permissions/db/user-dms.js';
 import { getActiveAdapters, getRegisteredChannelNames } from './channels/channel-registry.js';
 import { DATA_DIR, ASSISTANT_NAME } from './config.js';
-import { configFromDb } from './container-config.js';
+import { configFromDb, redactMcpServerSecrets } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getDb } from './db/connection.js';
 import { log } from './log.js';
@@ -181,14 +181,17 @@ async function collectAgentGroups() {
       g.id,
     );
     const row = await getContainerConfig(g.id);
+    const config = row ? configFromDb(row, g) : undefined;
 
     result.push({
       id: g.id,
       name: g.name,
       folder: g.folder,
       agent_provider: g.agent_provider,
-      container_config: row
-        ? configFromDb(row, g)
+      // The dashboard serves this snapshot back as JSON and only lists server
+      // names; MCP env/header values are credentials and stay on the host.
+      container_config: config
+        ? { ...config, mcpServers: redactMcpServerSecrets(config.mcpServers) }
         : { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' as const },
       sessionCount: sessions.length,
       runningSessions: running.length,
