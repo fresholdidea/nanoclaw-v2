@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { GatewayApprovalRequest, GatewaySessionInput } from './gateway-provider-registry.js';
 
@@ -46,6 +46,13 @@ vi.mock('../config.js', async (original) => ({
 vi.mock('../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
+// onecli.ts prefers process.env over .env for every key it reads, mostly at
+// import, so clear them before it loads: a Claude Code shell exports
+// ANTHROPIC_BASE_URL, which would otherwise override the fake .env below.
+vi.hoisted(() => {
+  const keys = ['ONECLI_URL', 'ONECLI_API_KEY', 'ONECLI_GATEWAY_CONTAINER', 'ANTHROPIC_BASE_URL', 'ONECLI_CONSOLE_URL'];
+  for (const key of keys) vi.stubEnv(key, undefined);
+});
 vi.mock('../env.js', () => ({
   readEnvFile: () => ({
     ONECLI_URL: 'http://localhost:1',
@@ -78,6 +85,8 @@ afterEach(() => {
   vi.useRealTimers();
   fs.rmSync('/tmp/nanoclaw-onecli-adapter-review', { recursive: true, force: true });
 });
+
+afterAll(() => vi.unstubAllEnvs());
 
 describe('OneCLI gateway package', () => {
   it.each(['copy-a', 'copy-b'])('leaves foreign requests untouched by the real SDK poller: %s', async (owned) => {
