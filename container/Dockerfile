@@ -70,9 +70,12 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # ---- mnemon — persistent agent memory ----------------------------------------
-# Shared store across host CC and all nanoclaw groups. The host mounts
-# ~/.mnemon (RW) at /workspace/extra/mnemon via each group's container.json
-# `additionalMounts`, and MNEMON_DATA_DIR below points the binary at it.
+# Shared store across host CC and all nanoclaw groups. A group that uses it
+# binds ~/.mnemon READ-ONLY at /workspace/extra/mnemon via `additionalMounts`;
+# one that writes memories also binds ~/.mnemon/queue READ-WRITE at
+# /workspace/extra/mnemon/queue. MNEMON_DATA_DIR below points the binary at it.
+# The root stays read-only because host hooks and sync jobs read and write
+# ~/.mnemon by path; see .claude/skills/add-mnemon/SKILL.md.
 #
 # The live store is WAL-mode SQLite, which cannot be opened across the macOS
 # Docker mount, so the real binary installs as mnemon-real and `mnemon` is a

@@ -647,10 +647,13 @@ registerResource({
         'Use --id <group-id> --host <host-path> --container <container-path> [--ro | --rw].\n' +
         '--rw only expresses intent: the mount allowlist (~/.config/nanoclaw/mount-allowlist.json) ' +
         'still decides. A --rw mount under a root that does not set allowReadWrite is downgraded ' +
-        'to read-only at spawn time.',
+        'to read-only at spawn time.\n' +
+        'To make one subdirectory of a read-only mount writable, add it as its own --rw mount at the ' +
+        'nested container path. The first allowlist root containing a path decides, so when the ' +
+        "parent's root refuses read-write, list a read-write root for the subdirectory before it.",
       examples: [
         'ncl groups config add-mount --id ag-123 --host ~/Documents/notes --container notes',
-        'ncl groups config add-mount --id ag-123 --host ~/.mnemon --container mnemon --rw',
+        'ncl groups config add-mount --id ag-123 --host ~/Documents/notes/inbox --container notes/inbox --rw',
       ],
       handler: async (args) => {
         const id = args.id as string;

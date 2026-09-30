@@ -55,4 +55,5 @@ mnemon link <full-uuid> <full-uuid> --type <semantic|causal> --weight <0-1> --me
 
 - After about two minutes, `mnemon search "<distinctive words>" --limit 3` should return the new memory.
 - Failed writes are parked as `/workspace/extra/mnemon/queue/*.json.err`. These files contain only the command, not the error. `ls /workspace/extra/mnemon/queue/*.err` shows them, and the usual causes are the ID rules above.
+- A write that fails right away with `EROFS: read-only file system` means this group has no writable queue mount: it only reads memory, or the operator has not added the `~/.mnemon/queue` mount. Do not retry or look for another writable path. Tell the user it was not stored.
 - If you told the user something was stored, make sure it actually was.

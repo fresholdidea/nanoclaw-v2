@@ -7,6 +7,8 @@ description: Add persistent graph-based memory via mnemon. Agents recall past co
 
 Installs [mnemon](https://github.com/mnemon-dev/mnemon) in the agent container image. On each container start, `mnemon setup` registers Claude Code hooks that surface relevant memory before the agent responds and store new insights after each turn. Memory is written to the per-agent-group `.claude/` mount and survives container restarts.
 
+> **This install is customized.** The host and every group that uses mnemon share one store, reached through a read-only mount plus a writable queue mount. There is no per-group store and no entrypoint hook. Read **This Install: Shared Store + Shim Architecture** below before applying anything; where it disagrees with the stock steps, it wins.
+
 ## Provider Compatibility
 
 mnemon hooks fire only under `--target claude-code`. Use this skill on agent groups that run the default Claude provider. The provider is the materialized `provider` key in each group's `container.json` (absent or `claude` = default Claude provider). Confirm it before applying:
@@ -56,6 +58,8 @@ ENV MNEMON_DATA_DIR=/home/node/.claude/mnemon
 
 ### 2. Entrypoint — run mnemon setup on each container start
 
+**This install: skip this step.** The entrypoint must not run `mnemon setup` (see This Install below), and `src/mnemon-entrypoint.test.ts` fails if the line comes back.
+
 `mnemon setup` is idempotent. Run it once per `container/entrypoint.sh`. First check whether the line is already present:
 
 ```bash
@@ -91,7 +95,7 @@ cp .claude/skills/add-mnemon/mnemon-entrypoint.test.ts src/mnemon-entrypoint.tes
 pnpm exec vitest run src/mnemon-dockerfile.test.ts src/mnemon-entrypoint.test.ts
 ```
 
-`mnemon-dockerfile.test.ts` asserts the `MNEMON_VERSION` ARG and `MNEMON_DATA_DIR` ENV are present (red if the install layer is dropped on an upgrade). `mnemon-entrypoint.test.ts` asserts the entrypoint invokes `mnemon setup --target claude-code` (red if the wiring is removed).
+`mnemon-dockerfile.test.ts` asserts the `MNEMON_VERSION` ARG and `MNEMON_DATA_DIR` ENV are present (red if the install layer is dropped on an upgrade). On this install `mnemon-entrypoint.test.ts` is inverted: it asserts the entrypoint does **not** run `mnemon setup` (red if step 2 is ever applied).
 
 ### 4. Rebuild and smoke-test the image
 
@@ -133,7 +137,7 @@ Have a conversation with the agent, then start a new session and reference somet
 
 ## This Install: Shared Store + Shim Architecture (customized 2026-07-21)
 
-This install diverges from the stock skill. All groups share one store (`~/.mnemon`, mounted RW at `/workspace/extra/mnemon`), and mnemon >= 0.1.14 forces SQLite WAL mode on every read-write open. WAL needs mmap'd shared memory, which fails across the macOS Docker file-sharing mount (`SQLITE_CANTOPEN (14)`), so containers can never open the live DB directly — in either RW or `--readonly` mode.
+This install diverges from the stock skill. The host and every group that uses mnemon share one store, `~/.mnemon`, which containers see at `/workspace/extra/mnemon`. Since 2026-09-30 the root is mounted read-only and only `queue/` is writable (see [Mounting the store into a group](#mounting-the-store-into-a-group)). mnemon >= 0.1.14 forces SQLite WAL mode on every read-write open. WAL needs mmap'd shared memory, which fails across the macOS Docker file-sharing mount (`SQLITE_CANTOPEN (14)`), so containers can never open the live DB directly — in either RW or `--readonly` mode.
 
 The working architecture:
 
@@ -141,7 +145,51 @@ The working architecture:
 - **Host**: `src/mnemon-sync.ts` (started from `src/index.ts`) replays queued argv through the host mnemon CLI every 60s and refreshes the snapshot (`VACUUM INTO`, DELETE journal, atomic rename) every 5 minutes or after a drain.
 - Failed/invalid queue files are parked as `*.err` in `~/.mnemon/queue/` — check there if agent memories go missing.
 
-Agents notice nothing: the hook-installed `mnemon recall` / `mnemon remember` commands work unchanged, with recall up to ~5 min stale and remembers landing on the next drain.
+Agents learn the commands from the curated container skill `container/skills/mnemon/SKILL.md`, not from hooks. Recall is up to ~5 min stale, and remembers land on the next drain.
+
+### What differs from the stock steps above
+
+- **Phase 2 step 1:** this install's Dockerfile block installs the release binary as `mnemon-real`, copies in the shim and queue writer, and sets `MNEMON_DATA_DIR=/workspace/extra/mnemon`. `src/mnemon-dockerfile.test.ts` guards it.
+- **Phase 2 step 2: skip it** (the line was removed on 2026-09-30). Live spawns bypass the image entrypoint (`bash -c 'exec bun …'` in `src/container-runner.ts`), so it could only run on a bare `docker run`. If it did, `mnemon setup` would write `prompt/{guide,skill}.md` and `data/default/mnemon.db` under `MNEMON_DATA_DIR`, which is the shared store, and install hooks that duplicate the container skill.
+- **Phase 3 hook checks, Memory Storage, Troubleshooting:** these describe the stock per-group store and hooks. Nothing is registered in `settings.json` here. Memory lives in `~/.mnemon` on the host, shared with host agents such as Claude Code, Codex and Hermes, so never delete it to reset one group. Verify a group with the mount check below.
+
+### Mounting the store into a group
+
+A group that writes memories needs **both** mounts. A group that only reads memory takes the first one alone.
+
+```bash
+ncl groups config add-mount --id <group-id> --host ~/.mnemon --container mnemon --ro
+ncl groups config add-mount --id <group-id> --host ~/.mnemon/queue --container mnemon/queue --rw
+ncl groups restart --id <group-id>
+```
+
+If the group's `skills` in `container_configs` is an explicit list rather than `"all"`, add `"mnemon"` to it so the agent loads the container skill. `ncl` has no flag for this.
+
+`--rw` only records intent. The mount allowlist (`~/.config/nanoclaw/mount-allowlist.json`) decides, and the first root that contains a path wins. So the queue needs its own read-write root, listed **above** the read-only `~/.mnemon` root in `allowedRoots`:
+
+```json
+{ "path": "~/.mnemon/queue", "allowReadWrite": true },
+{ "path": "~/.mnemon", "allowReadWrite": false }
+```
+
+The old single mount, `--host ~/.mnemon --container mnemon --rw`, no longer works. The allowlist forces it read-only and every `mnemon remember` fails with `EROFS: read-only file system`. The same happens if the queue root is missing or listed below `~/.mnemon`.
+
+**Why the root must stay read-only.** Host hooks and host sync processes read and write `~/.mnemon` by path, and a container can create real host symlinks inside a writable mount. With the root writable, a container could:
+
+- rewrite `prompt/guide.md`, which host mnemon session hooks `cat` into the startup context of new sessions. That is prompt injection into host agents.
+- swap `data/default/mnemon.db` for a symlink. The next `src/mnemon-sync.ts` snapshot (`VACUUM INTO` → `snapshot/`) would then copy any SQLite file the host can open, such as `data/v2.db`, into the container's view.
+- plant a symlink where a host sync job writes its state or log by path, and so overwrite an arbitrary host file.
+
+Containers never need more than `queue/` writable: reads come from `snapshot/` with `--readonly`, and writes are queued in `queue/`. Never give `~/.mnemon` read-write in the allowlist, and never move it above the queue root.
+
+Once the group's container is running again, confirm the effective modes:
+
+```bash
+docker inspect $(docker ps -q --filter label=nanoclaw-group=<group-id> | head -1) \
+  --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} rw={{.RW}}{{println}}{{end}}' | grep mnemon
+```
+
+Expect `~/.mnemon` → `/workspace/extra/mnemon` with `rw=false`, and `~/.mnemon/queue` → `/workspace/extra/mnemon/queue` with `rw=true`.
 
 ## Memory Storage
 
