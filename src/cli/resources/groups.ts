@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import {
   mcpServerPluginOwner,
   parseMcpServerConfig,
+  redactMcpServerSecrets,
   validateMcpServerName,
   type AdditionalMountConfig,
   type McpServerConfig,
@@ -37,6 +38,7 @@ import { isValidTimezone } from '../../timezone.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 import { localizeIsoTimestamps } from '../format.js';
+import type { CallerContext } from '../frame.js';
 
 /**
  * Parse a --timezone flag: undefined = not passed, null = explicit clear
@@ -71,8 +73,18 @@ function assertDeclaredSpeedTier(speed: string, provider: string): void {
   }
 }
 
+/**
+ * MCP server env/header values are credentials. Host operators see them as
+ * stored; a container agent gets them redacted — its own group's secrets have
+ * no business in model context, and a `global`-scope agent can read every
+ * group's config.
+ */
+function mcpServersFor(ctx: CallerContext, servers: unknown): unknown {
+  return ctx.caller === 'host' ? servers : redactMcpServerSecrets(servers);
+}
+
 /** Deserialize JSON columns for display. */
-function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
+function presentConfig(row: ContainerConfigRow, ctx: CallerContext): Record<string, unknown> {
   return {
     agent_group_id: row.agent_group_id,
     provider: row.provider,
@@ -83,7 +95,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     assistant_name: row.assistant_name,
     max_messages_per_prompt: row.max_messages_per_prompt,
     skills: JSON.parse(row.skills),
-    mcp_servers: JSON.parse(row.mcp_servers),
+    mcp_servers: mcpServersFor(ctx, JSON.parse(row.mcp_servers)),
     packages_apt: JSON.parse(row.packages_apt),
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
@@ -398,13 +410,15 @@ registerResource({
     },
     'config get': {
       access: 'open',
-      description: 'Show the container config for a group. Use --id <group-id>.',
-      handler: async (args) => {
+      description:
+        'Show the container config for a group. Use --id <group-id>. ' +
+        'From inside a container, MCP server env and header values show as "<redacted>" (placeholders stay readable).',
+      handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
-        return presentConfig(row);
+        return presentConfig(row, ctx);
       },
     },
     'config update': {
@@ -415,7 +429,7 @@ registerResource({
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
         '--provider-chain <p1,p2,...>, --no-fallback.',
-      handler: async (args) => {
+      handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = await getContainerConfig(id);
@@ -488,7 +502,7 @@ registerResource({
         }
 
         const updated = (await getContainerConfig(id))!;
-        return presentConfig(updated);
+        return presentConfig(updated, ctx);
       },
     },
     'config add-mcp-server': {
@@ -497,7 +511,7 @@ registerResource({
         'Add an MCP server to a group. Requires `ncl groups restart` to take effect. ' +
         'Use --id <group-id> --name <server-name> with either --command <cmd> [--args <json-array>] [--env <json-object>] ' +
         'or --url <url> [--headers <json-object>] (HTTPS, or plain HTTP for localhost / host.docker.internal).',
-      handler: async (args) => {
+      handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const name = args.name as string;
@@ -524,7 +538,7 @@ registerResource({
         });
         await updateContainerConfigJson(id, 'mcp_servers', servers);
 
-        return { added: name, servers };
+        return { added: name, servers: mcpServersFor(ctx, servers) };
       },
     },
     'config remove-mcp-server': {

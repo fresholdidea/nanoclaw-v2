@@ -14,6 +14,7 @@ import path from 'path';
 import { DEFAULT_EFFORT, DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { isSecretShaped, looksLikeCredential } from './drivers/types.js';
 import { isValidTimezone } from './timezone.js';
 import { log } from './log.js';
 import type { AgentGroup, ContainerConfigRow, ContainerSpeed } from './types.js';
@@ -96,6 +97,67 @@ const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** What a container agent sees in place of an MCP env or header value. */
+export const REDACTED_VALUE = '<redacted>';
+
+/**
+ * Values that name a credential without being one, optionally behind an auth
+ * scheme (`Bearer placeholder`): the template convention (PLACEHOLDER_VALUE in
+ * templates/mcp.ts, which imports this module), the vault-managed marker, and
+ * a bare `${VAR}` / `$VAR` reference.
+ */
+function isPlaceholderValue(value: string): boolean {
+  const bare = value.replace(/^(Bearer|Token|Basic)\s+/i, '');
+  return (
+    bare === '' ||
+    bare === 'placeholder' ||
+    bare === 'onecli-managed' ||
+    /^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)$/.test(bare)
+  );
+}
+
+/** A credential-format token anywhere in an arg (`Authorization: Bearer sk-…`, `--key=ghp_…`). */
+function containsCredential(value: string): boolean {
+  return looksLikeCredential(value) || value.split(/[\s=:,]+/).some(looksLikeCredential);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A copy of a stored `mcp_servers` blob that is safe to show a container
+ * agent: every env and header value becomes `<redacted>` unless it is a
+ * placeholder, and an arg carrying a credential-format token is replaced
+ * whole. Keys, commands and URLs stay, so the agent can still see how each
+ * server is wired. Hand-edited rows are shown, not validated — only redacted.
+ */
+export function redactMcpServerSecrets(servers: unknown): unknown {
+  if (!isPlainRecord(servers)) return servers;
+  return Object.fromEntries(
+    Object.entries(servers).map(([name, entry]) => {
+      if (!isPlainRecord(entry)) return [name, entry];
+      const shown: Record<string, unknown> = { ...entry };
+      for (const field of ['env', 'headers']) {
+        const values = entry[field];
+        if (!isPlainRecord(values)) continue;
+        shown[field] = Object.fromEntries(
+          Object.entries(values).map(([key, value]) => [
+            key,
+            typeof value === 'string' && isPlaceholderValue(value) ? value : REDACTED_VALUE,
+          ]),
+        );
+      }
+      if (Array.isArray(entry.args)) {
+        shown.args = entry.args.map((arg) =>
+          typeof arg === 'string' && containsCredential(arg) ? REDACTED_VALUE : arg,
+        );
+      }
+      return [name, shown];
+    }),
+  );
+}
 
 /** The owning plugin's name when a stored MCP server entry was stamped from a plugin. */
 export function mcpServerPluginOwner(entry: unknown): string | undefined {
@@ -294,6 +356,32 @@ export async function resolveGroupTimezone(agentGroupId: string): Promise<string
 }
 
 /**
+ * (group, server, env key) triples already reported this process. The blob is
+ * re-sanitized on every spawn and every dashboard push; one line is enough.
+ */
+const reportedSecretEnv = new Set<string>();
+
+/**
+ * Container env refuses secret-shaped values outright (validateSpec). MCP env
+ * cannot — a server may have no other credential source — but a raw
+ * credential there is copied into container.json and readable inside the
+ * container, so it is reported: the key, never the value.
+ */
+function warnSecretShapedEnv(groupName: string, server: string, env: Record<string, string>): void {
+  for (const [key, value] of Object.entries(env)) {
+    if (isPlaceholderValue(value) || !isSecretShaped(key, value)) continue;
+    const id = `${groupName}\0${server}\0${key}`;
+    if (reportedSecretEnv.has(id)) continue;
+    reportedSecretEnv.add(id);
+    log.warn('MCP server env carries a secret-shaped value; route the credential through the gateway instead', {
+      group: groupName,
+      server,
+      key,
+    });
+  }
+}
+
+/**
  * Defense-in-depth re-validation of the stored MCP server blob (threat: a
  * hand-edited DB value bypassing the three validated write paths). Invalid
  * entries are dropped + logged instead of shipped to the container.
@@ -328,6 +416,7 @@ export function sanitizeStoredMcpServers(raw: unknown, groupName: string): Recor
         delete server.cwd;
         log.warn('Stripping cwd from stored MCP server without plugin provenance', { group: groupName, server: name });
       }
+      if (server.type !== 'http') warnSecretShapedEnv(groupName, name, server.env ?? {});
       servers[name] = server;
       // eslint-disable-next-line no-catch-all/no-catch-all -- validation failures are data errors, not bugs
     } catch (err) {

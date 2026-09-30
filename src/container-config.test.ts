@@ -8,13 +8,14 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
 
 import { TIMEZONE } from './config.js';
 import {
   CONTAINER_PLUGINS_DIR,
   configFromDb,
   parseMcpServerConfig,
+  redactMcpServerSecrets,
   resolveGroupTimezone,
   sanitizeStoredMcpServers,
   validateMcpServerName,
@@ -23,6 +24,7 @@ import { createAgentGroup } from './db/agent-groups.js';
 import { closeDb, initTestDb } from './db/connection.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { runMigrations } from './db/migrations/index.js';
+import { log } from './log.js';
 import type { AgentGroup } from './types.js';
 
 const GROUP: AgentGroup = {
@@ -232,6 +234,121 @@ describe('sanitizeStoredMcpServers', () => {
 
   it('returns empty on a non-object blob', () => {
     expect(sanitizeStoredMcpServers('garbage', 'test-group')).toEqual({});
+  });
+});
+
+/**
+ * MCP env is not refused the way container env is (a server may have no
+ * other credential source), but a raw credential there still lands in
+ * container.json, so it is reported. Dedup is per process, so every test
+ * uses its own group name.
+ */
+describe('sanitizeStoredMcpServers secret-shaped env warning', () => {
+  let warn: MockInstance<typeof log.warn>;
+  beforeEach(() => {
+    warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warn.mockRestore();
+  });
+  const secretWarnings = (): unknown[] =>
+    warn.mock.calls.filter(([msg]) => msg.includes('secret-shaped')).map(([, data]) => data);
+
+  it('warns once per env key carrying a raw credential, naming the key but never the value', () => {
+    const blob = { li: { command: 'node', env: { LINKEDIN_CLIENT_SECRET: 'fake-client-secret', REGION: 'us-east' } } };
+    sanitizeStoredMcpServers(blob, 'warn-once');
+    sanitizeStoredMcpServers(blob, 'warn-once');
+    expect(secretWarnings()).toEqual([{ group: 'warn-once', server: 'li', key: 'LINKEDIN_CLIENT_SECRET' }]);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('fake-client-secret');
+  });
+
+  it('warns on a credential-format value under an innocuous key', () => {
+    sanitizeStoredMcpServers(
+      { s: { command: 'server', env: { UPSTREAM: 'sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA' } } },
+      'warn-by-value',
+    );
+    expect(secretWarnings()).toEqual([{ group: 'warn-by-value', server: 's', key: 'UPSTREAM' }]);
+  });
+
+  it('stays quiet for placeholders and file paths', () => {
+    sanitizeStoredMcpServers(
+      {
+        s: {
+          command: 'server',
+          env: {
+            SERPER_API_KEY: 'onecli-managed',
+            FIRECRAWL_API_KEY: '${FIRECRAWL_API_KEY}',
+            LINKEDIN_TOKEN: 'placeholder',
+            CLIENT_KEY: '/run/keys/client.pem',
+          },
+        },
+      },
+      'warn-quiet',
+    );
+    expect(secretWarnings()).toEqual([]);
+  });
+});
+
+describe('redactMcpServerSecrets', () => {
+  it('replaces every env and header value with <redacted> and keeps the keys', () => {
+    expect(
+      redactMcpServerSecrets({
+        linkedin: {
+          command: 'node',
+          args: ['server.js'],
+          env: { LINKEDIN_CLIENT_ID: '86abcdef', LINKEDIN_CLIENT_SECRET: 'fake-client-secret' },
+        },
+        docs: { type: 'http', url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer fake-token' } },
+      }),
+    ).toEqual({
+      linkedin: {
+        command: 'node',
+        args: ['server.js'],
+        env: { LINKEDIN_CLIENT_ID: '<redacted>', LINKEDIN_CLIENT_SECRET: '<redacted>' },
+      },
+      docs: { type: 'http', url: 'https://mcp.example.com/mcp', headers: { Authorization: '<redacted>' } },
+    });
+  });
+
+  it('leaves placeholder values readable', () => {
+    const servers = {
+      vaulted: {
+        command: 'server',
+        env: { A: 'onecli-managed', B: 'placeholder', C: '${SERPER_API_KEY}', D: '$HOME', E: '' },
+      },
+      remote: {
+        type: 'http',
+        url: 'https://mcp.example.com/mcp',
+        headers: { Authorization: 'Bearer placeholder', 'X-Api-Key': 'onecli-managed' },
+      },
+    };
+    expect(redactMcpServerSecrets(servers)).toEqual(servers);
+  });
+
+  it('redacts an arg carrying a credential-format value and leaves ordinary args alone', () => {
+    const args = ['-y', 'mcp-remote', 'https://mcp.example.com/mcp', '--header'];
+    expect(
+      redactMcpServerSecrets({
+        remote: { command: 'npx', args: [...args, 'Authorization: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA'] },
+      }),
+    ).toEqual({ remote: { command: 'npx', args: [...args, '<redacted>'] } });
+  });
+
+  it('never mutates the stored blob it is given', () => {
+    const servers = {
+      s: { command: 'server', args: ['ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'], env: { K: 'fake-value' } },
+    };
+    const before = JSON.stringify(servers);
+    redactMcpServerSecrets(servers);
+    expect(JSON.stringify(servers)).toBe(before);
+  });
+
+  it('tolerates hand-edited rows: a malformed blob passes through, a non-string env value is redacted', () => {
+    expect(redactMcpServerSecrets('garbage')).toBe('garbage');
+    expect(redactMcpServerSecrets({ n: 42, e: { command: 'x', env: { K: 7 } } })).toEqual({
+      n: 42,
+      e: { command: 'x', env: { K: '<redacted>' } },
+    });
   });
 });
 
