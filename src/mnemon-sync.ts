@@ -96,6 +96,12 @@ let timer: ReturnType<typeof setInterval> | null = null;
 let running = false;
 let lastSnapshotMs = 0;
 
+/**
+ * Queue files already replayed but not removable (a container can make queue/
+ * read-only). Keyed by name, inode and mtime so they are never replayed twice.
+ */
+const replayedNotRemoved = new Set<string>();
+
 function mnemonBase(): string {
   return process.env.MNEMON_DATA_DIR || path.join(os.homedir(), '.mnemon');
 }
@@ -153,11 +159,12 @@ export function checkQueuedArgv(argv: unknown): string[] {
  * and the type and size are checked on the open descriptor, so swapping the
  * entry after a check changes nothing.
  */
-function readQueueFile(full: string): string {
+function readQueueFile(full: string): { text: string; identity: string } {
   const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
   const fd = fs.openSync(full, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   try {
-    if (!fs.fstatSync(fd).isFile()) throw new Error('not a regular file');
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error('not a regular file');
     const buf = Buffer.alloc(QUEUE_FILE_MAX_BYTES + 1);
     let n = 0;
     for (;;) {
@@ -166,7 +173,7 @@ function readQueueFile(full: string): string {
       n += read;
       if (n === buf.length) throw new Error(`queue file larger than ${QUEUE_FILE_MAX_BYTES} bytes`);
     }
-    return buf.toString('utf8', 0, n);
+    return { text: buf.toString('utf8', 0, n), identity: `${path.basename(full)}\0${st.ino}\0${st.mtimeMs}` };
   } finally {
     fs.closeSync(fd);
   }
@@ -198,17 +205,31 @@ export async function drainQueue(base: string, bin: string): Promise<number> {
     return 0;
   }
 
-  const files = fs
-    .readdirSync(queueDir)
-    .filter((f) => f.endsWith('.json') && !f.startsWith('.'))
-    .sort();
+  let files: string[];
+  try {
+    files = fs
+      .readdirSync(queueDir)
+      .filter((f) => f.endsWith('.json') && !f.startsWith('.'))
+      .sort();
+    // eslint-disable-next-line no-catch-all/no-catch-all -- an unreadable queue must not skip the snapshot refresh
+  } catch (err) {
+    log.warn('mnemon-sync: cannot list queue, not draining', { queueDir, err: String(err) });
+    return 0;
+  }
+  for (const key of replayedNotRemoved) {
+    if (!files.includes(key.split('\0')[0])) replayedNotRemoved.delete(key);
+  }
 
   let replayed = 0;
   for (const file of files) {
     const full = path.join(queueDir, file);
     let argv: string[];
+    let identity: string;
     try {
-      argv = checkQueuedArgv(JSON.parse(readQueueFile(full))?.argv);
+      const entry = readQueueFile(full);
+      identity = entry.identity;
+      if (replayedNotRemoved.has(identity)) continue;
+      argv = checkQueuedArgv(JSON.parse(entry.text)?.argv);
       // eslint-disable-next-line no-catch-all/no-catch-all -- container-written input: any failure parks the file
     } catch (err) {
       log.warn('mnemon-sync: bad queue file, parking as .err', { file, err: String(err) });
@@ -229,7 +250,11 @@ export async function drainQueue(base: string, bin: string): Promise<number> {
       fs.unlinkSync(full);
       // eslint-disable-next-line no-catch-all/no-catch-all -- the write already landed; keep draining
     } catch (err) {
-      log.warn('mnemon-sync: replayed but could not remove queue file', { file, err: String(err) });
+      replayedNotRemoved.add(identity);
+      log.warn('mnemon-sync: replayed but could not remove queue file; will not replay it again', {
+        file,
+        err: String(err),
+      });
     }
   }
   if (replayed > 0) log.info('mnemon-sync: replayed queued writes', { replayed });

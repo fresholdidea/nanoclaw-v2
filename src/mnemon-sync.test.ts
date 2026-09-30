@@ -276,6 +276,29 @@ describe('drainQueue', () => {
       expect(calls()).toEqual([['forget', ID1]]);
     });
 
+    it('replays a write only once when the queue file cannot be removed', async () => {
+      queueFile('1-once.json', queued(['remember', 'only once', '--no-diff']));
+      fs.chmodSync(queueDir(), 0o555);
+      try {
+        expect(await drainQueue(base, bin)).toBe(1);
+        expect(await drainQueue(base, bin)).toBe(0);
+      } finally {
+        fs.chmodSync(queueDir(), 0o755);
+      }
+      expect(calls()).toEqual([['remember', 'only once', '--no-diff']]);
+    });
+
+    it('returns without throwing when the queue directory is unreadable', async () => {
+      queueFile('1-x.json', queued(['forget', ID1]));
+      fs.chmodSync(queueDir(), 0o000);
+      try {
+        expect(await drainQueue(base, bin)).toBe(0);
+      } finally {
+        fs.chmodSync(path.join(base, 'queue'), 0o755);
+      }
+      expect(calls()).toEqual([]);
+    });
+
     it('refuses to drain a queue directory that is a symlink', async () => {
       const target = path.join(outside, 'settings.json');
       fs.writeFileSync(target, '{"not":"a queue file"}');
