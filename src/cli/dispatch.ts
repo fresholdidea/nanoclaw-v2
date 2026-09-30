@@ -19,6 +19,7 @@ import { getSession } from '../db/sessions.js';
 import { guard, type GuardActor } from '../guard/index.js';
 import { registerApprovalHandler, requestApproval } from '../modules/approvals/index.js';
 import type { PendingApproval } from '../types.js';
+import { renderCardArgs } from './approval-card.js';
 import type { CallerContext, ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
 import { localizeIsoTimestamps } from './format.js';
 import { getResource } from './crud.js';
@@ -149,9 +150,8 @@ export async function dispatch(
     const agentGroup = await getAgentGroup(ctx.agentGroupId);
     const agentName = agentGroup?.name ?? ctx.agentGroupId;
 
-    const argSummary = Object.entries(req.args)
-      .map(([k, v]) => `--${k} ${v}`)
-      .join(' ');
+    // Card text only — the payload below keeps req.args verbatim.
+    const argSummary = renderCardArgs(req.args);
 
     await requestApproval({
       session,

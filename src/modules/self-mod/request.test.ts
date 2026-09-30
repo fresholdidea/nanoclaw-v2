@@ -467,6 +467,26 @@ describe('add_mcp_server secret redaction', () => {
 
     expect(lastQuestion()).toContain('?a=b%26c&debug');
   });
+
+  it('redacts a credential header whose name is hyphenated (X-Api-Key)', async () => {
+    const apiKey = 'fake-x-api-key-value';
+    await submitAddMcpServer(
+      {
+        name: 'docs',
+        url: 'https://mcp.example.com/mcp',
+        headers: { 'X-Api-Key': apiKey, Accept: 'application/json' },
+      },
+      session,
+    );
+
+    const question = lastQuestion();
+    expect(question).not.toContain(apiKey);
+    expect(question).toContain(redactedForm(apiKey));
+    expect(question).toContain('application/json');
+
+    const rows = await getPendingApprovalsByAction('add_mcp_server');
+    expect((JSON.parse(rows[0].payload) as { headers: Record<string, string> }).headers['X-Api-Key']).toBe(apiKey);
+  });
 });
 
 describe('escapeInvisibles', () => {

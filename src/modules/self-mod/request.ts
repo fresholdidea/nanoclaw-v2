@@ -14,7 +14,12 @@
  */
 import { createHash } from 'node:crypto';
 
-import { mcpServerPluginOwner, parseMcpServerConfig, validateMcpServerName } from '../../container-config.js';
+import {
+  isSecretQueryKey,
+  mcpServerPluginOwner,
+  parseMcpServerConfig,
+  validateMcpServerName,
+} from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { log } from '../../log.js';
@@ -98,10 +103,50 @@ const MCP_PAYLOAD_MAX_BYTES = 16384;
 export const SECRET_ENV_KEY_RE = /(TOKEN|SECRET|PASSW(OR)?D|API_?KEY|APIKEY|CREDENTIAL|PRIVATE_?KEY|AUTH)/i;
 export const SECRET_VALUE_RE = /^(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
 
-/** Card-only placeholder for a secret-shaped value: byte length + sha256 fingerprint. */
-function redactSecret(value: string): string {
+/**
+ * Card-only placeholder for a secret-shaped value: byte length + sha256 fingerprint.
+ * Exported for the ncl approval card (cli/approval-card.ts), which renders the
+ * same MCP env/header/args values when `groups config add-mcp-server` is held.
+ */
+export function redactSecret(value: string): string {
   const digest = createHash('sha256').update(value).digest('hex').slice(0, 8);
   return `<redacted: ${Buffer.byteLength(value, 'utf8')} bytes, sha256 ${digest}>`;
+}
+
+/**
+ * Whether an env var or header renders redacted on an approval card: a
+ * secret-named key or a secret-shaped value. Header names are hyphenated
+ * (`X-Api-Key`), so `-` reads as `_` for the key pattern.
+ */
+export function isSecretEntry(key: string, value: string): boolean {
+  return SECRET_ENV_KEY_RE.test(key.replace(/-/g, '_')) || SECRET_VALUE_RE.test(value);
+}
+
+/**
+ * An MCP server URL as an approval card shows it. Redact per path segment and
+ * per query value, never the origin — the admin must always see the true
+ * destination host, and SECRET_VALUE_RE is start-anchored so testing the whole
+ * URL would match nothing. A Zapier-style https://host/s/<token>/mcp must not
+ * render the token raw. Userinfo and fragment are never shown. Throws unless
+ * the URL parses as HTTP(S).
+ */
+export function displayMcpUrl(url: string): string {
+  const u = new URL(url);
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('not an HTTP(S) URL');
+  const path = u.pathname
+    .split('/')
+    .map((s) => (SECRET_VALUE_RE.test(s) ? redactSecret(s) : s))
+    .join('/');
+  // A credential-named key (`?api_key=`) is refused at validation, but the ncl
+  // card renders before validation runs, so its value is redacted too.
+  const secret = (k: string, v: string): boolean => SECRET_VALUE_RE.test(v) || isSecretQueryKey(k);
+  // Keep the query byte-faithful unless a value actually needs redacting —
+  // re-serializing decodes percent-escapes and can invent structure.
+  const entries = [...u.searchParams];
+  const query = entries.some(([k, v]) => secret(k, v))
+    ? `?${entries.map(([k, v]) => `${k}=${secret(k, v) ? redactSecret(v) : v}`).join('&')}`
+    : u.search;
+  return u.origin + path + query;
 }
 
 /**
@@ -190,31 +235,14 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
 
   let fields: string[];
   if (serverConfig.type === 'http') {
-    // Redact per path segment and per query value, never the origin — the
-    // admin must always see the true destination host, and SECRET_VALUE_RE
-    // is start-anchored so testing the whole URL would match nothing. A
-    // Zapier-style https://host/s/<token>/mcp must not render the token raw.
-    const u = new URL(serverConfig.url);
-    const redactSeg = (s: string): string => (SECRET_VALUE_RE.test(s) ? redactSecret(s) : s);
-    const path = u.pathname.split('/').map(redactSeg).join('/');
-    // Keep the query byte-faithful unless a value actually needs redacting —
-    // re-serializing decodes percent-escapes and can invent structure.
-    const entries = [...u.searchParams];
-    const query = entries.some(([, v]) => SECRET_VALUE_RE.test(v))
-      ? `?${entries.map(([k, v]) => `${k}=${redactSeg(v)}`).join('&')}`
-      : u.search;
-    const displayUrl = u.origin + path + query;
     fields = [
       `name: ${escapeInvisibles(JSON.stringify(serverName))}`,
       `type: ${escapeInvisibles(JSON.stringify(serverConfig.type))}`,
-      `url: ${escapeInvisibles(JSON.stringify(displayUrl))}`,
+      `url: ${escapeInvisibles(JSON.stringify(displayMcpUrl(serverConfig.url)))}`,
     ];
     if (serverConfig.headers !== undefined) {
       const displayHeaders = Object.fromEntries(
-        Object.entries(serverConfig.headers).map(([k, v]) => [
-          k,
-          SECRET_ENV_KEY_RE.test(k) || SECRET_VALUE_RE.test(v) ? redactSecret(v) : v,
-        ]),
+        Object.entries(serverConfig.headers).map(([k, v]) => [k, isSecretEntry(k, v) ? redactSecret(v) : v]),
       );
       fields.push(`headers: ${escapeInvisibles(JSON.stringify(displayHeaders))}`);
     }
@@ -225,10 +253,7 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
     // the payload below keeps the verbatim values.
     const displayArgs = args.map((a) => (SECRET_VALUE_RE.test(a) ? redactSecret(a) : a));
     const displayEnv = Object.fromEntries(
-      Object.entries(env).map(([k, v]) => [
-        k,
-        SECRET_ENV_KEY_RE.test(k) || SECRET_VALUE_RE.test(v) ? redactSecret(v) : v,
-      ]),
+      Object.entries(env).map(([k, v]) => [k, isSecretEntry(k, v) ? redactSecret(v) : v]),
     );
     fields = [
       `name: ${escapeInvisibles(JSON.stringify(serverName))}`,

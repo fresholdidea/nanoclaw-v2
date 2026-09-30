@@ -87,6 +87,11 @@ const SECRET_QUERY_KEY_RE =
 /** camelCase → snake_case before matching, so `authToken` hits the word list. */
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
 
+/** Whether a URL query key names a credential (SECRET_QUERY_KEY_RE). */
+export function isSecretQueryKey(key: string): boolean {
+  return SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'));
+}
+
 /**
  * Server names and env keys end up in provider config writers that emit
  * formats with structural syntax (codex writes TOML table headers), so an
@@ -224,7 +229,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): McpServerC
       throw new Error('url must not contain credentials or fragments; use the credential gateway');
     }
     for (const key of parsed.searchParams.keys()) {
-      if (SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'))) {
+      if (isSecretQueryKey(key)) {
         throw new Error(`url query parameter "${key}" looks like a credential; use the credential gateway`);
       }
     }
