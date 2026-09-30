@@ -1,7 +1,309 @@
+diff --git a/dist/server.d.ts b/dist/server.d.ts
+index 8507931fbaefd7e3670464de1c2b5b1cffbd666a..22b7971e423f39f9a2af884db2842c36b46c7c90 100644
+--- a/dist/server.d.ts
++++ b/dist/server.d.ts
+@@ -1,4 +1,3 @@
+ import type { DashboardConfig } from './types.js';
+-export declare function getDashboardSecret(): string | null;
+ export declare function startDashboard(config?: DashboardConfig): void;
+ export declare function stopDashboard(): Promise<void>;
+diff --git a/dist/server.js b/dist/server.js
+index f616ef5adfe7763270aa56d9685c1843819202de..9b59997bd2ed9d841a4c3e91fb29ec19f1c2cb23 100644
+--- a/dist/server.js
++++ b/dist/server.js
+@@ -2,16 +2,32 @@
+  * Dashboard HTTP server.
+  * Receives JSON snapshots via POST /api/ingest.
+  * Serves dashboard UI and API endpoints.
++ *
++ * With a secret configured, nothing is served to a caller that has not shown
++ * it: API clients send `Authorization: Bearer <secret>`, and a browser shows
++ * it once at /dashboard/login in exchange for a session cookie (an expiry
++ * signed with the secret, never the secret itself). No page carries the
++ * secret, and only the Bearer secret writes the snapshot or the log.
++ *
++ * The server binds loopback and answers only loopback Host names, which keeps
++ * LAN devices and DNS-rebinding pages out. That is not what keeps agent
++ * containers out: Docker Desktop forwards host.docker.internal to the host's
++ * 127.0.0.1, so the secret is the boundary.
+  */
++import crypto from 'crypto';
+ import http from 'http';
+ import { setSnapshot, addLogClient, removeLogClient, pushLogLines } from './store.js';
+ import { dispatch } from './router.js';
++import { loginPage } from './ui/layout.js';
+ const DEFAULT_PORT = 3100;
++const HOST = '127.0.0.1';
++const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1']);
++const SESSION_COOKIE = 'nanoclaw_dashboard';
++const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
++/** Far above any real secret; the login body is the one read before auth. */
++const LOGIN_BODY_MAX = 4096;
+ let server = null;
+ let dashboardSecret = null;
+-export function getDashboardSecret() {
+-    return dashboardSecret;
+-}
+ export function startDashboard(config = {}) {
+     const port = config.port || DEFAULT_PORT;
+     dashboardSecret = config.secret || null;
+@@ -19,24 +35,43 @@ export function startDashboard(config = {}) {
+         console.warn('[dashboard] Starting without secret — endpoints are unauthenticated');
+     }
+     server = http.createServer(async (req, res) => {
+-        const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
++        res.setHeader('Cache-Control', 'no-store');
++        res.setHeader('X-Frame-Options', 'DENY');
++        // Any other name for this port is a DNS-rebinding page or a client that
++        // dialed another address: nothing is served to either.
++        if (!LOOPBACK_NAMES.has(hostName(req.headers.host))) {
++            sendJson(res, 421, { error: 'Misdirected Request' });
++            return;
++        }
++        let url;
++        try {
++            url = new URL(req.url || '/', 'http://localhost');
++        }
++        catch {
++            sendJson(res, 400, { error: 'Bad Request' });
++            return;
++        }
+         const path = url.pathname;
+         const method = req.method || 'GET';
+-        // CORS
+-        res.setHeader('Access-Control-Allow-Origin', '*');
+-        res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+-        if (method === 'OPTIONS') {
+-            res.writeHead(204);
+-            res.end();
++        if (path === '/dashboard/login' && method === 'GET') {
++            sendHtml(res, 200, loginPage());
++            return;
++        }
++        if (path === '/dashboard/login' && method === 'POST') {
++            await handleLogin(req, res);
+             return;
+         }
+-        // Auth check for /api/* routes (endpoints with their own auth are excluded)
+-        const selfAuthed = ['/api/ingest', '/api/logs', '/api/logs/push'];
+-        if (path.startsWith('/api/') && !selfAuthed.includes(path) && dashboardSecret) {
+-            const auth = req.headers.authorization;
+-            if (!auth || auth !== `Bearer ${dashboardSecret}`) {
+-                res.writeHead(401, { 'Content-Type': 'application/json' });
+-                res.end(JSON.stringify({ error: 'Unauthorized' }));
++        if (dashboardSecret && !hasBearer(req)) {
++            // A session reads; only the Bearer secret replaces the snapshot or pushes log lines.
++            const write = path === '/api/ingest' || path === '/api/logs/push';
++            if (write || !hasSession(req)) {
++                if (!write && method === 'GET' && !path.startsWith('/api/')) {
++                    res.writeHead(303, { Location: '/dashboard/login' });
++                    res.end();
++                }
++                else {
++                    sendJson(res, 401, { error: 'Unauthorized' });
++                }
+                 return;
+             }
+         }
+@@ -60,12 +95,11 @@ export function startDashboard(config = {}) {
+         }
+         catch (err) {
+             if (!res.headersSent) {
+-                res.writeHead(500, { 'Content-Type': 'application/json' });
+-                res.end(JSON.stringify({ error: 'Internal Server Error' }));
++                sendJson(res, 500, { error: 'Internal Server Error' });
+             }
+         }
+     });
+-    server.listen(port, '0.0.0.0', () => {
++    server.listen(port, HOST, () => {
+         console.log(`[dashboard] Started on http://localhost:${port}/dashboard`);
+     });
+ }
+@@ -75,16 +109,23 @@ export async function stopDashboard() {
+         server = null;
+     }
+ }
+-async function handleIngest(req, res) {
+-    // Auth check for ingest
+-    if (dashboardSecret) {
+-        const auth = req.headers.authorization;
+-        if (!auth || auth !== `Bearer ${dashboardSecret}`) {
+-            res.writeHead(401, { 'Content-Type': 'application/json' });
+-            res.end(JSON.stringify({ error: 'Unauthorized' }));
+-            return;
+-        }
++async function handleLogin(req, res) {
++    const body = await readBody(req, LOGIN_BODY_MAX);
++    if (body === null) {
++        sendHtml(res, 413, loginPage('That is too long to be the secret.'));
++        return;
++    }
++    if (!dashboardSecret || !isSecret(new URLSearchParams(body).get('secret'))) {
++        sendHtml(res, 401, loginPage('That is not the secret.'));
++        return;
+     }
++    res.writeHead(303, {
++        Location: '/dashboard',
++        'Set-Cookie': `${SESSION_COOKIE}=${newSession()}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`,
++    });
++    res.end();
++}
++async function handleIngest(req, res) {
+     const chunks = [];
+     for await (const chunk of req) {
+         chunks.push(chunk);
+@@ -92,23 +133,13 @@ async function handleIngest(req, res) {
+     try {
+         const data = JSON.parse(Buffer.concat(chunks).toString());
+         setSnapshot(data);
+-        res.writeHead(200, { 'Content-Type': 'application/json' });
+-        res.end(JSON.stringify({ ok: true, timestamp: data.timestamp }));
++        sendJson(res, 200, { ok: true, timestamp: data.timestamp });
+     }
+     catch {
+-        res.writeHead(400, { 'Content-Type': 'application/json' });
+-        res.end(JSON.stringify({ error: 'Invalid JSON' }));
++        sendJson(res, 400, { error: 'Invalid JSON' });
+     }
+ }
+ async function handleLogPush(req, res) {
+-    if (dashboardSecret) {
+-        const auth = req.headers.authorization;
+-        if (!auth || auth !== `Bearer ${dashboardSecret}`) {
+-            res.writeHead(401, { 'Content-Type': 'application/json' });
+-            res.end(JSON.stringify({ error: 'Unauthorized' }));
+-            return;
+-        }
+-    }
+     const chunks = [];
+     for await (const chunk of req) {
+         chunks.push(chunk);
+@@ -116,25 +147,13 @@ async function handleLogPush(req, res) {
+     try {
+         const { lines } = JSON.parse(Buffer.concat(chunks).toString());
+         pushLogLines(lines);
+-        res.writeHead(200, { 'Content-Type': 'application/json' });
+-        res.end(JSON.stringify({ ok: true, count: lines.length }));
++        sendJson(res, 200, { ok: true, count: lines.length });
+     }
+     catch {
+-        res.writeHead(400, { 'Content-Type': 'application/json' });
+-        res.end(JSON.stringify({ error: 'Invalid JSON' }));
++        sendJson(res, 400, { error: 'Invalid JSON' });
+     }
+ }
+ function handleLogStream(req, res) {
+-    // Auth check — read token from query param since SSE can't set headers
+-    if (dashboardSecret) {
+-        const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+-        const token = url.searchParams.get('token') || req.headers.authorization?.replace('Bearer ', '');
+-        if (!token || token !== dashboardSecret) {
+-            res.writeHead(401, { 'Content-Type': 'application/json' });
+-            res.end(JSON.stringify({ error: 'Unauthorized' }));
+-            return;
+-        }
+-    }
+     res.writeHead(200, {
+         'Content-Type': 'text/event-stream',
+         'Cache-Control': 'no-cache',
+@@ -145,3 +164,75 @@ function handleLogStream(req, res) {
+     addLogClient(res);
+     req.on('close', () => removeLogClient(res));
+ }
++/** Constant-time: hashing both sides first gives them equal length. */
++function isSecret(candidate) {
++    if (typeof candidate !== 'string' || !dashboardSecret) {
++        return false;
++    }
++    const given = crypto.createHash('sha256').update(candidate).digest();
++    const wanted = crypto.createHash('sha256').update(dashboardSecret).digest();
++    return crypto.timingSafeEqual(given, wanted);
++}
++function hasBearer(req) {
++    const auth = req.headers.authorization;
++    return typeof auth === 'string' && auth.startsWith('Bearer ') && isSecret(auth.slice('Bearer '.length));
++}
++/**
++ * A session is `<expiry seconds>.<HMAC of the expiry, keyed by the secret>`.
++ * Stateless: a restart keeps every session, and a new secret ends them all.
++ */
++function sessionSignature(expires) {
++    return crypto.createHmac('sha256', dashboardSecret).update(`nanoclaw-dashboard-session:${expires}`).digest('base64url');
++}
++function newSession() {
++    const expires = String(Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS);
++    return `${expires}.${sessionSignature(expires)}`;
++}
++function hasSession(req) {
++    const value = cookieValue(req.headers.cookie, SESSION_COOKIE) || '';
++    const dot = value.indexOf('.');
++    if (dot < 1) {
++        return false;
++    }
++    const expires = value.slice(0, dot);
++    if (!/^\d{1,12}$/.test(expires) || Number(expires) * 1000 <= Date.now()) {
++        return false;
++    }
++    const given = Buffer.from(value.slice(dot + 1));
++    const wanted = Buffer.from(sessionSignature(expires));
++    return given.length === wanted.length && crypto.timingSafeEqual(given, wanted);
++}
++function cookieValue(header, name) {
++    for (const part of (header || '').split(';')) {
++        const eq = part.indexOf('=');
++        if (eq > 0 && part.slice(0, eq).trim() === name) {
++            return part.slice(eq + 1).trim();
++        }
++    }
++    return null;
++}
++/** The name in a Host header (`name` or `name:port`), lowercased; '' when absent or malformed. */
++function hostName(header) {
++    const match = /^([^:]*)(?::\d*)?$/.exec(header || '');
++    return match ? match[1].toLowerCase() : '';
++}
++/** The body as text, or null past `max` bytes; the rest is read and dropped, never kept. */
++async function readBody(req, max) {
++    const chunks = [];
++    let size = 0;
++    for await (const chunk of req) {
++        size += chunk.length;
++        if (size <= max) {
++            chunks.push(chunk);
++        }
++    }
++    return size > max ? null : Buffer.concat(chunks).toString();
++}
++function sendJson(res, status, data) {
++    res.writeHead(status, { 'Content-Type': 'application/json' });
++    res.end(JSON.stringify(data));
++}
++function sendHtml(res, status, content) {
++    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
++    res.end(content);
++}
+diff --git a/dist/ui/layout.d.ts b/dist/ui/layout.d.ts
+index 4fbfd481deb402299d5b95e36416917ca006acda..f503b9610728ed9ab9a6ec70facde89fd6782e31 100644
+--- a/dist/ui/layout.d.ts
++++ b/dist/ui/layout.d.ts
+@@ -1 +1,2 @@
+ export declare function layout(title: string, activePath: string, bodyHtml: string): string;
++export declare function loginPage(error?: string): string;
 diff --git a/dist/ui/layout.js b/dist/ui/layout.js
-index 36b957573fba3d5046e9b50f844aefb9fde486e8..1c106537b52b9a413829bf05445a775154599cb1 100644
+index 36b957573fba3d5046e9b50f844aefb9fde486e8..34a22cf6a7c9024012df4731e836d6283a758f98 100644
 --- a/dist/ui/layout.js
 +++ b/dist/ui/layout.js
+@@ -1,8 +1,8 @@
+ /**
+  * Shared HTML layout for dashboard pages.
+  * Dark theme, nav sidebar, api() helper for authenticated fetch calls.
++ * The session cookie authenticates those calls; no page carries a token.
+  */
+-import { getDashboardSecret } from '../server.js';
+ const NAV_ITEMS = [
+     { href: '/dashboard', label: 'Overview', icon: '&#9632;' },
+     { href: '/dashboard/agent-groups', label: 'Agent Groups', icon: '&#9654;' },
 @@ -18,7 +18,6 @@ const CSS = `
      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
      background: #0f0f0f;
@@ -20,3 +322,104 @@ index 36b957573fba3d5046e9b50f844aefb9fde486e8..1c106537b52b9a413829bf05445a7751
      min-width: 0;
    }
    .page-title {
+@@ -165,7 +163,6 @@ const CSS = `
+   .tab.active { color: #7eb8da; border-bottom-color: #7eb8da; }
+ `;
+ export function layout(title, activePath, bodyHtml) {
+-    const token = getDashboardSecret() || '';
+     const navHtml = NAV_ITEMS.map((item) => `<a href="${item.href}" class="${item.href === activePath ? 'active' : ''}">
+         <span class="icon">${item.icon}</span>${item.label}
+       </a>`).join('\n');
+@@ -174,15 +171,15 @@ export function layout(title, activePath, bodyHtml) {
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+-  <meta name="dashboard-token" content="${token}">
+   <title>${title} — NanoClaw Dashboard</title>
+   <style>${CSS}</style>
+   <script>
+-    const TOKEN = document.querySelector('meta[name="dashboard-token"]')?.content || '';
+     async function api(path) {
+-      const headers = {};
+-      if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
+-      const res = await fetch(path, { headers });
++      const res = await fetch(path);
++      if (res.status === 401) {
++        location.href = '/dashboard/login';
++        throw new Error('Not logged in');
++      }
+       if (!res.ok) throw new Error('API error: ' + res.status);
+       return res.json();
+     }
+@@ -235,3 +232,53 @@ export function layout(title, activePath, bodyHtml) {
+ </body>
+ </html>`;
+ }
++const LOGIN_CSS = `
++  .login { max-width: 380px; margin: 18vh auto 0; }
++  .login h1 { font-size: 18px; color: #fff; margin-bottom: 8px; }
++  .login p { font-size: 13px; color: #888; margin-bottom: 16px; }
++  .login p.error { color: #f87171; }
++  .login label { display: block; font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
++  .login input {
++    width: 100%;
++    background: #0f0f0f;
++    color: #e0e0e0;
++    border: 1px solid #2a2a2a;
++    border-radius: 4px;
++    padding: 8px 10px;
++    font-size: 14px;
++    margin-bottom: 12px;
++  }
++  .login button {
++    width: 100%;
++    background: #1e2a35;
++    color: #7eb8da;
++    border: 1px solid #7eb8da;
++    border-radius: 4px;
++    padding: 8px;
++    font-size: 14px;
++    cursor: pointer;
++  }
++  .login button:hover { background: #253545; }
++`;
++/** The login form. `error` is one of the server's fixed messages, never request input. */
++export function loginPage(error) {
++    return `<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>Log in — NanoClaw Dashboard</title>
++  <style>${CSS}${LOGIN_CSS}</style>
++</head>
++<body>
++  <form class="login card" method="post" action="/dashboard/login">
++    <h1>NanoClaw Dashboard</h1>
++    <p>Paste DASHBOARD_SECRET from NanoClaw's .env once; this browser then stays logged in.</p>
++    ${error ? `<p class="error">${error}</p>` : ''}
++    <label for="secret">Dashboard secret</label>
++    <input id="secret" type="password" name="secret" autocomplete="current-password" autofocus required>
++    <button type="submit">Log in</button>
++  </form>
++</body>
++</html>`;
++}
+diff --git a/dist/ui/pages/logs.js b/dist/ui/pages/logs.js
+index 93fe37af10c30bf3ab8ac49647914b3f71bae682..6a7ffe5977cd41260cd8fc6bb10104952e38b599 100644
+--- a/dist/ui/pages/logs.js
++++ b/dist/ui/pages/logs.js
+@@ -24,8 +24,11 @@ export function logsPage() {
+ 
+     function connect() {
+       statusEl.textContent = 'Connecting...';
+-      var logUrl = '/api/logs?token=' + encodeURIComponent(TOKEN);
+-      fetch(logUrl).then(function(response) {
++      fetch('/api/logs').then(function(response) {
++        if (response.status === 401) {
++          location.href = '/dashboard/login';
++          return;
++        }
+         if (!response.ok) {
+           statusEl.textContent = 'Log streaming unavailable';
+           statusEl.style.color = '#f87171';
