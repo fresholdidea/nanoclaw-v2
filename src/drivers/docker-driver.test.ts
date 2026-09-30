@@ -381,6 +381,26 @@ describe('lifecycle', () => {
     );
   });
 
+  it('never logs the container env or argv when it exits non-zero', async () => {
+    // Regression: a local diagnostic once logged the whole `docker run` argv on
+    // a non-zero exit, writing every `-e KEY=value` — vendor API keys and the
+    // gateway proxy credential — into the host error log.
+    const spec = fixtureSpec();
+    spec.containers[0].env.MCP_REGION = 'env-value-that-must-not-be-logged';
+    spec.containers[0].contributedEnv = { HTTPS_PROXY: 'http://x:aoc_FIXTUREGATEWAYTOKEN@gateway:10255' };
+    const handle = await driver().prepare(spec);
+    await handle.start();
+
+    const proc = cli.started.at(-1)!.proc;
+    proc.emitStderr('fatal: boot failed');
+    proc.emitExit(137);
+
+    const logged = JSON.stringify(Object.values(log).flatMap((fn) => vi.mocked(fn).mock.calls));
+    expect(logged).toContain('fatal: boot failed');
+    expect(logged).not.toContain('env-value-that-must-not-be-logged');
+    expect(logged).not.toContain('aoc_FIXTUREGATEWAYTOKEN');
+  });
+
   it('does not report a terminal event for a stop the host asked for', async () => {
     // The driver emits the end it observed (no intent filtering, r3); the
     // hub saw stop() through the wrapped handle and suppresses delivery.
