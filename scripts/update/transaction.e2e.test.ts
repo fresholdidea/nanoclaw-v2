@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import {
   cleanupUpdate,
   cutoverUpdate,
   finishUpdate,
+  loadGatewayModules,
   loadState,
   prepareUpdate,
   pruneTransactions,
@@ -17,7 +18,7 @@ import {
   validateUpdate,
   type UpdateRuntime,
 } from './transaction.js';
-import { CUTOVER_STOP_CLI_TIMEOUT_MS, drainContainers, stopService } from './service.js';
+import { CUTOVER_STOP_CLI_TIMEOUT_MS, DRAIN_LIST_FORMAT, drainContainers, stopService } from './service.js';
 import { getInstallSlug } from '../../src/install-slug.js';
 import type { CommandRunner, ServiceHandle } from './service.js';
 
@@ -194,6 +195,11 @@ function fakeRuntime(
     drainContainers: async () => {
       events.push('containers drained');
     },
+    restartGateways: () => {
+      events.push('gateways restarted');
+    },
+    // The fixtures are minimal repos with no setup/ tree; load this checkout's.
+    loadGateway: () => loadGatewayModules(path.resolve(import.meta.dirname, '../..')),
     startService: () => {
       events.push('service start');
       if (options.migrateOnStart && fs.readFileSync(path.join(install, 'src/value.ts'), 'utf8').includes('new')) {
@@ -218,7 +224,8 @@ describe('update-nanoclaw transaction end to end', () => {
     process.env.NANOCLAW_UPDATE_DIR = temp('nanoclaw-update-state-');
     const bin = temp('nanoclaw-update-bin-');
     const pnpm = path.join(bin, 'pnpm');
-    write(bin, 'pnpm', `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$3"\n`);
+    // Runs the detector script, the last argument of `pnpm --silent exec tsx <script>`.
+    write(bin, 'pnpm', `#!/bin/sh\nfor script; do :; done\nexec ${JSON.stringify(process.execPath)} "$script"\n`);
     fs.chmodSync(pnpm, 0o755);
     const previousPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${previousPath ?? ''}`;
@@ -282,8 +289,13 @@ describe('update-nanoclaw transaction end to end', () => {
     fs.writeFileSync(path.join(fixture.install, 'start-nanoclaw.sh'), '#!/bin/bash\nexit 1\n');
     fs.writeFileSync(path.join(fixture.install, 'nanoclaw.pid'), '9999\n');
     runtime.detectService = () => ({ mode: 'unmanaged', active: true });
+    const beforeRollback = events.length;
     state = await rollbackUpdate(fixture.install, state.id, runtime);
     expect(state.phase).toBe('rolled-back');
+    // Gateways kept through cutover must be remounted onto the restored data/.
+    const rollbackEvents = events.slice(beforeRollback);
+    expect(rollbackEvents).toContain('gateways restarted');
+    expect(rollbackEvents.indexOf('gateways restarted')).toBeLessThan(rollbackEvents.indexOf('service start'));
     expect(exec(fixture.install, 'git', ['rev-parse', 'HEAD'])).toBe(fixture.originalHead);
     expect(fs.readFileSync(path.join(fixture.install, 'data/v2.db'), 'utf8')).toBe('old-schema');
     expect(fs.readFileSync(path.join(fixture.install, '.env'), 'utf8')).toBe('EXAMPLE=old\n');
@@ -573,6 +585,92 @@ describe('update-nanoclaw transaction end to end', () => {
     expect(running).toBe(true);
   });
 
+  it('a rollback whose drain fails restarts the stopped service and changes nothing', async () => {
+    const fixture = createForkFixture();
+    previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
+    process.env.NANOCLAW_UPDATE_DIR = temp('nanoclaw-update-state-');
+    const { runtime, events } = fakeRuntime(fixture.install);
+    let state = prepareUpdate({ projectRoot: fixture.install, upstreamRef: 'upstream/main' }, runtime);
+    state = await validateUpdate(fixture.install, state.id, runtime);
+    state = await cutoverUpdate(fixture.install, state.id, runtime);
+    state = await finishUpdate(fixture.install, state.id, runtime);
+    const updatedHead = exec(fixture.install, 'git', ['rev-parse', 'HEAD']);
+
+    runtime.drainContainers = async () => {
+      throw new Error('Cannot inspect active NanoClaw containers with docker');
+    };
+    events.length = 0;
+    await expect(rollbackUpdate(fixture.install, state.id, runtime)).rejects.toThrow('Cannot inspect');
+    expect(events).toEqual(['service stop', 'service start']);
+    expect(loadState(fixture.install, state.id).phase).toBe('complete');
+    expect(exec(fixture.install, 'git', ['rev-parse', 'HEAD'])).toBe(updatedHead);
+  });
+
+  it('a failed rollback drain never starts a service that was already down (after cutover, before finish)', async () => {
+    const fixture = createForkFixture();
+    previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
+    process.env.NANOCLAW_UPDATE_DIR = temp('nanoclaw-update-state-');
+    const { runtime, events } = fakeRuntime(fixture.install);
+    let state = prepareUpdate({ projectRoot: fixture.install, upstreamRef: 'upstream/main' }, runtime);
+    state = await validateUpdate(fixture.install, state.id, runtime);
+    state = await cutoverUpdate(fixture.install, state.id, runtime);
+
+    // Cutover left the service stopped; migrations may still be pending.
+    runtime.detectService = () => ({ mode: 'systemd-user', active: false, name: 'nanoclaw-test' });
+    runtime.drainContainers = async () => {
+      throw new Error('Cannot inspect active NanoClaw containers with docker');
+    };
+    events.length = 0;
+    await expect(rollbackUpdate(fixture.install, state.id, runtime)).rejects.toThrow('Cannot inspect');
+    expect(events).not.toContain('service start');
+    expect(loadState(fixture.install, state.id).phase).toBe('cutover');
+  });
+
+  it('nohup rollback stops the host started after cutover and drains containers before restoring data/', async () => {
+    const fixture = createForkFixture();
+    previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
+    process.env.NANOCLAW_UPDATE_DIR = temp('nanoclaw-update-state-');
+    const { runtime, events } = fakeRuntime(fixture.install);
+    // Captured at cutover: the pre-update host, which cutover itself stops.
+    const oldPid = spawnSync('node', ['-e', '']).pid;
+    const definition = path.join(fixture.install, 'start-nanoclaw.sh');
+    runtime.detectService = () => ({ mode: 'nohup', active: true, definition, pid: oldPid });
+    runtime.stopService = async (handle) => {
+      events.push(`service stop ${handle.pid}`);
+      await stopService(handle, { ...runtime.serviceEnv, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) });
+    };
+    const proc = temp('nanoclaw-update-proc-');
+    runtime.serviceEnv.procRoot = proc;
+    runtime.drainContainers = async (root) => {
+      events.push(`containers drained (db=${fs.readFileSync(path.join(root, 'data/v2.db'), 'utf8')})`);
+    };
+
+    let state = prepareUpdate({ projectRoot: fixture.install, upstreamRef: 'upstream/main' }, runtime);
+    state = await validateUpdate(fixture.install, state.id, runtime);
+    state = await cutoverUpdate(fixture.install, state.id, runtime);
+    state = await finishUpdate(fixture.install, state.id, runtime);
+    expect(state.phase).toBe('complete');
+
+    // finish's start-nanoclaw.sh launched a new host and recorded only its pid.
+    const live = spawn('sleep', ['30'], { stdio: 'ignore' });
+    const exited = new Promise((resolve) => live.once('exit', resolve));
+    try {
+      fs.writeFileSync(path.join(fixture.install, 'nanoclaw.pid'), `${live.pid}\n`);
+      const entrypoint = path.join(fs.realpathSync(fixture.install), 'dist', 'index.js');
+      write(proc, `${live.pid}/cmdline`, `node\0${entrypoint}\0`);
+      fs.writeFileSync(path.join(fixture.install, 'data/v2.db'), 'post-update-data');
+      events.length = 0;
+
+      state = await rollbackUpdate(fixture.install, state.id, runtime);
+      expect(state.phase).toBe('rolled-back');
+      expect(events.slice(0, 2)).toEqual([`service stop ${live.pid}`, 'containers drained (db=post-update-data)']);
+      await expect(exited).resolves.toBeDefined();
+      expect(fs.readFileSync(path.join(fixture.install, 'data/v2.db'), 'utf8')).toBe('old-schema');
+    } finally {
+      live.kill('SIGKILL');
+    }
+  });
+
   it("cutover stops the install's containers only after the service is down, and a container that will not stop restores the old service (#3828)", async () => {
     const fixture = createForkFixture();
     previousUpdateDir = process.env.NANOCLAW_UPDATE_DIR;
@@ -607,7 +705,7 @@ describe('update-nanoclaw transaction end to end', () => {
     expect(cut.phase).toBe('cutover');
     // state.projectRoot is realpathed (macOS tmp lives under /var → /private/var), so derive the slug from it.
     const slugValue = getInstallSlug(cut.projectRoot);
-    const ps = `docker ps -q --filter label=nanoclaw-install=${slugValue}`;
+    const ps = `docker ps --filter label=nanoclaw-install=${slugValue} --format ${DRAIN_LIST_FORMAT}`;
     expect(events.indexOf('service stop')).toBeLessThan(events.indexOf(ps));
     expect(events.filter((e) => e.startsWith('docker '))).toEqual([ps, 'docker stop -t 10 idle111', ps]);
 
