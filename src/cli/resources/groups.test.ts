@@ -668,3 +668,94 @@ describe('groups config update --provider-chain / --no-fallback', () => {
     );
   });
 });
+
+describe('groups update — architecture columns (tier / reports_to / role / persona)', () => {
+  const ZED = 'ag-zed';
+  const BUILDER = 'ag-builder';
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await runMigrations(await initTestDb());
+    await createAgentGroup({ id: ZED, name: 'Zed', folder: 'zed', agent_provider: null, created_at: now() });
+    await createAgentGroup({
+      id: BUILDER,
+      name: 'Builder',
+      folder: 'builder',
+      agent_provider: null,
+      created_at: now(),
+    });
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  const update = (id: string, args: Record<string, unknown>) =>
+    dispatch({ id: 'req', command: 'groups-update', args: { id, ...args } }, { caller: 'host' });
+
+  it('sets every column, canonicalizes persona, and surfaces them on get/list', async () => {
+    const resp = await update(BUILDER, {
+      tier: 'worker',
+      'reports-to': ZED,
+      role: '  Executes build tasks for Zed  ',
+      persona: '{"initials":"BD","emoji":"🔧","color":" #1e90ff "}',
+    });
+    expect(errorMessage(resp)).toBeUndefined();
+
+    const got = await dispatch({ id: 'g', command: 'groups-get', args: { id: BUILDER } }, { caller: 'host' });
+    expect(got.ok && got.data).toMatchObject({
+      id: BUILDER,
+      tier: 'worker',
+      reports_to: ZED,
+      role: 'Executes build tasks for Zed',
+      persona: JSON.stringify({ initials: 'BD', emoji: '🔧', color: '#1e90ff' }),
+    });
+
+    const listed = await dispatch({ id: 'l', command: 'groups-list', args: { tier: 'worker' } }, { caller: 'host' });
+    expect(listed.ok && (listed.data as Array<{ id: string }>).map((g) => g.id)).toEqual([BUILDER]);
+  });
+
+  it('clears each column with ""', async () => {
+    expect(
+      errorMessage(await update(BUILDER, { tier: 'worker', 'reports-to': ZED, role: 'x', persona: '{}' })),
+    ).toBeUndefined();
+    const resp = await update(BUILDER, { tier: '', 'reports-to': '', role: '', persona: '' });
+    expect(errorMessage(resp)).toBeUndefined();
+    expect(resp.ok && resp.data).toMatchObject({ tier: null, reports_to: null, role: null, persona: null });
+  });
+
+  it('rejects an unknown tier', async () => {
+    expect(errorMessage(await update(BUILDER, { tier: 'boss' }))).toMatch(/tier must be one of: orchestrator/);
+  });
+
+  it('rejects reports_to that does not exist, points at itself, or forms a cycle', async () => {
+    expect(errorMessage(await update(BUILDER, { 'reports-to': 'ag-nope' }))).toMatch(/agent group not found: ag-nope/);
+    expect(errorMessage(await update(BUILDER, { 'reports-to': BUILDER }))).toMatch(/cannot point at the group itself/);
+
+    expect(errorMessage(await update(BUILDER, { 'reports-to': ZED }))).toBeUndefined();
+    expect(errorMessage(await update(ZED, { 'reports-to': BUILDER }))).toMatch(/would form a cycle/);
+  });
+
+  it('rejects a multi-line role and malformed persona payloads', async () => {
+    expect(errorMessage(await update(BUILDER, { role: 'line one\nline two' }))).toMatch(/single line/);
+    expect(errorMessage(await update(BUILDER, { persona: 'not json' }))).toMatch(/JSON object/);
+    expect(errorMessage(await update(BUILDER, { persona: '["x"]' }))).toMatch(/JSON object/);
+    expect(errorMessage(await update(BUILDER, { persona: '{"avatar":"x"}' }))).toMatch(/unknown key "avatar"/);
+    expect(errorMessage(await update(BUILDER, { persona: '{"emoji":7}' }))).toMatch(/persona\.emoji must be a string/);
+  });
+
+  it('a group-scoped container agent cannot change tier or reports_to', async () => {
+    await ensureContainerConfig(BUILDER);
+    const resp = await dispatch(
+      { id: 'a', command: 'groups-update', args: { tier: 'orchestrator' } },
+      { caller: 'agent', sessionId: 'sess-b', agentGroupId: BUILDER, messagingGroupId: 'mg-b' },
+    );
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+      expect(resp.error.message).toMatch(/tier or reports_to/);
+    }
+  });
+});

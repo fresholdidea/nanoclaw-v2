@@ -1,5 +1,16 @@
 // ── Central DB entities ──
 
+/** Agent architecture tiers (`agent_groups.tier`). */
+export const AGENT_TIERS = ['orchestrator', 'account', 'specialist', 'worker', 'personal'] as const;
+export type AgentTier = (typeof AGENT_TIERS)[number];
+
+/** Decoded `agent_groups.persona` — every key optional, all strings. */
+export interface AgentPersona {
+  emoji?: string;
+  color?: string;
+  initials?: string;
+}
+
 export interface AgentGroup {
   id: string;
   name: string;
@@ -7,6 +18,18 @@ export interface AgentGroup {
   /** @deprecated Use container_configs.provider instead. */
   agent_provider: string | null;
   created_at: string;
+  /**
+   * Architecture metadata (migration 026). Optional on the type so callers
+   * that mint a group can omit them; rows read back always carry them
+   * (NULL = unclassified). Validated on write in `src/db/agent-groups.ts`.
+   */
+  tier?: AgentTier | null;
+  /** Agent group id this group reports to. */
+  reports_to?: string | null;
+  /** One-line role description. */
+  role?: string | null;
+  /** JSON-encoded `AgentPersona`. */
+  persona?: string | null;
 }
 
 /**

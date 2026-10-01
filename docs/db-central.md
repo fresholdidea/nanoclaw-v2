@@ -23,12 +23,18 @@ CREATE TABLE agent_groups (
   name             TEXT NOT NULL,
   folder           TEXT NOT NULL UNIQUE,
   agent_provider   TEXT,
-  created_at       TEXT NOT NULL
+  created_at       TEXT NOT NULL,
+  tier             TEXT,   -- v26: orchestrator | account | specialist | worker | personal
+  reports_to       TEXT,   -- v26: agent_groups.id this group reports to (no FK; validated in code)
+  role             TEXT,   -- v26: one-line role description
+  persona          TEXT    -- v26: JSON object {emoji?, color?, initials?}
 );
 ```
 
-- **Readers:** `src/session-manager.ts`, `src/delivery.ts`, `src/router.ts`
-- **Writers:** `src/db/agent-groups.ts`
+The four architecture columns (migration 26) are all nullable with no backfill — NULL means "unclassified". They are validated on write by `normalizeAgentArchitectureUpdates` in `src/db/agent-groups.ts` (shared by `updateAgentGroup` and the `ncl groups update` `preUpdate` hook): `tier` must be one of the five values, `reports_to` must name an existing group and may not self-reference or close a cycle, `role` is a trimmed single line (≤ 200 chars), `persona` is re-encoded canonically from a JSON object whose only allowed keys are `emoji`, `color`, `initials` (string values). `reports_to` deliberately carries no FK so `ncl groups delete` never has to re-parent children first; a dangling value reads as "reports to a deleted group". Set them with `ncl groups update --id <id> --tier … --reports-to … --role … --persona '<json>'` (`""` clears). A group-scoped container agent (`cli_scope = group`) is denied `--tier` / `--reports-to` outright, like `--cli-scope`. The dashboard pusher surfaces them on each `agent_groups[]` entry (persona parsed) alongside `lastActiveAt` and the top-level `a2a_edges`.
+
+- **Readers:** `src/session-manager.ts`, `src/delivery.ts`, `src/router.ts`, `src/dashboard-pusher.ts`
+- **Writers:** `src/db/agent-groups.ts`, `src/cli/resources/groups.ts` (generic update)
 
 ### 1.2 `messaging_groups`
 
@@ -443,6 +449,7 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 23 | `approvals-instance` | `023-approvals-instance.ts` | `pending_approvals.instance` — adapter instance the approval card was delivered through |
 | 24 | `wiring-thread-filter` | `024-wiring-thread-filter.ts` | `messaging_group_agents.thread_filter` — scope a wiring to one thread/topic (NULL = unscoped); scoped match makes unscoped wirings stand down |
 | 25 | `destination-thread` | `025-destination-thread.ts` | `agent_destinations.thread_id` — pin a channel destination to one thread/topic (NULL = session thread / top level) |
+| 26 | `agent-group-architecture` | `026-agent-group-architecture.ts` | `agent_groups.tier`, `reports_to`, `role`, `persona` — org-chart metadata for the dashboard and `ncl groups` (all NULL = unclassified; validated in code, see §1.1) |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

@@ -7,7 +7,7 @@ import path from 'path';
 import http from 'http';
 import Database from 'better-sqlite3';
 
-import { getAllAgentGroups, getAgentGroup } from './db/agent-groups.js';
+import { getAllAgentGroups, getAgentGroup, parseAgentPersona } from './db/agent-groups.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
 import { getAllMessagingGroups, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { getDestinations } from './modules/agent-to-agent/db/agent-destinations.js';
@@ -129,8 +129,12 @@ async function push(config: PusherConfig): Promise<void> {
 }
 
 async function collectSnapshot(): Promise<Record<string, unknown>> {
+  // One pass over every session outbound.db feeds both the per-group
+  // `lastActiveAt` and the top-level `a2a_edges`; results are cached by
+  // file mtime (see `collectOutboundStats`) since this runs every minute.
+  const outbound = collectOutboundStats();
   const [agentGroups, sessions, channels, users, tokens, contextWindows] = await Promise.all([
-    collectAgentGroups(),
+    collectAgentGroups(outbound.lastActiveByGroup),
     collectSessions(),
     collectChannels(),
     collectUsers(),
@@ -149,10 +153,11 @@ async function collectSnapshot(): Promise<Record<string, unknown>> {
     context_windows: contextWindows,
     activity: collectActivity(),
     messages: collectMessages(),
+    a2a_edges: outbound.edges,
   };
 }
 
-async function collectAgentGroups() {
+async function collectAgentGroups(lastActiveByGroup: ReadonlyMap<string, string> = new Map()) {
   const result = [];
   for (const g of await getAllAgentGroups()) {
     const sessions = await getSessionsByAgentGroup(g.id);
@@ -200,9 +205,153 @@ async function collectAgentGroups() {
       members,
       admins,
       created_at: g.created_at,
+      // Architecture metadata (agent_groups migration 026). Additive — every
+      // field above keeps its shape so older dashboard builds still ingest.
+      tier: g.tier ?? null,
+      reports_to: g.reports_to ?? null,
+      role: g.role ?? null,
+      persona: parseAgentPersona(g.persona),
+      lastActiveAt: lastActiveByGroup.get(g.id) ?? null,
     });
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Session outbound.db scan — per-group last activity + agent-to-agent edges
+// ---------------------------------------------------------------------------
+
+export interface A2aEdge {
+  /** Sending agent group id (the session's `ag-…` directory). */
+  from: string;
+  /** Receiving agent group id (`messages_out.platform_id` on an `agent` row). */
+  to: string;
+  /** Agent-to-agent messages sent in the trailing 7 days. */
+  count7d: number;
+  /** ISO timestamp of the newest counted message. */
+  lastAt: string;
+}
+
+interface OutboundFileStats {
+  mtimeMs: number;
+  size: number;
+  /** MAX(messages_out.timestamp) — null for an empty table. */
+  lastAt: string | null;
+  /** `channel_type='agent'` rows newer than the cutoff at scan time. */
+  agentRows: Array<{ ts: string; to: string }>;
+}
+
+const A2A_WINDOW_MS = 7 * 86400000;
+const outboundStatsCache = new Map<string, OutboundFileStats>();
+
+/** Test hook: forget every cached outbound.db scan. */
+export function resetDashboardCaches(): void {
+  outboundStatsCache.clear();
+}
+
+/**
+ * Read one outbound.db, through the mtime/size cache. Opens read-only and
+ * tolerates a missing, locked, or corrupt file by returning the cached entry
+ * (if any) or null — a container mid-write must never fail the push.
+ */
+function readOutboundStats(dbPath: string, cutoff: string): OutboundFileStats | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(dbPath);
+  } catch {
+    outboundStatsCache.delete(dbPath);
+    return null;
+  }
+  const cached = outboundStatsCache.get(dbPath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
+
+  let db: Database.Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const last = db.prepare('SELECT MAX(timestamp) AS last_at FROM messages_out').get() as
+      | { last_at: string | null }
+      | undefined;
+    const rows = db
+      .prepare(
+        `SELECT timestamp AS ts, platform_id AS "to" FROM messages_out
+          WHERE channel_type = 'agent' AND platform_id IS NOT NULL AND timestamp > ?`,
+      )
+      .all(cutoff) as Array<{ ts: string; to: string }>;
+    const entry: OutboundFileStats = {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      lastAt: last?.last_at ?? null,
+      agentRows: rows,
+    };
+    outboundStatsCache.set(dbPath, entry);
+    return entry;
+  } catch {
+    return cached ?? null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Walk `data/v2-sessions/<ag>/<session>/outbound.db` once and derive:
+ * - `lastActiveByGroup`: newest `messages_out.timestamp` per agent group
+ * - `edges`: agent-to-agent traffic in the trailing 7 days, keyed (from, to)
+ */
+function collectOutboundStats(): { lastActiveByGroup: Map<string, string>; edges: A2aEdge[] } {
+  const lastActiveByGroup = new Map<string, string>();
+  const edgeMap = new Map<string, A2aEdge>();
+  const sessionsDir = path.join(DATA_DIR, 'v2-sessions');
+  if (!fs.existsSync(sessionsDir)) return { lastActiveByGroup, edges: [] };
+
+  const cutoff = new Date(Date.now() - A2A_WINDOW_MS).toISOString();
+  const seen = new Set<string>();
+
+  try {
+    for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
+      const agPath = path.join(sessionsDir, agDir);
+      let sessDirs: string[];
+      try {
+        sessDirs = fs.readdirSync(agPath).filter((d) => d.startsWith('sess-'));
+      } catch {
+        continue;
+      }
+      for (const sessDir of sessDirs) {
+        const dbPath = path.join(agPath, sessDir, 'outbound.db');
+        seen.add(dbPath);
+        const stats = readOutboundStats(dbPath, cutoff);
+        if (!stats) continue;
+
+        if (stats.lastAt) {
+          const prev = lastActiveByGroup.get(agDir);
+          if (!prev || stats.lastAt > prev) lastActiveByGroup.set(agDir, stats.lastAt);
+        }
+        for (const row of stats.agentRows) {
+          // Cached rows age out of the window between rescans.
+          if (row.ts <= cutoff) continue;
+          const key = `${agDir}\u0000${row.to}`;
+          const edge = edgeMap.get(key);
+          if (edge) {
+            edge.count7d++;
+            if (row.ts > edge.lastAt) edge.lastAt = row.ts;
+          } else {
+            edgeMap.set(key, { from: agDir, to: row.to, count7d: 1, lastAt: row.ts });
+          }
+        }
+      }
+    }
+  } catch {
+    /* skip */
+  }
+
+  // Drop cache entries for files that no longer exist on disk.
+  for (const key of outboundStatsCache.keys()) if (!seen.has(key)) outboundStatsCache.delete(key);
+
+  const edges = [...edgeMap.values()].sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
+  return { lastActiveByGroup, edges };
 }
 
 async function collectSessions() {

@@ -12,7 +12,7 @@ import {
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
-import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
+import { createAgentGroup, getAgentGroupByFolder, normalizeAgentArchitectureUpdates } from '../../db/agent-groups.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -35,7 +35,7 @@ import {
   type RestampResult,
 } from '../../templates/restamp.js';
 import { isValidTimezone } from '../../timezone.js';
-import type { AgentGroup, ContainerConfigRow } from '../../types.js';
+import { AGENT_TIERS, type AgentGroup, type ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 import { localizeIsoTimestamps } from '../format.js';
 import type { CallerContext } from '../frame.js';
@@ -140,12 +140,48 @@ registerResource({
       required: true,
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
+    {
+      name: 'tier',
+      type: 'string',
+      description:
+        `Architecture tier: ${AGENT_TIERS.join(' | ')}. Pass "" to clear. ` +
+        'A group-scoped container agent cannot change it.',
+      updatable: true,
+    },
+    {
+      name: 'reports_to',
+      type: 'string',
+      description:
+        'Agent group id this group reports to (must exist; no self-reference or cycle). Pass "" to clear. ' +
+        'A group-scoped container agent cannot change it.',
+      updatable: true,
+    },
+    {
+      name: 'role',
+      type: 'string',
+      description: 'One-line role description (max 200 chars). Pass "" to clear.',
+      updatable: true,
+    },
+    {
+      name: 'persona',
+      type: 'string',
+      description:
+        'JSON object with optional string keys emoji, color, initials — e.g. \'{"emoji":"🦉","color":"#1e90ff","initials":"ZD"}\'. ' +
+        'Stored canonically; pass "" to clear.',
+      updatable: true,
+    },
   ],
   // `create` and `delete` are custom (below): create needs a `--template`
   // branch, and the generic create inserts a bare agent_groups row but never
   // the container_config a working group needs; the generic single-table
   // DELETE violates FK constraints (#2525).
   operations: { list: 'open', get: 'open', update: 'approval' },
+  // Architecture columns: `""` clears, tier is an enum, reports_to must name
+  // an existing group, persona is validated JSON. One validator shared with
+  // `updateAgentGroup` so the DB layer and the CLI agree.
+  preUpdate: async (updates, current) => {
+    await normalizeAgentArchitectureUpdates(String(current.id), updates);
+  },
   customOperations: {
     connect: {
       access: 'open',

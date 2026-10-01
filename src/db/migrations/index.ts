@@ -30,6 +30,7 @@ import { migration024 as migration024WiringThreadFilter } from './024-wiring-thr
 import { migration025 as migration025DestinationThread } from './025-destination-thread.js';
 import { migration024 } from './024-host-coordination.js';
 import { migration025 } from './025-container-config-speed.js';
+import { migration026 } from './026-agent-group-architecture.js';
 
 interface MigrationBase {
   version: number;
@@ -101,6 +102,7 @@ export const migrations: Migration[] = [
   migration025DestinationThread,
   migration024,
   migration025,
+  migration026,
 ];
 
 /**

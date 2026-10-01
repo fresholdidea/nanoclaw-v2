@@ -20,6 +20,15 @@ NanoClaw (pusher)              Dashboard (npm package)
                                └──────────────┘
 ```
 
+### Snapshot additions: agent architecture
+
+The `/api/ingest` payload is additive — every field the dashboard already ingests keeps its shape. Since the `agent-group-architecture` migration (026) the pusher also sends:
+
+- Per `agent_groups[]` entry: `tier` (`orchestrator | account | specialist | worker | personal | null`), `reports_to` (agent group id or null), `role` (string or null), `persona` (parsed `{emoji?, color?, initials?}` object or null), and `lastActiveAt` (ISO string of the newest `messages_out.timestamp` across that group's session `outbound.db` files, or null).
+- Top-level `a2a_edges: [{ from, to, count7d, lastAt }]` — agent-to-agent traffic in the trailing 7 days, derived from `messages_out` rows with `channel_type = 'agent'` (`from` = the session's agent group, `to` = `platform_id`). Sorted by `from`, then `to`.
+
+Both come from one read-only pass over `data/v2-sessions/<ag>/<session>/outbound.db`, cached per file by mtime/size, so a locked or corrupt file degrades to "no data for that session" rather than failing the push. Set the columns with `ncl groups update --id <id> --tier … --reports-to … --role … --persona '<json>'` (`""` clears).
+
 ## Steps
 
 ### 1. Install the npm package

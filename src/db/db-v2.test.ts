@@ -127,6 +127,34 @@ describe('agent groups', () => {
     expect((await getAgentGroup('ag-1'))!.name).toBe('Updated');
   });
 
+  it('architecture columns default to NULL and validate on write', async () => {
+    await createAgentGroup(ag());
+    await createAgentGroup({ ...ag(), id: 'ag-2', name: 'Parent', folder: 'parent' });
+    expect(await getAgentGroup('ag-1')).toMatchObject({ tier: null, reports_to: null, role: null, persona: null });
+
+    await updateAgentGroup('ag-1', {
+      tier: 'specialist',
+      reports_to: 'ag-2',
+      role: 'Paid media analyst',
+      persona: '{"emoji":"📊"}',
+    });
+    expect(await getAgentGroup('ag-1')).toMatchObject({
+      tier: 'specialist',
+      reports_to: 'ag-2',
+      role: 'Paid media analyst',
+      persona: '{"emoji":"📊"}',
+    });
+
+    await expect(updateAgentGroup('ag-1', { tier: 'ceo' as never })).rejects.toThrow(/tier must be one of/);
+    await expect(updateAgentGroup('ag-1', { reports_to: 'ag-missing' })).rejects.toThrow(/not found/);
+    await expect(updateAgentGroup('ag-2', { reports_to: 'ag-1' })).rejects.toThrow(/cycle/);
+    await expect(updateAgentGroup('ag-1', { persona: '{"emoji":1}' })).rejects.toThrow(/must be a string/);
+
+    // null clears
+    await updateAgentGroup('ag-1', { tier: null, reports_to: null, role: null, persona: null });
+    expect(await getAgentGroup('ag-1')).toMatchObject({ tier: null, reports_to: null, role: null, persona: null });
+  });
+
   it('should delete', async () => {
     await createAgentGroup(ag());
     await deleteAgentGroup('ag-1');
