@@ -1,7 +1,7 @@
 /**
  * The dashboard serves every group's sessions, messages and the host log, so
- * its server (the @nanoco/nanoclaw-dashboard package, hardened by
- * patches/@nanoco__nanoclaw-dashboard@0.3.0.patch) must give nothing to a
+ * its server (the @nanoco/nanoclaw-dashboard fork at ../nanoclaw-dashboard,
+ * branch fork/nanoclaw-v2, which carries the hardening in source) must give nothing to a
  * caller that has not shown DASHBOARD_SECRET: as a Bearer token (the pusher,
  * API clients) or once at the login form, for a session cookie (the browser).
  * No response may carry the secret.
@@ -10,8 +10,9 @@
  * host.docker.internal to the host's 127.0.0.1, and the server sees 127.0.0.1
  * as the peer, so an agent container looks like a local browser.
  *
- * Runs against the installed package, so it also fails if the patch stops
- * applying (for example after a version bump).
+ * Runs against the linked package, so it also fails if the fork's dist is
+ * stale or its hardening regresses. The Fleet landing page and /api/fleet
+ * (org-chart metadata + agent-to-agent edges) are covered at the end.
  */
 import http from 'http';
 import net from 'net';
@@ -62,6 +63,30 @@ const SNAPSHOT = {
         },
       ],
       created_at: '2026-09-01T00:00:00.000Z',
+      tier: 'orchestrator',
+      reports_to: null,
+      role: 'Monitors ad accounts',
+      persona: { emoji: '📈' },
+      lastActiveAt: '2026-09-30T11:59:00.000Z',
+    },
+    {
+      id: 'ag-2',
+      name: 'Paid Media',
+      folder: 'paid-media',
+      agent_provider: 'claude',
+      container_config: null,
+      sessionCount: 0,
+      runningSessions: 0,
+      wirings: [],
+      destinations: [],
+      members: [],
+      admins: [],
+      created_at: '2026-09-01T00:00:00.000Z',
+      tier: 'specialist',
+      reports_to: 'ag-1',
+      role: null,
+      persona: null,
+      lastActiveAt: null,
     },
   ],
   sessions: [
@@ -104,10 +129,12 @@ const SNAPSHOT = {
       outbound: [],
     },
   ],
+  a2a_edges: [{ from: 'ag-1', to: 'ag-2', count7d: 3, lastAt: '2026-09-30T11:58:00.000Z' }],
 };
 
 const PAGES = [
   '/dashboard',
+  '/dashboard/overview',
   '/dashboard/agent-groups?id=ag-1',
   '/dashboard/sessions',
   '/dashboard/channels',
@@ -120,6 +147,7 @@ const API_READS = [
   '/api/status',
   '/api/overview',
   '/api/activity',
+  '/api/fleet',
   '/api/agent-groups',
   '/api/agent-groups/ag-1',
   '/api/sessions',
@@ -459,5 +487,93 @@ describe('where the dashboard answers', () => {
       socket.on('error', (err: NodeJS.ErrnoException) => resolve(err.code ?? 'error'));
     });
     expect(outcome).toBe('ECONNREFUSED');
+  });
+});
+
+describe('the Fleet landing page', () => {
+  it('is what /dashboard renders, with the overview moved to /dashboard/overview', async () => {
+    const cookie = sessionCookie(await login());
+    const fleet = await send({ path: '/dashboard', headers: { cookie } });
+    expect(fleet.status).toBe(200);
+    expect(fleet.headers['content-type']).toMatch(/^text\/html/);
+    expect(fleet.body).toContain('<title>Fleet');
+    expect(fleet.body).toContain('id="chart"');
+    expect(fleet.body).toContain('/api/fleet');
+    expect(fleet.body).not.toContain(SECRET);
+
+    const overview = await send({ path: '/dashboard/overview', headers: { cookie } });
+    expect(overview.status).toBe(200);
+    expect(overview.body).toContain('<title>Overview');
+    expect(overview.body).toContain('/api/overview');
+    expect(overview.body).toContain('href="/dashboard/overview"');
+    expect(overview.body).not.toContain(SECRET);
+  });
+
+  it('serves groups and edges from /api/fleet to a session or Bearer caller, and nobody else', async () => {
+    expect((await send({ path: '/api/fleet' })).status).toBe(401);
+    expect((await send({ path: '/api/fleet', headers: { authorization: 'Bearer nc-not-the-secret' } })).status).toBe(
+      401,
+    );
+
+    const cookie = sessionCookie(await login());
+    for (const headers of [{ cookie }, BEARER]) {
+      const reply = await send({ path: '/api/fleet', headers });
+      expect(reply.status).toBe(200);
+      const data = JSON.parse(reply.body);
+      expect(data.assistantName).toBe('TestBot');
+      expect(data.groups.map((g: { id: string }) => g.id)).toEqual(['ag-1', 'ag-2']);
+      const [ads, pm] = data.groups;
+      expect(ads).toMatchObject({
+        tier: 'orchestrator',
+        reports_to: null,
+        role: 'Monitors ad accounts',
+        persona: { emoji: '📈' },
+      });
+      expect(pm).toMatchObject({
+        tier: 'specialist',
+        reports_to: 'ag-1',
+        role: null,
+        persona: null,
+        status: 'offline',
+      });
+      expect(data.edges).toEqual(SNAPSHOT.a2a_edges);
+      expect(data.activity).not.toBeNull();
+      expect(data.activity.byGroup).toEqual({});
+      expect(reply.body).not.toContain(SECRET);
+    }
+  });
+
+  it('nulls a reports_to that names a missing group and tolerates a snapshot without the new fields', async () => {
+    const legacy = {
+      ...SNAPSHOT,
+      agent_groups: [
+        {
+          ...SNAPSHOT.agent_groups[0],
+          tier: undefined,
+          reports_to: undefined,
+          role: undefined,
+          persona: undefined,
+          lastActiveAt: undefined,
+        },
+        { ...SNAPSHOT.agent_groups[1], reports_to: 'ag-gone', runningSessions: 2 },
+      ],
+      a2a_edges: undefined,
+      messages: undefined,
+    };
+    expect((await sendJson('/api/ingest', BEARER, legacy)).status).toBe(200);
+    const reply = await send({ path: '/api/fleet', headers: BEARER });
+    expect(reply.status).toBe(200);
+    const data = JSON.parse(reply.body);
+    expect(data.groups[0]).toMatchObject({
+      tier: null,
+      reports_to: null,
+      role: null,
+      persona: null,
+      lastActiveAt: null,
+      status: 'offline',
+    });
+    expect(data.groups[1]).toMatchObject({ reports_to: null, status: 'running' });
+    expect(data.edges).toEqual([]);
+    expect(data.activity).toBeNull();
   });
 });

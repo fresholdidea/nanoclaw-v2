@@ -3,9 +3,6 @@ onlyBuiltDependencies:
   - protobufjs
   - sharp
 
-patchedDependencies:
-  "@nanoco/nanoclaw-dashboard@0.3.0": patches/@nanoco__nanoclaw-dashboard@0.3.0.patch
-
 # Top-level, NOT nested under a `pnpm:` key: pnpm reads a `pnpm:` config block
 # only from package.json. Nested here in pnpm-workspace.yaml the setting is
 # silently ignored. New package versions must exist on the registry this many
