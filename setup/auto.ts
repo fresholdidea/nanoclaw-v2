@@ -405,13 +405,13 @@ async function main(): Promise<void> {
       try {
         ({ blockers, hostContractModules } = await applyProviderSkill(skillDir, process.cwd()));
       } catch (err) {
-        s.stop(`Couldn't install ${agentProvider}.`, 1);
+        s.error(`Couldn't install ${agentProvider}.`);
         const message = err instanceof Error ? err.message : String(err);
         await fail(`add-${agentProvider}`, `Couldn't install ${agentProvider}.`, message);
         return; // unreachable — fail() exits — but narrows blockers for TS
       }
       if (blockers.length) {
-        s.stop(`Couldn't install ${agentProvider}.`, 1);
+        s.error(`Couldn't install ${agentProvider}.`);
         await fail(`add-${agentProvider}`, `Couldn't install ${agentProvider}.`, blockers.join('; '));
       }
       s.stop(`${agentProvider} installed.`);
@@ -879,7 +879,7 @@ async function confirmAssistantResponds(): Promise<PingResult> {
   } else {
     const msg =
       result === 'socket_error' ? "Couldn't reach the NanoClaw service." : "Your assistant didn't reply in time.";
-    s.stop(`${k.bold(fitToWidth(msg, suffix))}${k.dim(suffix)}`, 1);
+    s.error(`${k.bold(fitToWidth(msg, suffix))}${k.dim(suffix)}`);
   }
   return result;
 }

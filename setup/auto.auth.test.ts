@@ -59,7 +59,7 @@ vi.mock('@clack/prompts', () => ({
   intro: vi.fn(),
   cancel: vi.fn(),
   isCancel: (value: unknown) => typeof value === 'symbol',
-  spinner: () => ({ start: vi.fn(), stop: vi.fn() }),
+  spinner: () => ({ start: vi.fn(), stop: vi.fn(), error: vi.fn() }),
   log: { error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), step: vi.fn() },
 }));
 

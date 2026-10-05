@@ -40,7 +40,7 @@ vi.mock('../portal.js', () => ({ portalEnabled: state.portalEnabled, runSlackPor
 
 vi.mock('@clack/prompts', () => ({
   note: vi.fn((message: string, title: string) => state.notes.push({ message, title })),
-  spinner: vi.fn(() => ({ start: vi.fn(), stop: vi.fn() })),
+  spinner: vi.fn(() => ({ start: vi.fn(), stop: vi.fn(), error: vi.fn() })),
   log: {
     info: vi.fn((message: string) => state.infos.push(message)),
     warn: vi.fn((message: string) => state.warns.push(message)),
