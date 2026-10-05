@@ -174,6 +174,7 @@ export async function run(args: string[]): Promise<void> {
 
   // Lazy: the pairing store ships on the `channels` branch, so it only exists once
   // /add-dial has copied it in. Importing it here keeps module load adapter-free.
+  // @ts-ignore TS2307 until /add-dial installs the module; ts-expect-error would fail once it does.
   const { createPairing, getLineLock, waitForPairing } = await import('../src/channels/dial-pairing.js');
 
   const record = await createPairing();

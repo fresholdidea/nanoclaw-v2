@@ -1,0 +1,28 @@
+// Type-checks the tool code that runs through tsx and so never reached `tsc`:
+// the setup wizard (setup/) and the maintenance scripts (scripts/). The host in
+// src/ and the container runner have their own configs. Run: pnpm typecheck:tools
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    // setup/lib/host-status.mjs is plain JS that tests import; read its JSDoc types.
+    "allowJs": true,
+    "checkJs": false
+  },
+  "include": ["setup/**/*", "scripts/**/*"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    // Imports container/agent-runner modules that need the Bun runtime and its types.
+    "scripts/test-v2-agent.ts",
+    // Imports the add-iron-proxy skill scripts, which need src/ files that skill installs.
+    "scripts/opencode-auth-config.test.ts",
+    // Manual Docker + live-Claude script written against the old ChannelSetup
+    // (conversations, no onInboundEvent). Fix it or delete it, then drop this line.
+    "scripts/test-v2-channel-e2e.ts"
+  ]
+}

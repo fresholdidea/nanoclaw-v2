@@ -22,6 +22,7 @@ import { pathToFileURL } from 'node:url';
 
 import { applySkill, fullyApplied, removeSkill } from './skill-apply.js';
 import {
+  type Directive,
   lintGateAmbiguity,
   lintReferenceFloor,
   parseDirectives,
@@ -329,7 +330,7 @@ async function testSkill(
 
   for (const branch of meta.branches) pinRegistryRef(root, branch, refs[branch]);
   const byLine = new Map(directives.map((directive) => [directive.line, directive]));
-  let current = directives[0];
+  let current: Directive | undefined = directives[0];
 
   const apply = () =>
     applySkill(meta.dir, root, {
@@ -364,7 +365,9 @@ async function testSkill(
   }
   if (roundTrip) {
     const installed = before ? snapshot(root) : undefined;
-    await removeSkill(root, result.journal, (cmd) => command(cmd, root));
+    await removeSkill(root, result.journal, async (cmd) => {
+      await command(cmd, root);
+    });
     if (before && installed) {
       assertSnapshot('provider removal did not restore the exact checkout', before, snapshot(root));
       const verification = await verifyProviderContracts(root, { exec: (cmd, cwd) => command(cmd, cwd) });
