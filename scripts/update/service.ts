@@ -5,11 +5,12 @@ import path from 'node:path';
 
 import { getInstallSlug } from '../../src/install-slug.js';
 
-// Frozen installs and the full validation suite can legitimately emit more
-// than Node's 1 MiB execFileSync default (especially pnpm's dependency
-// report). Keep the controller's captured output bounded, but large enough
-// that a successful validation is not misreported as ENOBUFS.
-const MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024;
+// Node's default maxBuffer is 1 MiB; a full vitest run on a large repo exceeds
+// it and the whole validate step dies as `spawnSync pnpm ENOBUFS` with the
+// tests never judged, and frozen installs (pnpm's dependency report) can too.
+// 64 MiB is far above any real build/test output while still bounding a
+// runaway.
+const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024 * 1024;
 export interface RunOptions {
   /** Kill the subprocess and fail the call after this long. Unset = no bound. */
   timeoutMs?: number;
@@ -28,11 +29,6 @@ export function createCommandRunner(): CommandRunner {
       maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: options?.timeoutMs,
-      // Node's default maxBuffer is 1 MiB; a full vitest run on a large repo
-      // exceeds it and the whole validate step dies as `spawnSync pnpm
-      // ENOBUFS` with the tests never judged. 64 MiB is far above any real
-      // build/test output while still bounding a runaway.
-      maxBuffer: 64 * 1024 * 1024,
     }).trim();
   return {
     run,

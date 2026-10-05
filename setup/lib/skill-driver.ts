@@ -643,10 +643,10 @@ export function unknownInputKeys(skillDir: string, inputs: Record<string, string
 // CLI: pnpm exec tsx setup/lib/skill-driver.ts <skillDir>   — apply a skill interactively.
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   void (async () => {
-    const usage = (msg: string): never => {
+    function usage(msg: string): never {
       console.error(`${msg}\nusage: skill-driver <skill-dir> [--input key=value]...`);
       process.exit(2);
-    };
+    }
     const parsed = parseDriverArgv(process.argv.slice(2));
     if ('error' in parsed) usage(parsed.error);
     const { skillDir, inputs } = parsed;

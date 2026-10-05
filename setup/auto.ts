@@ -680,7 +680,7 @@ async function main(): Promise<void> {
       if (channelChoice !== 'skip' && channelChoice !== 'other') {
         await resolveDisplayName();
       }
-      let result: void | typeof BACK_TO_CHANNEL_SELECTION;
+      let result: void | typeof BACK_TO_CHANNEL_SELECTION = undefined;
       if (channelChoice === 'other') {
         result = await askOtherChannelName();
       } else if (channelChoice === 'skip') {
