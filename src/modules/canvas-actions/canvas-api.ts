@@ -101,13 +101,13 @@ export async function fetchCanvasHtml(token: string, canvasId: string): Promise<
       signal: AbortSignal.timeout(30_000),
     });
   } catch (err) {
-    throw new Error(`slack files.info failed: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`slack files.info failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
   }
   let info: Record<string, unknown>;
   try {
     info = (await infoRes.json()) as Record<string, unknown>;
-  } catch {
-    throw new Error(`slack files.info failed: HTTP ${infoRes.status}, non-JSON body`);
+  } catch (err) {
+    throw new Error(`slack files.info failed: HTTP ${infoRes.status}, non-JSON body`, { cause: err });
   }
   if (info.ok !== true) {
     throw new Error(`slack files.info failed: ${String(info.error ?? `HTTP ${infoRes.status}`)}`);
@@ -123,7 +123,7 @@ export async function fetchCanvasHtml(token: string, canvasId: string): Promise<
       signal: AbortSignal.timeout(30_000),
     });
   } catch (err) {
-    throw new Error(`canvas download failed: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`canvas download failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
   }
   if (!res.ok) throw new Error(`canvas download failed: HTTP ${res.status}`);
   return res.text();
