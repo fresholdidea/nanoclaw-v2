@@ -893,7 +893,7 @@ async function runSetup(args: Args, fetchFn: FetchFn = fetch, deps: SetupDeps = 
   if (!phone && args.interactive && process.stdin.isTTY) {
     const answer = await p.text({
       message: 'Your iMessage phone number (E.164, e.g. +15551234567)',
-      validate: (v) => (isE164(normalizePhone(v)) ? undefined : 'Enter a valid E.164 number, e.g. +15551234567'),
+      validate: (v) => (isE164(normalizePhone(v ?? '')) ? undefined : 'Enter a valid E.164 number, e.g. +15551234567'),
     });
     if (p.isCancel(answer)) {
       p.cancel('Setup cancelled');

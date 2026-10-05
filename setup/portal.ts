@@ -21,6 +21,7 @@ import {
   type InstallIdentity,
 } from '../src/community-portal/index.js';
 import type { ProvisioningCore } from './channels/slack-auto.js';
+import type { DeviceState } from '../src/community-portal/device-client.js';
 import { readSlackJob } from '../src/community-portal/slack-job.js';
 
 /**
@@ -147,7 +148,7 @@ export async function offerPortalReminder(stage: 'echo' | 'slack', enable: () =>
       if (!(await client.available(stage))) return false;
       if (client.token && !resuming) {
         try {
-          const state = await client.request('GET', '/api/v1/device/state');
+          const state = await client.request<DeviceState>('GET', '/api/v1/device/state');
           if (state.activations?.[stage]?.enabled) return false;
         } catch (error: any) {
           // Not signed in here, or not registered yet: the offer still stands.
@@ -346,6 +347,8 @@ export async function runSlackPortal(
       }
     }
     const app = saved.app;
+    // The create branch above is skipped only for a setup that already holds its app.
+    if (!app) throw new Error('The saved Slack setup has no app record. Re-run the Slack setup to create one.');
     if (!app.botToken) {
       await client.complete('awaiting_approval', { appId: app.appId });
       p.log.info(
