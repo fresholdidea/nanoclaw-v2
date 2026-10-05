@@ -215,6 +215,16 @@ export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
 }
 
+/**
+ * Whether a runner may be alive for the session — registered, or a surviving
+ * container left running while its adoption is retried. Gate every host write
+ * to outbound.db on this, not isContainerRunning: an unregistered survivor is
+ * still that file's writer.
+ */
+export function isSessionRuntimeLive(sessionId: string): boolean {
+  return activeContainers.has(sessionId) || pendingAdoptions.has(sessionId);
+}
+
 export function getContainerStartedAtMs(sessionId: string): number | undefined {
   return activeContainers.get(sessionId)?.startedAtMs;
 }

@@ -24,16 +24,27 @@ vi.mock('./config.js', async () => {
 });
 
 // Mock container runner to prevent actual Docker spawning
-vi.mock('./container-runner.js', () => ({
-  getContainerStartedAtMs: vi.fn(() => Date.now()),
-  isContainerRunning: vi.fn().mockReturnValue(false),
-  wakeContainer: vi.fn().mockResolvedValue(true),
-  killContainer: vi.fn(),
-}));
+vi.mock('./container-runner.js', () => {
+  const isContainerRunning = vi.fn().mockReturnValue(false);
+  return {
+    getContainerStartedAtMs: vi.fn(() => Date.now()),
+    isContainerRunning,
+    // No pending adoptions in these tests: live iff registered.
+    isSessionRuntimeLive: vi.fn((sessionId: string) => isContainerRunning(sessionId)),
+    wakeContainer: vi.fn().mockResolvedValue(true),
+    killContainer: vi.fn(),
+  };
+});
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
 import { createSession } from './db/sessions.js';
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import {
+  getContainerStartedAtMs,
+  isContainerRunning,
+  isSessionRuntimeLive,
+  killContainer,
+  wakeContainer,
+} from './container-runner.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { log } from './log.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -58,6 +69,16 @@ function seedStaleClaim(messageId: string, ageMs: number): void {
     new Date(Date.now() - ageMs).toISOString(),
   );
   db.close();
+}
+
+function processingClaimCount(): number {
+  const db = new Database(outboundDbPath(AG, SESS), { readonly: true });
+  try {
+    return (db.prepare("SELECT COUNT(*) AS n FROM processing_ack WHERE status = 'processing'").get() as { n: number })
+      .n;
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -207,6 +228,124 @@ describe('host sweep incarnation-gated grace period', () => {
     );
     await runSweepTick();
     expect(killContainer).toHaveBeenCalledTimes(1);
-    expect(killContainer).toHaveBeenCalledWith(SESS, 'claim-stuck');
+    expect(killContainer).toHaveBeenCalledWith(SESS, 'claim-stuck', expect.any(Function));
+
+    // The dying runner still owns outbound.db until it exits: the claim reset
+    // (a host write) must wait for onExit, never race the stop.
+    expect(processingClaimCount()).toBe(1);
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    const onExit = vi.mocked(killContainer).mock.calls[0][2] as () => void;
+    onExit();
+    await vi.waitFor(() => expect(processingClaimCount()).toBe(0));
+  });
+});
+
+/**
+ * Leave a hot DELETE journal on outbound.db, as a runner killed mid-commit
+ * would — indistinguishable on disk from a live runner's in-flight commit.
+ */
+function plantHotJournal(): void {
+  const dbPath = outboundDbPath(AG, SESS);
+  const writer = new Database(dbPath);
+  writer.pragma('journal_mode = DELETE');
+  writer.pragma('cache_size = 1');
+  writer.exec('BEGIN IMMEDIATE');
+  const insert = writer.prepare(
+    "INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES (?, ?, ?, 'chat', ?)",
+  );
+  for (let i = 0; i < 200; i++) insert.run(`hj-${i}`, i * 2 + 1, now(), 'x'.repeat(4096));
+  fs.copyFileSync(`${dbPath}-journal`, `${dbPath}.planted`);
+  writer.exec('ROLLBACK');
+  writer.close();
+  fs.renameSync(`${dbPath}.planted`, `${dbPath}-journal`);
+}
+
+describe('host sweep outbound journal handling', () => {
+  it("replays a dead runner's leftover journal so the session can wake again", async () => {
+    plantHotJournal();
+    const errorSpy = vi.spyOn(log, 'error');
+    try {
+      await runSweepTick();
+      expect(wakeContainer).not.toHaveBeenCalled();
+      expect(fs.existsSync(`${outboundDbPath(AG, SESS)}-journal`)).toBe(false);
+      expect(errorSpy).not.toHaveBeenCalledWith('Session mailbox sweep failed', expect.anything());
+
+      await runSweepTick();
+      expect(wakeContainer).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('never replays while a runner is live — its journal is an in-flight commit', async () => {
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    plantHotJournal();
+    const errorSpy = vi.spyOn(log, 'error');
+    try {
+      await runSweepTick();
+      expect(fs.existsSync(`${outboundDbPath(AG, SESS)}-journal`)).toBe(true);
+      expect(killContainer).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalledWith('Session mailbox sweep failed', expect.anything());
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe('host sweep outbound journal handling — runner edge cases', () => {
+  it('post-kill reset replays the journal a SIGKILL left mid-commit, then clears the claim', async () => {
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    const { getDb } = await import('./db/index.js');
+    await runSweepTick(); // wake tick
+    await getDb().run(
+      'UPDATE session_claims SET claimed_at = ? WHERE session_id = ?',
+      new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+      SESS,
+    );
+    await runSweepTick(); // claim-stuck → kill, reset deferred
+    expect(killContainer).toHaveBeenCalledWith(SESS, 'claim-stuck', expect.any(Function));
+
+    plantHotJournal(); // the stop's SIGKILL landed mid-commit
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    const errorSpy = vi.spyOn(log, 'error');
+    try {
+      (vi.mocked(killContainer).mock.calls[0][2] as () => void)();
+      await vi.waitFor(() => expect(processingClaimCount()).toBe(0));
+      expect(fs.existsSync(`${outboundDbPath(AG, SESS)}-journal`)).toBe(false);
+      expect(errorSpy).not.toHaveBeenCalledWith('Post-kill processing reset failed', expect.anything());
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('still applies the absolute ceiling to a runner wedged mid-commit', async () => {
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    vi.mocked(getContainerStartedAtMs).mockReturnValue(Date.now() - 31 * 60 * 1000);
+    plantHotJournal();
+    const base = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(base);
+    try {
+      await runSweepTick(); // first sighting: one sample is not evidence
+      expect(killContainer).not.toHaveBeenCalled();
+      nowSpy.mockReturnValue(base + 61_000);
+      await runSweepTick();
+      expect(killContainer).toHaveBeenCalledWith(SESS, 'absolute-ceiling', expect.any(Function));
+      expect(fs.existsSync(`${outboundDbPath(AG, SESS)}-journal`)).toBe(true); // replay waits for onExit
+    } finally {
+      nowSpy.mockRestore();
+      vi.mocked(getContainerStartedAtMs).mockImplementation(() => Date.now());
+    }
+  });
+
+  it('never writes outbound.db for a surviving container whose adoption is pending', async () => {
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    vi.mocked(isSessionRuntimeLive).mockReturnValue(true);
+    plantHotJournal();
+    try {
+      await runSweepTick();
+      expect(fs.existsSync(`${outboundDbPath(AG, SESS)}-journal`)).toBe(true);
+    } finally {
+      vi.mocked(isSessionRuntimeLive).mockImplementation((id: string) => vi.mocked(isContainerRunning)(id));
+    }
   });
 });

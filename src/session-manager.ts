@@ -465,8 +465,9 @@ async function runMailboxSession<T>(
 
 /**
  * Write a message directly to a session's outbound mailbox so the host delivery
- * loop picks it up. Used by the command gate to send denial responses
- * without waking a container.
+ * loop picks it up. Only safe while no runner is live for the session — the
+ * runner is outbound.db's writer and its locks are invisible to the host, so
+ * concurrent host writes corrupt the file. Not used on any live routing path.
  *
  * The selected mailbox owns persistence and sequencing.
  */

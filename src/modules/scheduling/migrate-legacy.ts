@@ -31,6 +31,7 @@
  */
 import { getActiveSessions, isTaskThread } from '../../db/sessions.js';
 import { log } from '../../log.js';
+import { OutboundJournalPendingError } from '../../mailbox/index.js';
 import type { TaskRecord } from '../../mailbox/index.js';
 import { resolveTaskSession, withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { handleRecurrence } from './recurrence.js';
@@ -42,15 +43,23 @@ export async function migrateLegacyTaskSeries(): Promise<{ migrated: number; ski
   for (const session of await getActiveSessions()) {
     if (isTaskThread(session.thread_id)) continue;
 
-    const rows = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
-      mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks());
-      try {
-        await handleRecurrence(mailbox, session);
-      } catch (err) {
-        log.warn('Legacy task migration: recurrence re-arm failed, continuing', { sessionId: session.id, err });
-      }
-      return mailbox.listLiveTasks();
-    });
+    let rows;
+    try {
+      rows = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
+        mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks());
+        try {
+          await handleRecurrence(mailbox, session);
+        } catch (err) {
+          log.warn('Legacy task migration: recurrence re-arm failed, continuing', { sessionId: session.id, err });
+        }
+        return mailbox.listLiveTasks();
+      });
+    } catch (err) {
+      // Idempotent and re-run every startup; the sweep replays a leftover journal.
+      if (!(err instanceof OutboundJournalPendingError)) throw err;
+      log.warn('Legacy task migration: outbound journal pending, skipping session this run', { sessionId: session.id });
+      continue;
+    }
     if (!rows) continue;
 
     for (const row of rows) {

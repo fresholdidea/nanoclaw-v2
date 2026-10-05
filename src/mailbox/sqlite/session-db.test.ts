@@ -14,8 +14,10 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   ensureSchema,
   getInboundSourceSessionId,
+  isOutboundRollbackPending,
   migrateMessagesInTable,
   openOutboundDb,
+  openOutboundDbRw,
   syncProcessingAcks,
 } from './session-db.js';
 
@@ -164,7 +166,11 @@ describe('syncProcessingAcks — script-skip counter', () => {
 });
 
 describe('openOutboundDb read-only enforcement', () => {
-  it('recovers a hot DELETE journal before enforcing query-only access', async () => {
+  // The host must never replay a journal itself: across the bind mount it
+  // cannot see the runner's locks, so a live runner's mid-commit journal looks
+  // exactly like a crash leftover and replaying it corrupts the file. Only the
+  // explicit recovery path (writable, runner confirmed gone) may replay.
+  it('refuses a hot DELETE journal on the read path; only the writable recovery replays it', async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
     const outDbPath = path.join(TEST_DIR, 'outbound.db');
@@ -228,8 +234,28 @@ describe('openOutboundDb read-only enforcement', () => {
       child.kill('SIGKILL');
       await exitPromise;
 
+      const refused = openOutboundDb(outDbPath);
+      try {
+        let caught: unknown;
+        try {
+          refused.prepare("SELECT content FROM messages_out WHERE id = 'baseline-0'").get();
+        } catch (err) {
+          caught = err;
+        }
+        expect(isOutboundRollbackPending(caught)).toBe(true);
+      } finally {
+        refused.close();
+      }
+      expect(fs.existsSync(`${outDbPath}-journal`)).toBe(true);
+
+      const recovery = openOutboundDbRw(outDbPath);
+      recovery.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
+      recovery.close();
+      expect(fs.existsSync(`${outDbPath}-journal`)).toBe(false);
+
       const hostOutDb = openOutboundDb(outDbPath);
       try {
+        expect(hostOutDb.readonly).toBe(true);
         const row = hostOutDb.prepare("SELECT content FROM messages_out WHERE id = 'baseline-0'").get() as {
           content: string;
         };

@@ -137,6 +137,8 @@ export interface OutboundMailbox {
   getTerminalProcessingAcks(): ProcessingAck[];
   getProcessingClaims(): ProcessingClaim[];
   deleteOrphanProcessingClaims(): number;
+  /** Replay a dead container's leftover write journal. Only safe when no container is running for the session. */
+  recoverOutboundJournal(): void;
   getContainerState(): ContainerState | null;
   getDueMessages(excludeIds?: ReadonlySet<string>): OutboundMessage[];
   writeDirect(message: DirectOutboundMessage): Promise<void>;
