@@ -71,7 +71,7 @@ export async function verifyMattermostRuntime(
 
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const status = await (dependencies.queryHostImpl ?? queryHost)(root);
-  if (!status.channels.some((channel: { instance?: string; connected?: boolean }) => channel.instance === 'mattermost' && channel.connected === true)) {
+  if (!status.channels.some((channel) => channel.instance === 'mattermost' && channel.connected === true)) {
     throw new Error('Mattermost runtime verification: the running host has no connected mattermost adapter');
   }
 

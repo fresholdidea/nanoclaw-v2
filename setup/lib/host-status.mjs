@@ -5,7 +5,22 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 
-/** Query the live host, with a deadline even for an unresponsive socket. */
+/**
+ * @typedef {object} HostStatus
+ * @property {number} pid
+ * @property {string} instance_id
+ * @property {string} started_at
+ * @property {string} project_root
+ * @property {{ id: string, port: number, paths: string[] } | null} webhook
+ * @property {Array<{ instance: string, type: string, connected: boolean }>} channels
+ */
+
+/**
+ * Query the live host, with a deadline even for an unresponsive socket.
+ * @param {string} root
+ * @param {number} [timeoutMs]
+ * @returns {Promise<HostStatus>}
+ */
 export function queryHost(root, timeoutMs = 1000) {
   return new Promise((resolve, reject) => {
     const id = randomUUID();
@@ -56,6 +71,10 @@ export function queryHost(root, timeoutMs = 1000) {
  * the budget is judged by its answer (previous instance, wrong process, missing
  * channel) instead of being reported as "Host status timed out". On the failure
  * path this can overrun timeoutMs by one probe.
+ *
+ * @param {string} root
+ * @param {{ previous?: string, pid?: number, startedAfter?: number, channel?: string, alive?: () => boolean, timeoutMs?: number }} [options]
+ * @returns {Promise<HostStatus>}
  */
 export async function waitForHost(root, { previous = '', pid, startedAfter, channel, alive, timeoutMs = 30000 } = {}) {
   const deadline = Date.now() + timeoutMs;
