@@ -97,10 +97,12 @@ export function stageOnecliFile(dataDir: string, kind: 'ca' | 'combined' | 'stub
     if (!validate()) throw new Error(`OneCLI staged file validation failed after publish: ${destination}`);
     return destination;
   } finally {
+    // Best effort. A throw here would replace the publish result or the error
+    // already in flight, and a stray .pending file in the staging directory is harmless.
     try {
       fs.unlinkSync(temporary);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    } catch {
+      // ENOENT is the normal case after a successful rename.
     }
   }
 }

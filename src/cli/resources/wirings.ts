@@ -75,7 +75,9 @@ function requireThreadsForFilter(w: EngageValues, mg: MessagingGroup): void {
   try {
     validateEngageAgainstChannel({ ...w, engage_mode: undefined, session_mode: 'per-thread' }, mg);
   } catch (err) {
-    throw new Error(`--thread-filter ${String((err as Error).message).replace(/^session_mode 'per-thread' /, '')}`);
+    throw new Error(`--thread-filter ${String((err as Error).message).replace(/^session_mode 'per-thread' /, '')}`, {
+      cause: err,
+    });
   }
 }
 

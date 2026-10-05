@@ -15,7 +15,7 @@ const UNLINKABLE_HOST =
 
 // A bare URL: scheme, then everything up to whitespace or a closing bracket.
 // Trailing sentence punctuation is left outside the match.
-const BARE_URL = /(?<!\]\()\bhttps?:\/\/[^\s<>()\[\]`]+?(?=[.,;:!?]*(?:[\s<>()\[\]`]|$))/g;
+const BARE_URL = /(?<!\]\()\bhttps?:\/\/[^\s<>()[\]`]+?(?=[.,;:!?]*(?:[\s<>()[\]`]|$))/g;
 
 // Code spans and fences are left untouched.
 const CODE = /```[\s\S]*?```|`[^`\n]*`/g;

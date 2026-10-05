@@ -18,6 +18,14 @@ afterEach(() => {
 });
 
 describe('persistent OneCLI files', () => {
+  it('returns the published path when removing the temporary file fails', () => {
+    vi.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+      throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    });
+    const destination = stageOnecliFile(dir, 'ca', 'CA');
+    expect(fs.readFileSync(destination, 'utf8')).toBe('CA');
+  });
+
   it('publishes only a complete file when several processes stage the same content', async () => {
     const moduleUrl = new URL('./onecli-files.ts', import.meta.url).href;
     const script = `import {stageOnecliFile} from ${JSON.stringify(moduleUrl)}; console.log(stageOnecliFile(process.argv[1], 'ca', 'CA'.repeat(50000)));`;
