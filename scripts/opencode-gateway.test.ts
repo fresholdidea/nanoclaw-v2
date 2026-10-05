@@ -44,6 +44,8 @@ vi.mock('child_process', async (original) => ({
 }));
 import { runOpenCodeChatGptAuth, runOpenCodeSetupAuth } from './opencode-auth.js';
 
+type SignIn = NonNullable<NonNullable<Parameters<typeof runOpenCodeChatGptAuth>[1]>['signIn']>;
+
 type Call = [string, ...unknown[]];
 declare global {
   // eslint-disable-next-line no-var
@@ -141,7 +143,7 @@ describe('OpenCode through a gateway it has never heard of', () => {
   });
 
   it('hands ChatGPT sign-in to the gateway as the named profile and reuses a live login', async () => {
-    const signIn = vi.fn(async (_method: string, _root: string, vault: { save: (v: unknown) => Promise<void> }) => {
+    const signIn = vi.fn<SignIn>(async (_method, _root, vault) => {
       await vault.save({ profile: 'chatgpt', accessToken: 'a', refreshToken: 'r', accountId: 'acct' });
     });
     await runOpenCodeChatGptAuth('device', { signIn });

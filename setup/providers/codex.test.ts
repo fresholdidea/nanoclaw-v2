@@ -225,7 +225,7 @@ describe('gateway store failures name their cause', () => {
         MESSAGE: failure.message,
       }),
     );
-    expect(log.mock.calls.some((call) => String(call[0]).includes(failure.message))).toBe(true);
+    expect(log.mock.calls.some((call: unknown[]) => String(call[0]).includes(failure.message))).toBe(true);
   });
 
   it('after an API key paste, logs the adapter message and prints it under the friendly line', async () => {
@@ -250,7 +250,7 @@ describe('gateway store failures name their cause', () => {
         MESSAGE: failure.message,
       }),
     );
-    expect(log.mock.calls.some((call) => String(call[0]).includes(failure.message))).toBe(true);
+    expect(log.mock.calls.some((call: unknown[]) => String(call[0]).includes(failure.message))).toBe(true);
   });
 });
 

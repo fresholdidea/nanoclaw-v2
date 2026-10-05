@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   detectInstalledGateway: vi.fn<() => string | undefined>(),
   isGatewayInstalled: vi.fn<() => boolean>(),
-  runSkill: vi.fn(async () => ({ deferred: [], agentTasks: [] })),
+  runSkill: vi.fn(async (_skillDir: string, _options: { mode?: string }) => ({ deferred: [], agentTasks: [] })),
   upsertEnvVar: vi.fn(),
 }));
 

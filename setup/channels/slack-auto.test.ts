@@ -28,12 +28,20 @@ const state = vi.hoisted(() => ({
   brokerListWorkspaces: vi.fn(async () => [
     { team_id: 'T0TEAM123', team_name: 'NanoCo', status: 'active', connected_as: 'U0OWNER12' },
   ]),
-  brokerProvision: vi.fn(async () => ({
-    appId: 'A0APP123',
-    appToken: 'xapp-test',
-    botToken: 'xoxb-test',
-    installUrl: '',
-  })),
+  brokerProvision: vi.fn(
+    async (): Promise<{
+      appId: string;
+      appToken: string;
+      botToken?: string;
+      installUrl: string;
+      installError?: string;
+    }> => ({
+      appId: 'A0APP123',
+      appToken: 'xapp-test',
+      botToken: 'xoxb-test',
+      installUrl: '',
+    }),
+  ),
 }));
 
 vi.mock('../portal.js', () => ({ portalEnabled: state.portalEnabled, runSlackPortal: state.runSlackPortal }));

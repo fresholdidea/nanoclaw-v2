@@ -137,7 +137,7 @@ async function applyCompanionSkills(
   }
 }
 
-interface WireArgs {
+export interface WireArgs {
   channel: string;
   userId: string;
   platformId: string;
