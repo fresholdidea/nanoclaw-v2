@@ -100,8 +100,8 @@ describe('migrateLegacyTaskSeries', () => {
     await createChatSession('ag-1', 'chat-1');
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 

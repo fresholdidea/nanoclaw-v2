@@ -22,8 +22,8 @@ describe('provider_chain column', () => {
     const db = await initTestDb();
     await runMigrations(db);
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
   });
 
   it('round-trips a provider chain', async () => {

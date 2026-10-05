@@ -141,7 +141,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     mod.setTitleDelaysForTest(0, 0);
 
     const longText = 'Can you help me put together the quarterly report for the design review?';
-    sessionCreated(dmEvent(longText));
+    await sessionCreated(dmEvent(longText));
 
     await flushTitles();
     expect(registry.setThreadTitle.mock.calls).toEqual([['slack', 'slack:D1', 'slack:D1:171', longText.slice(0, 45)]]);
@@ -152,8 +152,8 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(dmEvent('first conversation'));
-    sessionCreated(dmEvent('second conversation', { session: { id: 'sess-2' }, threadId: 'slack:D1:999' }));
+    await sessionCreated(dmEvent('first conversation'));
+    await sessionCreated(dmEvent('second conversation', { session: { id: 'sess-2' }, threadId: 'slack:D1:999' }));
 
     await flushTitles();
     expect(registry.setThreadTitle).toHaveBeenCalledTimes(2);
@@ -169,7 +169,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(dmEvent('hello there', { sessionMode: 'shared', threadId: null }));
+    await sessionCreated(dmEvent('hello there', { sessionMode: 'shared', threadId: null }));
 
     await flushTitles();
     expect(registry.setThreadTitle).not.toHaveBeenCalled();
@@ -181,7 +181,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(
+    await sessionCreated(
       dmEvent('hello there', {
         mg: { id: 'mg-room', channel_type: 'slack', platform_id: 'slack:C9', instance: 'slack', is_group: 1 },
         platformId: 'slack:C9',
@@ -197,7 +197,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(dmEvent('hello there', { threadId: null }));
+    await sessionCreated(dmEvent('hello there', { threadId: null }));
 
     await flushTitles();
     expect(registry.setThreadTitle).not.toHaveBeenCalled();
@@ -207,7 +207,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(
+    await sessionCreated(
       dmEvent('hi', {
         mg: { id: 'mg-dm', channel_type: 'slack', platform_id: 'slack:D1', instance: 'slack-teamster', is_group: 0 },
       }),
@@ -221,7 +221,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(
+    await sessionCreated(
       dmEvent('ignored', { message: { id: 'm1', kind: 'chat', content: 'plain text hello', timestamp: now() } }),
     );
 
@@ -233,7 +233,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(dmEvent('   '));
+    await sessionCreated(dmEvent('   '));
 
     await flushTitles();
     expect(registry.setThreadTitle).not.toHaveBeenCalled();
@@ -244,7 +244,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     const { mod, sessionCreated, registry } = await loadModule();
     mod.setTitleDelaysForTest(0, 0);
 
-    sessionCreated(dmEvent('let’s go'));
+    await sessionCreated(dmEvent('let’s go'));
 
     await flushTitles();
     expect(registry.setSuggestedPrompts).toHaveBeenCalledWith('slack', 'slack:D1', []);
@@ -256,7 +256,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     mod.setTitleDelaysForTest(10, 20);
     registry.setThreadTitle.mockRejectedValueOnce(new Error('channel_not_found'));
 
-    sessionCreated(dmEvent('needs a retry'));
+    await sessionCreated(dmEvent('needs a retry'));
     expect(registry.setThreadTitle).not.toHaveBeenCalled(); // nothing before the initial delay
 
     await vi.advanceTimersByTimeAsync(10);
@@ -276,7 +276,7 @@ describe('DM thread auto-title (session-created hook)', () => {
     mod.setTitleDelaysForTest(0, 0);
     registry.setThreadTitle.mockRejectedValue(new Error('channel_not_found'));
 
-    sessionCreated(dmEvent('never lands'));
+    await sessionCreated(dmEvent('never lands'));
 
     await vi.advanceTimersByTimeAsync(60_000);
     expect(registry.setThreadTitle).toHaveBeenCalledTimes(2); // initial + one retry, never a third

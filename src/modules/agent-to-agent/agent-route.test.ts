@@ -395,7 +395,7 @@ describe('routeAgentMessage return-path', () => {
     );
 
     // S2 is an idle session that gets restarted/refreshed, setting last_active to a much newer time
-    updateSession(S2.id, { last_active: '2026-08-17T23:59:59.000Z' });
+    await updateSession(S2.id, { last_active: '2026-08-17T23:59:59.000Z' });
 
     // B replies without in_reply_to (or with missing in_reply_to).
     // Peer-affinity MUST still route back to S1 (the conversing session), NOT S2.
@@ -418,8 +418,8 @@ describe('routeAgentMessage return-path', () => {
 
   it('unsolicited fallback: routes to session with most recent last_active', async () => {
     // Both S1 and S2 exist. S1 has recent last_active, S2 does not.
-    updateSession(S1.id, { last_active: '2026-08-17T12:00:00.000Z' });
-    updateSession(S2.id, { last_active: '2026-08-01T12:00:00.000Z' });
+    await updateSession(S1.id, { last_active: '2026-08-17T12:00:00.000Z' });
+    await updateSession(S2.id, { last_active: '2026-08-01T12:00:00.000Z' });
 
     // Unsolicited message from B to A (no peer history)
     await routeAgentMessage(
@@ -782,8 +782,8 @@ describe('routeAgentMessage session-fragmentation fixes', () => {
     });
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
