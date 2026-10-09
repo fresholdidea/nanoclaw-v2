@@ -36,7 +36,7 @@ import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { log } from './log.js';
-import { heartbeatPath, withExistingMailboxSession } from './session-manager.js';
+import { heartbeatPath, outsideMailboxSession, withExistingMailboxSession } from './session-manager.js';
 import {
   getContainerStartedAtMs,
   isContainerRunning,
@@ -402,21 +402,29 @@ async function enforceRunningContainerSla(
  * from counting against it.
  */
 function killAndReset(session: Session, agentGroupId: string, reason: string): void {
-  killContainer(session.id, reason, () => {
-    void withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
-      // Checked inside the session, adjacent to the writes (no await between).
-      if (isSessionRuntimeLive(session.id)) return;
-      try {
-        resetStuckProcessingRows(mailbox, mailbox, session, reason);
-      } catch (err) {
-        if (!(err instanceof OutboundJournalPendingError)) throw err;
-        // The stop's SIGKILL often lands mid-commit. Nothing else writes now.
-        mailbox.recoverOutboundJournal();
-        journalPendingSince.delete(session.id);
-        resetStuckProcessingRows(mailbox, mailbox, session, reason);
-      }
-    }).catch((err: unknown) => log.error('Post-kill processing reset failed', { sessionId: session.id, reason, err }));
-  });
+  // The kill is issued from inside the sweep's mailbox session for this very
+  // key, and the exit callback inherits that async context. Leave it before
+  // opening the reset's own session, or the nesting guard rejects it and the
+  // claims are never reset (the sweep's session is long over by then).
+  const resetAfterExit = (): void =>
+    outsideMailboxSession(() => {
+      void withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
+        // Checked inside the session, adjacent to the writes (no await between).
+        if (isSessionRuntimeLive(session.id)) return;
+        try {
+          resetStuckProcessingRows(mailbox, mailbox, session, reason);
+        } catch (err) {
+          if (!(err instanceof OutboundJournalPendingError)) throw err;
+          // The stop's SIGKILL often lands mid-commit. Nothing else writes now.
+          mailbox.recoverOutboundJournal();
+          journalPendingSince.delete(session.id);
+          resetStuckProcessingRows(mailbox, mailbox, session, reason);
+        }
+      }).catch((err: unknown) =>
+        log.error('Post-kill processing reset failed', { sessionId: session.id, reason, err }),
+      );
+    });
+  killContainer(session.id, reason, resetAfterExit);
 }
 
 export function _resetStuckProcessingRowsForTesting(

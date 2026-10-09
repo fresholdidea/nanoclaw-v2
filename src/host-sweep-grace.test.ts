@@ -238,6 +238,36 @@ describe('host sweep incarnation-gated grace period', () => {
     onExit();
     await vi.waitFor(() => expect(processingClaimCount()).toBe(0));
   });
+
+  it('resets the claims when onExit fires inside the sweep session that ordered the kill', async () => {
+    // In production the exit callback runs from a continuation of the sweep's
+    // own mailbox session (the stop promise is created inside it), so it
+    // inherits that session's AsyncLocalStorage store. Opening the reset's
+    // session there used to throw "Nested mailbox session" and leave the
+    // stale claim in place on every idle/ceiling kill.
+    vi.mocked(killContainer).mockImplementation((_sessionId, _reason, onExit) => {
+      vi.mocked(isContainerRunning).mockReturnValue(false);
+      // A microtask inherits the caller's async context, like the real
+      // handle.stop().then(...) chain does.
+      if (onExit) queueMicrotask(onExit);
+    });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    const { getDb } = await import('./db/index.js');
+    await getDb().run(
+      'UPDATE session_claims SET claimed_at = ? WHERE session_id = ?',
+      new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+      SESS,
+    );
+    const errorSpy = vi.spyOn(log, 'error');
+    try {
+      await runSweepTick();
+      expect(killContainer).toHaveBeenCalledWith(SESS, 'claim-stuck', expect.any(Function));
+      await vi.waitFor(() => expect(processingClaimCount()).toBe(0));
+      expect(errorSpy).not.toHaveBeenCalledWith('Post-kill processing reset failed', expect.anything());
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 /**

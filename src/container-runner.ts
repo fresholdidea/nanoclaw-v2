@@ -85,6 +85,7 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
+  outsideMailboxSession,
   sessionContextPath,
   sessionDir,
   writeSessionContext,
@@ -803,7 +804,12 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   if (!entry) return;
 
   if (onExit) {
-    entry.exitCallbacks.push(onExit);
+    // Callers kill from inside a mailbox session (the sweep's SLA check, a
+    // restart dispatched mid-delivery); the callback would inherit that
+    // context and trip the nesting guard when it opens its own session on
+    // the same key. The container is gone by the time it runs, so it gets a
+    // fresh top-level context instead.
+    entry.exitCallbacks.push(() => outsideMailboxSession(onExit));
   }
 
   entry.stopReason = reason;
