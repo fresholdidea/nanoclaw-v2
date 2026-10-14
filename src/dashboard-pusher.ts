@@ -3,6 +3,10 @@
  * snapshot to the dashboard's /api/ingest endpoint every interval.
  */
 import fs from 'fs';
+import { collectDashboardHud } from './hud/index.js';
+import { localDay, SourceCache } from './hud/io.js';
+import { parseTokenJsonl } from './hud/sources/usage.js';
+let tokenFileCache = new SourceCache(128 * 1024 * 1024);
 import path from 'path';
 import http from 'http';
 import Database from 'better-sqlite3';
@@ -16,7 +20,7 @@ import { getAllUsers, getUser } from './modules/permissions/db/users.js';
 import { getUserRoles, getAdminsOfAgentGroup } from './modules/permissions/db/user-roles.js';
 import { getUserDmsForUser } from './modules/permissions/db/user-dms.js';
 import { getActiveAdapters, getRegisteredChannelNames } from './channels/channel-registry.js';
-import { DATA_DIR, ASSISTANT_NAME } from './config.js';
+import { DATA_DIR, ASSISTANT_NAME, TIMEZONE } from './config.js';
 import { configFromDb, redactMcpServerSecrets } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getDb } from './db/connection.js';
@@ -150,6 +154,7 @@ async function collectSnapshot(): Promise<Record<string, unknown>> {
     channels,
     users,
     tokens,
+    hud: await collectDashboardHud(tokens),
     context_windows: contextWindows,
     activity: collectActivity(),
     messages: collectMessages(),
@@ -247,6 +252,7 @@ const outboundStatsCache = new Map<string, OutboundFileStats>();
 /** Test hook: forget every cached outbound.db scan. */
 export function resetDashboardCaches(): void {
   outboundStatsCache.clear();
+  tokenFileCache = new SourceCache(128 * 1024 * 1024);
 }
 
 /**
@@ -450,6 +456,7 @@ async function collectUsers() {
 async function collectTokens() {
   const sessionsDir = path.join(DATA_DIR, 'v2-sessions');
   const allEntries: Array<{
+    timestamp: string | null;
     model: string;
     inputTokens: number;
     outputTokens: number;
@@ -521,7 +528,15 @@ async function collectTokens() {
     totals.cacheCreationTokens += e.cacheCreationTokens;
   }
 
-  return { totals, byModel, byGroup };
+  const daily: Record<string, number> = {};
+  let asOf: string | null = null;
+  for (const e of allEntries) {
+    if (!e.timestamp || !Number.isFinite(Date.parse(e.timestamp))) continue;
+    const day = localDay(new Date(e.timestamp), TIMEZONE);
+    daily[day] = (daily[day] ?? 0) + e.inputTokens + e.outputTokens + e.cacheReadTokens + e.cacheCreationTokens;
+    if (!asOf || e.timestamp > asOf) asOf = e.timestamp;
+  }
+  return { totals, byModel, byGroup, daily, asOf };
 }
 
 function scanJsonlTokens(agentDir: string) {
@@ -529,6 +544,7 @@ function scanJsonlTokens(agentDir: string) {
   if (!fs.existsSync(claudeDir)) return [];
 
   const entries: Array<{
+    timestamp: string | null;
     model: string;
     inputTokens: number;
     outputTokens: number;
@@ -542,28 +558,7 @@ function scanJsonlTokens(agentDir: string) {
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) walk(full);
         else if (entry.name.endsWith('.jsonl')) {
-          try {
-            for (const line of fs.readFileSync(full, 'utf-8').split('\n')) {
-              if (!line.trim()) continue;
-              try {
-                const r = JSON.parse(line);
-                if (r.type === 'assistant' && r.message?.usage) {
-                  const u = r.message.usage;
-                  entries.push({
-                    model: r.message.model || 'unknown',
-                    inputTokens: u.input_tokens || 0,
-                    outputTokens: u.output_tokens || 0,
-                    cacheReadTokens: u.cache_read_input_tokens || 0,
-                    cacheCreationTokens: u.cache_creation_input_tokens || 0,
-                  });
-                }
-              } catch {
-                /* skip line */
-              }
-            }
-          } catch {
-            /* skip file */
-          }
+          entries.push(...(tokenFileCache.load(full, parseTokenJsonl).value ?? []));
         }
       }
     } catch {

@@ -36,7 +36,7 @@ import { dispatch } from '../dispatch.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
-import './tasks.js';
+import { collectTaskSeries } from './tasks.js';
 import '../commands/index.js'; // registers tasks-help for the help-topic test
 
 function now(): string {
@@ -137,6 +137,8 @@ describe('tasks CLI resource', () => {
     expect(resp.human).toBeDefined();
     expect(resp.human).toMatch(/SERIES\s+SCHEDULE\s+RUNS\s+FAILED\s+LAST RUN\s+NEXT RUN/);
     expect(resp.human).toContain('briefing-');
+    expect(await collectTaskSeries()).toEqual(resp.data);
+    await expect(collectTaskSeries(-1)).rejects.toThrow('budget exhausted');
   });
 
   it('list/get do not provision a missing task mailbox', async () => {
@@ -161,6 +163,8 @@ describe('tasks CLI resource', () => {
 
     const get = await dispatch({ id: 'missing-get', command: 'tasks-get', args: { id: 'missing-series' } }, agentCtx());
     expect(get.ok).toBe(false);
+    expect(fs.existsSync(missingDir)).toBe(false);
+    await expect(collectTaskSeries()).rejects.toThrow('mailbox unavailable');
     expect(fs.existsSync(missingDir)).toBe(false);
   });
 

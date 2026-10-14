@@ -145,6 +145,18 @@ describe('dashboard snapshot — MCP secrets', () => {
     // Nothing in the payload — any section, any encoding the UI never reads — carries a value.
     for (const value of [SECRET, TOKEN, ARG_TOKEN]) expect(raw).not.toContain(value);
 
+    const hud = JSON.parse(raw).hud;
+    expect(hud.cards.map((c: { id: string }) => c.id)).toEqual([
+      'receivables',
+      'ad_spend',
+      'usage',
+      'cron',
+      'waiting',
+      'plane',
+      'walls',
+    ]);
+    expect(hud.cards.find((c: { id: string }) => c.id === 'receivables').value).toBeNull();
+    expect(hud.generatedAt).toMatch(/Z$/);
     const groups = JSON.parse(raw).agent_groups as Array<{ id: string; container_config: { mcpServers: unknown } }>;
     expect(groups.find((g) => g.id === 'ag-1')?.container_config.mcpServers).toEqual({
       linkedin: {
