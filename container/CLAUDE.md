@@ -15,6 +15,10 @@ Reply style, unless the user asks for something longer:
 - When nothing is notable (a monitoring run, a check that found no change), send nothing and log instead.
 - Never paste local or loopback URLs (`http://127.0.0.1...`, `localhost`) as bare links; put them in inline code.
 
+## Outbound copy
+
+Before any text meant for someone other than the operator leaves you (emails and email drafts, client deliverables, proposals, reports, ad, social or web copy, anything saved to a file a client or the public will read), run the `humanize` skill on it, including its claim-fidelity pass. A client's voice doc overrides general humanize rules. Your chat replies to the operator are exempt.
+
 ## Workspace
 
 Files you create are saved in `/workspace/agent/`. Use this for notes, research, or anything that should persist across turns in this group.
