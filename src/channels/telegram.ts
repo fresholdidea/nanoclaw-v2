@@ -21,6 +21,7 @@ import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
+import { withPlainTextFallback } from './telegram-plain-fallback.js';
 import { codeWrapUnlinkableUrls } from './telegram-unlinkable-urls.js';
 
 /**
@@ -394,10 +395,12 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     return null;
   }
   claimedBotIds.set(botId, instanceKey);
-  const telegramAdapter = createTelegramAdapter({
-    botToken: token,
-    mode: 'polling',
-  });
+  const telegramAdapter = withPlainTextFallback(
+    createTelegramAdapter({
+      botToken: token,
+      mode: 'polling',
+    }),
+  );
   const bridge = createChatSdkBridge({
     adapter: telegramAdapter,
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)

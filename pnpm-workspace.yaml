@@ -8,3 +8,9 @@ onlyBuiltDependencies:
 # silently ignored. New package versions must exist on the registry this many
 # minutes (4320 = 3 days) before pnpm will resolve them.
 minimumReleaseAge: 4320
+
+# Backport of the upstream @chat-adapter/telegram >= 4.41 MarkdownV2 trim fix
+# (4.29.0 truncated messages with underscores in link URLs). Drop when bumping
+# the adapter past 4.41.
+patchedDependencies:
+  '@chat-adapter/telegram@4.29.0': patches/@chat-adapter__telegram@4.29.0.patch

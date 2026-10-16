@@ -1,0 +1,176 @@
+diff --git a/dist/index.js b/dist/index.js
+index 33eb3679bad53e5225f2f4098eb99f7c131d76ba..cf7b1028a8491d38a1157bbf26e89763645349d3 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -127,35 +127,31 @@ function toBotApiParseMode(mode) {
+ }
+ var TELEGRAM_MESSAGE_LIMIT = 4096;
+ var TELEGRAM_CAPTION_LIMIT = 1024;
+-var MARKDOWN_V2_ENTITY_MARKERS = ["*", "_", "~", "`"];
++// nanoclaw patch: backport of @chat-adapter/telegram >= 4.41 delimiter scan.
++// 4.29.0 trimmed every MarkdownV2 message (even under the limit) and counted
++// raw `_` inside link URLs as italic markers, so an odd number of underscores
++// across URLs truncated the message mid-entity and Telegram rejected it.
++var MARKDOWN_V2_ENTITY_MARKERS = ["*", "_", "__", "~", "`"];
+ var MARKDOWN_V2_ELLIPSIS = "\\.\\.\\.";
+ var PLAIN_ELLIPSIS = "...";
+ function escapeMarkdownV2(text) {
+   return text.replace(MARKDOWNV2_SPECIAL_CHARS, "\\$1");
+ }
+-function findUnescapedPositions(text, marker) {
+-  const positions = [];
+-  for (let i = 0; i < text.length; i++) {
+-    if (text[i] !== marker) {
+-      continue;
+-    }
+-    let backslashes = 0;
+-    let j = i - 1;
+-    while (j >= 0 && text[j] === "\\") {
+-      backslashes++;
+-      j--;
+-    }
+-    if (backslashes % 2 === 0) {
+-      positions.push(i);
+-    }
+-  }
+-  return positions;
+-}
+-function findUnescapedPositionsOutsideCode(text, marker) {
+-  const positions = [];
++function scanDelimiters(text) {
++  const markers = {
++    "*": [],
++    _: [],
++    __: [],
++    "~": [],
++    "`": []
++  };
++  const openBrackets = [];
++  let closeBrackets = 0;
+   let inFence = false;
+   let inInline = false;
++  let inLinkUrl = false;
+   let backslashes = 0;
++  const lastIndex = text.length - 1;
+   for (let i = 0; i < text.length; i++) {
+     const ch = text[i];
+     if (ch === "\\") {
+@@ -164,23 +160,63 @@ function findUnescapedPositionsOutsideCode(text, marker) {
+     }
+     const escaped = backslashes % 2 === 1;
+     backslashes = 0;
+-    if (ch === "`" && !escaped) {
+-      const isTriple = text[i + 1] === "`" && text[i + 2] === "`";
+-      if (isTriple && !inInline) {
++    if (escaped) {
++      continue;
++    }
++    if (inLinkUrl) {
++      if (ch === ")") {
++        inLinkUrl = false;
++        closeBrackets++;
++      }
++      continue;
++    }
++    if (ch === "`") {
++      if (!inInline && text.startsWith("```", i)) {
++        markers["`"].push(i);
+         inFence = !inFence;
+         i += 2;
+         continue;
+       }
+-      if (!inFence) {
+-        inInline = !inInline;
++      if (inFence) {
++        continue;
++      }
++      markers["`"].push(i);
++      if (!inInline && i + 2 === text.length && text[i + 1] === "`") {
++        i += 1;
+       }
++      inInline = !inInline;
+       continue;
+     }
+-    if (ch === marker && !escaped && !inFence && !inInline) {
+-      positions.push(i);
++    if (inFence || inInline) {
++      continue;
++    }
++    if (ch === "[") {
++      openBrackets.push(i);
++      continue;
++    }
++    if (ch === "]") {
++      if (text[i + 1] === "(") {
++        inLinkUrl = true;
++        i += 1;
++      } else if (i < lastIndex) {
++        closeBrackets++;
++      }
++      continue;
++    }
++    if (ch === "_") {
++      if (text[i + 1] === "_") {
++        markers.__.push(i);
++        i += 1;
++      } else {
++        markers._.push(i);
++      }
++      continue;
++    }
++    if (ch === "*" || ch === "~") {
++      markers[ch].push(i);
+     }
+   }
+-  return positions;
++  return { markers, openBrackets, closeBrackets };
+ }
+ function endsWithOrphanBackslash(text) {
+   let trailing = 0;
+@@ -197,36 +233,29 @@ function trimToMarkdownV2SafeBoundary(text) {
+       current = current.slice(0, -1);
+       continue;
+     }
+-    let minUnsafePosition = current.length;
++    const scan = scanDelimiters(current);
++    let cut = current.length;
+     for (const marker of MARKDOWN_V2_ENTITY_MARKERS) {
+-      const positions = marker === "`" ? findUnescapedPositions(current, marker) : findUnescapedPositionsOutsideCode(current, marker);
++      const positions = scan.markers[marker];
+       if (positions.length % 2 === 1) {
+-        const lastUnpaired = positions.at(-1) ?? current.length;
+-        if (lastUnpaired < minUnsafePosition) {
+-          minUnsafePosition = lastUnpaired;
+-        }
++        cut = Math.min(cut, positions.at(-1) ?? cut);
+       }
+     }
+-    const openBrackets = findUnescapedPositionsOutsideCode(current, "[");
+-    const closeBrackets = findUnescapedPositionsOutsideCode(current, "]");
+-    if (openBrackets.length > closeBrackets.length) {
+-      const lastOpen = openBrackets.at(-1) ?? current.length;
+-      if (lastOpen < minUnsafePosition) {
+-        minUnsafePosition = lastOpen;
+-      }
++    if (scan.openBrackets.length > scan.closeBrackets) {
++      cut = Math.min(cut, scan.openBrackets.at(-1) ?? cut);
+     }
+-    if (minUnsafePosition >= current.length) {
++    if (cut >= current.length) {
+       return current;
+     }
+-    current = current.slice(0, minUnsafePosition);
++    current = current.slice(0, cut);
+   }
+   return current;
+ }
+ function truncateForTelegram(text, limit, parseMode) {
+-  const isMarkdownV2 = parseMode === "MarkdownV2";
+   if (text.length <= limit) {
+-    return isMarkdownV2 ? trimToMarkdownV2SafeBoundary(text) : text;
++    return text;
+   }
++  const isMarkdownV2 = parseMode === "MarkdownV2";
+   const ellipsis = isMarkdownV2 ? MARKDOWN_V2_ELLIPSIS : PLAIN_ELLIPSIS;
+   let slice = text.slice(0, limit - ellipsis.length);
+   if (isMarkdownV2) {
