@@ -164,7 +164,7 @@ describe('tasks CLI resource', () => {
     const get = await dispatch({ id: 'missing-get', command: 'tasks-get', args: { id: 'missing-series' } }, agentCtx());
     expect(get.ok).toBe(false);
     expect(fs.existsSync(missingDir)).toBe(false);
-    await expect(collectTaskSeries()).rejects.toThrow('mailbox unavailable');
+    expect(await collectTaskSeries()).toEqual([]);
     expect(fs.existsSync(missingDir)).toBe(false);
   });
 

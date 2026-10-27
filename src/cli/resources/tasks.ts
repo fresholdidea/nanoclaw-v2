@@ -255,8 +255,9 @@ export async function collectTaskSeries(deadline = Infinity) {
     const found = await withInbound(session, (db) =>
       selectLiveTasks(db).map((row) => enrichListRow(db, toOutput(session, row))),
     );
-    if (!found) throw new Error('Task mailbox unavailable');
-    rows.push(...found);
+    // A session row whose mailbox was never created holds no tasks; skip it the
+    // way tasks-list does rather than failing the whole collection over it.
+    if (found) rows.push(...found);
   }
   return rows;
 }
