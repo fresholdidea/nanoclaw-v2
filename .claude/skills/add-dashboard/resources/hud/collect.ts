@@ -16,6 +16,9 @@ import { parseMeeting, nextMeeting } from './sources/meeting-notes.js';
 import { parseSkill, skillTile } from './sources/skills.js';
 import type { Hud, HudCard, TaskSeries } from './types.js';
 
+// Task series refresh every 5 minutes (see index.ts); stale after 1.5x this.
+export const TASK_CADENCE_MIN = 10;
+
 export interface HudPaths {
   groupsDir: string;
   primary?: string;
@@ -151,7 +154,7 @@ export function createHudCollector(cache = new SourceCache()) {
     const invoiceTask = tasks.find((t) => t.folder === paths.billing && t.series_id.startsWith('receivables-check-'));
     if (invoiceTask)
       receivables.href = `/dashboard/messages?agentGroupId=${encodeURIComponent(invoiceTask.agent_group_id)}&sessionId=${encodeURIComponent(invoiceTask.session_id)}`;
-    const cron = card('cron', 'Cron health', 'task sessions', 1);
+    const cron = card('cron', 'Cron health', 'task sessions', TASK_CADENCE_MIN);
     if (input.tasks !== null)
       Object.assign(cron, taskHealth(tasks, now, failureCounts), { asOf: input.tasksAsOf ?? now.toISOString() });
     hud.cards.push(cron);

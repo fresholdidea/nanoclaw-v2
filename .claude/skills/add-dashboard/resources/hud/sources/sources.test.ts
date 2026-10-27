@@ -53,11 +53,33 @@ describe('HUD sources', () => {
     expect(entries[0]).toMatchObject({ timestamp: NOW.toISOString(), inputTokens: 10, outputTokens: 5 });
     expect(() => parseTokenJsonl('{partial')).toThrow();
   });
+  it('ledger buckets unpaid invoices by age, oldest first', () => {
+    const rows = parseLedger(
+      ledger
+        .replace('| Vast.Dev | 4 |', '| Old | 4 |')
+        .replace('$9,000.00 | x | x | ✅ 2026-10-01', '$500.00 | x | x | ✅ 2026-08-01') +
+        '\n| Mid | 5 | Oct | $300.00 | x | x | ✅ 2026-09-10 |\n| Undated | 6 | Oct | $50.00 | x | x | ✅ sent |',
+    );
+    const result = ledgerValue(rows, NOW, () => true);
+    expect(result.value).toBe(2050);
+    expect(result.detail).toEqual([
+      'Aging · 61+ days: $500 (1) · 31–60 days: $300 (1) · 0–30 days: $1,200 (1) · undated: $50 (1)',
+      'Old #4: $500 · 74 days since sent',
+      'Mid #5: $300 · 34 days since sent',
+      'Visible #1: $1,200 · 13 days since sent',
+      'Undated #6: $50',
+      'Draft: $200 draft awaiting approval',
+    ]);
+  });
   it('ledger counts only sent/unpaid visible rows, keeps drafts separate', () => {
     const f = exclusionFilter(null);
     const result = ledgerValue(parseLedger(ledger), NOW, f.keep);
     expect(result.value).toBe(1200);
-    expect(result.detail).toEqual(['Visible #1: $1,200 · 13 days since sent', 'Draft: $200 draft awaiting approval']);
+    expect(result.detail).toEqual([
+      'Aging · 0–30 days: $1,200 (1)',
+      'Visible #1: $1,200 · 13 days since sent',
+      'Draft: $200 draft awaiting approval',
+    ]);
     expect(f.hiddenCount).toBe(1);
     expect(() => parseLedger(ledger.replace('$1,200.00', 'unknown'))).toThrow();
   });
