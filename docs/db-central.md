@@ -23,12 +23,18 @@ CREATE TABLE agent_groups (
   name             TEXT NOT NULL,
   folder           TEXT NOT NULL UNIQUE,
   agent_provider   TEXT,
-  created_at       TEXT NOT NULL
+  created_at       TEXT NOT NULL,
+  tier             TEXT,   -- local migration agent-group-architecture: orchestrator | account | specialist | worker | personal
+  reports_to       TEXT,   -- agent_groups.id this group reports to (no FK; validated in code)
+  role             TEXT,   -- one-line role description
+  persona          TEXT    -- JSON object {emoji?, color?, initials?}
 );
 ```
 
-- **Readers:** `src/session-manager.ts`, `src/delivery.ts`, `src/router.ts`
-- **Writers:** `src/db/agent-groups.ts`
+The four architecture columns (local migration `agent-group-architecture`) are all nullable with no backfill — NULL means "unclassified". They are validated on write by `normalizeAgentArchitectureUpdates` in `src/db/agent-groups.ts` (shared by `updateAgentGroup` and the `ncl groups update` `preUpdate` hook): `tier` must be one of the five values, `reports_to` must name an existing group and may not self-reference or close a cycle, `role` is a trimmed single line (≤ 200 chars), `persona` is re-encoded canonically from a JSON object whose only allowed keys are `emoji`, `color`, `initials` (string values). `reports_to` deliberately carries no FK so `ncl groups delete` never has to re-parent children first; a dangling value reads as "reports to a deleted group". Set them with `ncl groups update --id <id> --tier … --reports-to … --role … --persona '<json>'` (`""` clears). A group-scoped container agent (`cli_scope = group`) is denied `--tier` / `--reports-to` outright, like `--cli-scope`. The dashboard pusher surfaces them on each `agent_groups[]` entry (persona parsed) alongside `lastActiveAt` and the top-level `a2a_edges`.
+
+- **Readers:** `src/session-manager.ts`, `src/delivery.ts`, `src/router.ts`, `src/dashboard-pusher.ts`
+- **Writers:** `src/db/agent-groups.ts`, `src/cli/resources/groups.ts` (generic update)
 
 ### 1.2 `messaging_groups`
 
@@ -440,6 +446,19 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 | 20 | `container-config-timezone` | `020-container-config-timezone.ts` | `container_configs.timezone` — per-agent-group timezone override (NULL = install-global) |
 | 21 | `approval-question-render-metadata` | `021-approval-question.ts` | `question` card-body column on all three approval tables so terminal edits retain the original request |
 | 22 | `messaging-group-detached-at` | `022-messaging-group-detached.ts` | `messaging_groups.detached_at` — records when the bot left a channel without deleting its wiring |
+| 23 | `approvals-instance` | `023-approvals-instance.ts` | `pending_approvals.instance` — adapter instance the approval card was delivered through |
+| 24 | `host-coordination` | `024-host-coordination.ts` | durable host-coordination state (schema only) |
+| 25 | `container-config-speed` | `025-container-config-speed.ts` | `container_configs.speed` — per-agent-group serving tier (NULL = install/provider default) |
+
+Local (fork) migrations, registered after upstream's entries in `src/db/migrations/index.ts`. Their `version:` values collide with upstream files (20, 21, 24, 25), which is harmless: identity is the `name`, and `schema_version.version` is assigned at apply time. Never rename one — a new name re-runs its `ADD COLUMN` on the live DB and crash-loops `initDb`.
+
+| version: | Name | File | What it does |
+|----------|------|------|--------------|
+| 20 | `provider-tooling` | `020-provider-tooling.ts` | `container_configs.enable_agy_tooling`, `enable_opencode_tooling` (INTEGER NOT NULL DEFAULT 0). Kept for the live DB; no code reads them since the 2026-11 rebuild |
+| 21 | `provider-chain` | `021-provider-chain.ts` | `container_configs.provider_chain` (TEXT JSON array). Kept for the live DB; no code reads it since the 2026-11 rebuild |
+| 24 | `wiring-thread-filter` | `024-wiring-thread-filter.ts` | `messaging_group_agents.thread_filter` — scope a wiring to one thread/topic (NULL = unscoped); scoped match makes unscoped wirings stand down |
+| 25 | `destination-thread` | `025-destination-thread.ts` | `agent_destinations.thread_id` — pin a channel destination to one thread/topic (NULL = session thread / top level) |
+| 26 | `agent-group-architecture` | `026-agent-group-architecture.ts` | `agent_groups.tier`, `reports_to`, `role`, `persona` — org-chart metadata for the dashboard and `ncl groups` (all NULL = unclassified; validated in code, see §1.1) |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

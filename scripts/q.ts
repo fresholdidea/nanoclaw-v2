@@ -122,7 +122,11 @@ if (path.resolve(dbPath) === path.resolve(CENTRAL_DB_PATH)) {
   db = await initDb(CENTRAL_DB_PATH, { role: 'tool' });
   close = closeDb;
 } else {
-  db = new SqliteDriver(new Database(dbPath));
+  // A session's outbound.db is its container's file: a read-write open from the
+  // host can roll back the container's in-flight commit (its locks are invisible
+  // across the mount) and corrupt it. Read it read-only, always.
+  const outbound = path.basename(dbPath) === 'outbound.db';
+  db = new SqliteDriver(new Database(dbPath, outbound ? { readonly: true, fileMustExist: true } : undefined));
   close = () => db.close();
 }
 try {

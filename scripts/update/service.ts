@@ -218,6 +218,37 @@ export function detectService(projectRoot: string, env: ServiceEnvironment): Ser
           ) !== undefined,
       };
     }
+
+    // Older v1/v2 installs used the unsuffixed `com.nanoclaw` LaunchAgent.
+    // Treat it as a supported wrapper only when the legacy plist belongs to
+    // this checkout; otherwise an unrelated NanoClaw install must remain
+    // untouched and the process is correctly classified as unmanaged.
+    const legacyName = 'com.nanoclaw';
+    const legacyDefinition = path.join(env.home, 'Library', 'LaunchAgents', `${legacyName}.plist`);
+    if (fs.existsSync(legacyDefinition)) {
+      const wd = env.runner.tryRun('/usr/libexec/PlistBuddy', ['-c', 'Print :WorkingDirectory', legacyDefinition]);
+      const prog = env.runner.tryRun('/usr/libexec/PlistBuddy', ['-c', 'Print :ProgramArguments:1', legacyDefinition]);
+      if (
+        wd.ok &&
+        prog.ok &&
+        wd.stdout.trim() === projectRoot &&
+        prog.stdout.trim() === path.join(projectRoot, 'dist', 'index.js')
+      ) {
+        return {
+          mode: 'launchd',
+          name: legacyName,
+          definition: legacyDefinition,
+          active:
+            probe(
+              env,
+              'launchctl',
+              ['print', `gui/${env.uid}/${legacyName}`],
+              [113],
+              'Run the update from a login session of this user.',
+            ) !== undefined,
+        };
+      }
+    }
   }
 
   if (env.platform === 'linux') {
