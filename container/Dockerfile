@@ -73,6 +73,30 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+# ---- mnemon — persistent agent memory ----------------------------------------
+# Shared store across host CC and all nanoclaw groups. A group that uses it
+# binds ~/.mnemon READ-ONLY at /workspace/extra/mnemon via `additionalMounts`;
+# one that writes memories also binds ~/.mnemon/queue READ-WRITE at
+# /workspace/extra/mnemon/queue. MNEMON_DATA_DIR below points the binary at it.
+# The root stays read-only because host hooks and sync jobs read and write
+# ~/.mnemon by path; see .claude/skills/add-mnemon/SKILL.md.
+#
+# The live store is WAL-mode SQLite, which cannot be opened across the macOS
+# Docker mount, so the real binary installs as mnemon-real and `mnemon` is a
+# shim: reads go to the host-refreshed snapshot, writes queue for host replay
+# (drained by src/mnemon-sync.ts). See container/mnemon-shim.sh.
+ARG MNEMON_VERSION=0.1.14
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://github.com/mnemon-dev/mnemon/releases/download/v${MNEMON_VERSION}/mnemon_${MNEMON_VERSION}_linux_${ARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin mnemon && \
+    mv /usr/local/bin/mnemon /usr/local/bin/mnemon-real && \
+    chmod +x /usr/local/bin/mnemon-real
+COPY mnemon-shim.sh /usr/local/bin/mnemon
+COPY mnemon-queue.mjs /usr/local/lib/mnemon-queue.mjs
+RUN chmod +x /usr/local/bin/mnemon
+
+ENV MNEMON_DATA_DIR=/workspace/extra/mnemon
+
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.
