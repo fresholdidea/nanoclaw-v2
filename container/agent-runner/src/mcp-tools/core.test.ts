@@ -100,6 +100,13 @@ beforeEach(() => {
        VALUES ('peer', 'Peer', 'agent', NULL, NULL, 'ag-peer')`,
     )
     .run();
+  // A channel destination pinned to one forum topic (agent_destinations.thread_id).
+  getInboundDb()
+    .prepare(
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id, thread_id)
+       VALUES ('ops-topic', 'Daily Ops', 'channel', 'telegram', 'telegram:-100', NULL, 'telegram:-100:4')`,
+    )
+    .run();
 });
 
 afterEach(() => {
@@ -203,5 +210,20 @@ describe('send_message / send_file — thread for a channel destination', () => 
     publishReplyRoute({ inReplyTo: 'in-1', channelType: 'discord', platformId: 'chan-9', threadId: 'discord-thread' });
 
     expect(await sendBoth()).toEqual([null, null]);
+  });
+});
+
+describe('send_message MCP tool — destination pinned to a thread', () => {
+  it('routes to the pinned thread regardless of the session thread', async () => {
+    getInboundDb().exec(
+      `CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY CHECK (id = 1), channel_type TEXT, platform_id TEXT, thread_id TEXT);
+       INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id)
+       VALUES (1, 'telegram', 'telegram:-100', 'telegram:-100:9')`,
+    );
+    await sendMessage.handler({ to: 'ops-topic', text: 'monitor result' });
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].platform_id).toBe('telegram:-100');
+    expect(out[0].thread_id).toBe('telegram:-100:4');
   });
 });

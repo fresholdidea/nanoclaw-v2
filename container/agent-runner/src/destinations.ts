@@ -19,6 +19,8 @@ export interface DestinationEntry {
   type: 'channel' | 'agent';
   channelType?: string;
   platformId?: string;
+  /** Pinned thread/topic: every send through this destination lands here. */
+  threadId?: string;
   agentGroupId?: string;
 }
 
@@ -31,6 +33,7 @@ function destinationEntry(destination: Destination): DestinationEntry {
     type: destination.type,
     channelType: destination.channelType ?? undefined,
     platformId: destination.platformId ?? undefined,
+    threadId: destination.type === 'channel' ? (destination.threadId ?? undefined) : undefined,
     agentGroupId: destination.agentGroupId ?? undefined,
   };
 }

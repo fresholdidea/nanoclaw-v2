@@ -12,5 +12,10 @@
   {
     "name": "@openai/codex",
     "version": "0.162.1"
+  },
+  {
+    "name": "@googleworkspace/cli",
+    "version": "0.22.5",
+    "onlyBuilt": true
   }
 ]

@@ -85,6 +85,7 @@ describe('SQLite runner mailbox canonical serialization', () => {
         type: 'channel',
         channelType: 'test',
         platformId: 'room',
+        threadId: null,
         agentGroupId: null,
       },
     ]);

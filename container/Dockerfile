@@ -59,6 +59,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         curl \
         git \
         poppler-utils \
+        python3 \
         tini \
         unzip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
@@ -97,6 +98,38 @@ RUN chmod +x /usr/local/bin/mnemon
 
 ENV MNEMON_DATA_DIR=/workspace/extra/mnemon
 
+# ---- notebooklm CLI (nlm) — Google NotebookLM --------------------------------
+# `notebooklm-mcp-cli` drives NotebookLM from a portable cookie file. Auth is a
+# one-time interactive host `nlm login`; the host then mounts ~/.notebooklm-mcp-cli
+# (RW) at /workspace/extra/notebooklm via each group's container.json
+# `additionalMounts`, and NOTEBOOKLM_MCP_CLI_PATH below points the CLI at it.
+# Queries use profiles/<name>/cookies.json over HTTP — no browser or Playwright is
+# needed in-container (login, which drives Chrome over CDP, happens on the host).
+# Installed with uv against the system python3 into world-readable /opt so the
+# non-root `node` user can execute /usr/local/bin/nlm.
+ARG NOTEBOOKLM_CLI_VERSION=0.8.7
+ENV UV_TOOL_DIR=/opt/uv/tools
+ENV UV_TOOL_BIN_DIR=/usr/local/bin
+ENV UV_PYTHON_DOWNLOADS=never
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh && \
+    uv tool install --python /usr/bin/python3 "notebooklm-mcp-cli==${NOTEBOOKLM_CLI_VERSION}" && \
+    uv cache clean && \
+    rm -f /usr/local/bin/uv /usr/local/bin/uvx && \
+    chmod -R a+rX /opt/uv
+
+ENV NOTEBOOKLM_MCP_CLI_PATH=/workspace/extra/notebooklm
+
+# ---- deepline CLI ------------------------------------------------------------
+# Install the supported npm CLI package directly. The former Python binary
+# endpoint (`/api/v2/cli/python`) now returns 404; the package registry is the
+# documented, versioned distribution and avoids running Deepline's interactive
+# setup during a non-interactive image build.
+ARG DEEPLINE_VERSION=0.3.0
+RUN npm install --global --ignore-scripts --no-audit --no-fund \
+    "deepline@${DEEPLINE_VERSION}" \
+    --registry=https://code.deepline.com/api/v2/npm/
+ENV DEEPLINE_HOST_URL=https://code.deepline.com
+
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.
@@ -126,7 +159,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+ENV PATH="$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 # Pin pnpm to match the host (package.json packageManager). pnpm 11 stopped
 # honoring `only-built-dependencies[]=` in .npmrc for global installs, which
 # silently skips claude-code's native-binary postinstall and agent-browser's
@@ -147,6 +180,15 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
     chmod +x /usr/local/bin/ncl
+
+# ---- gws-account wrapper ------------------------------------------------------
+# Same pattern as ncl: the real helper lives in the mounted skills dir at
+# /app/skills/google-workspace/gws-account, which is not on PATH. The
+# google-workspace SKILL.md documents the bare `gws-account` command, so without
+# this shim every group except one with its own private copy hit
+# "command not found" and concluded GWS was unavailable to them.
+RUN printf '#!/bin/sh\nexec /app/skills/google-workspace/gws-account "$@"\n' > /usr/local/bin/gws-account && \
+    chmod +x /usr/local/bin/gws-account
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
