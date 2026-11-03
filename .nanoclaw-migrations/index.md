@@ -14,7 +14,7 @@ Brad's goal: a clean install that serves a solo freelancer, carrying only custom
 |------|------|
 | `10-channels.md` (+ `10-channels.assets/`) | Telegram + Slack |
 | `20-providers.md` | Codex, OneCLI, AGY/OpenCode drops |
-| `30-host-core.md` (+ `30-host-core.candidate.patch`) | host src, DB migrations, dashboard/HUD, mnemon-sync, ccusage, A2A |
+| `30-host-core.md` | host src, DB migrations, dashboard/HUD, mnemon-sync, ccusage, A2A |
 | `40-container-scripts.md` | Dockerfile, agent-runner, container skills, scripts, setup |
 
 ## Decisions (Brad, 2026-11-03)
