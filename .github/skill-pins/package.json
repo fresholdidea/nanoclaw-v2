@@ -20,6 +20,7 @@
     "@deltachat/stdio-rpc-server": "2.49.0",
     "@firecrawl/anydoc": "0.1.6",
     "@getdial/cli": "0.37.0",
+    "@googleworkspace/cli": "0.22.5",
     "@grpc/grpc-js": "1.14.5",
     "@grpc/proto-loader": "0.8.1",
     "@microsoft/teams.cli": "3.0.2",
@@ -133,6 +134,12 @@
         ".claude/skills/add-dial-tool/SKILL.md nc:json-merge"
       ]
     },
+    "@googleworkspace/cli": {
+      "version": "0.22.5",
+      "sources": [
+        "container/cli-tools.json"
+      ]
+    },
     "@grpc/grpc-js": {
       "version": "1.14.5",
       "sources": [
@@ -160,7 +167,8 @@
     "@openai/codex": {
       "version": "0.162.1",
       "sources": [
-        ".claude/skills/add-codex/SKILL.md nc:json-merge"
+        ".claude/skills/add-codex/SKILL.md nc:json-merge",
+        "container/cli-tools.json"
       ]
     },
     "@opencode-ai/sdk": {
