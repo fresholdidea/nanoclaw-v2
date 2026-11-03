@@ -507,9 +507,6 @@ describe('container configs', () => {
       additional_mounts: '[]',
       cli_scope: 'global',
       timezone: null,
-      enable_agy_tooling: 0,
-      enable_opencode_tooling: 0,
-      provider_chain: null,
       speed: null,
       updated_at: now(),
     });

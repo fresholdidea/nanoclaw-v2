@@ -455,14 +455,12 @@ describe('composeGroupProjectDoc size cap', () => {
 });
 
 describe('composeGroupProjectDoc module selection', () => {
-  it('omits Slack-only and sub-query module docs for a group with no Slack wiring or tooling flags', async () => {
+  it('omits Slack-only module docs for a group with no Slack wiring', async () => {
     const ag = await seed('ag-tg', 'tg');
     const doc = await compose(ag);
     expect(doc).not.toContain('# NanoClaw Module: canvas');
     expect(doc).not.toContain('# NanoClaw Module: rooms');
     expect(doc).not.toContain('# NanoClaw Module: create-agent-slack');
-    expect(doc).not.toContain('# NanoClaw Module: query-agy');
-    expect(doc).not.toContain('# NanoClaw Module: query-opencode');
     expect(doc).toContain('# NanoClaw Module: core');
     expect(doc).toContain('# NanoClaw Module: scheduling');
   });
@@ -495,25 +493,15 @@ describe('composeGroupProjectDoc module selection', () => {
     expect(doc).toContain('# NanoClaw Module: canvas');
     expect(doc).toContain('# NanoClaw Module: rooms');
   });
-
-  it('inlines a sub-query module doc only when its tooling flag is on', async () => {
-    const ag = await seed('ag-agy', 'agy');
-    await updateContainerConfigScalars(ag.id, { enable_agy_tooling: 1 });
-    const doc = await compose(ag);
-    expect(doc).toContain('# NanoClaw Module: query-agy');
-    expect(doc).not.toContain('# NanoClaw Module: query-opencode');
-  });
 });
 
 describe('moduleApplies', () => {
   it('is a pure gate over the group context', async () => {
     const { moduleApplies } = await import('./project-doc-compose.js');
-    const none = { cliDisabled: false, hasSlack: false, agyTooling: false, opencodeTooling: false };
+    const none = { cliDisabled: false, hasSlack: false };
     expect(moduleApplies('core', none)).toBe(true);
     expect(moduleApplies('canvas', none)).toBe(false);
     expect(moduleApplies('canvas', { ...none, hasSlack: true })).toBe(true);
-    expect(moduleApplies('query-opencode', none)).toBe(false);
-    expect(moduleApplies('query-opencode', { ...none, opencodeTooling: true })).toBe(true);
     expect(moduleApplies('cli', { ...none, cliDisabled: true })).toBe(false);
   });
 });

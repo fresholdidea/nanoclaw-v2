@@ -161,30 +161,16 @@ const NCL_DEPENDENT_MODULES = new Set(['cli', 'scheduling']);
 // ~10 KB of them on every turn and can never act on any of it.
 export const SLACK_ONLY_MODULES = new Set(['canvas', 'rooms', 'create-agent-slack']);
 
-// Module docs for the sub-query tools, which are only registered when the
-// matching container-config flag is on (`enable_agy_tooling`,
-// `enable_opencode_tooling`). Teaching a tool that is not there wastes tokens
-// and invites the agent to try it.
-const TOOLING_GATED_MODULES: Record<string, 'agy' | 'opencode'> = {
-  'query-agy': 'agy',
-  'query-opencode': 'opencode',
-};
-
 /** What the group actually has, so the composer can leave out what it cannot use. */
 export interface ModuleContext {
   cliDisabled: boolean;
   hasSlack: boolean;
-  agyTooling: boolean;
-  opencodeTooling: boolean;
 }
 
 /** Pure: does this module's instruction doc belong in the group's document? */
 export function moduleApplies(moduleName: string, ctx: ModuleContext): boolean {
   if (ctx.cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) return false;
   if (!ctx.hasSlack && SLACK_ONLY_MODULES.has(moduleName)) return false;
-  const gate = TOOLING_GATED_MODULES[moduleName];
-  if (gate === 'agy' && !ctx.agyTooling) return false;
-  if (gate === 'opencode' && !ctx.opencodeTooling) return false;
   return true;
 }
 
@@ -251,8 +237,6 @@ export async function composeGroupProjectDoc(
   const moduleCtx: ModuleContext = {
     cliDisabled: configRow?.cli_scope === 'disabled',
     hasSlack: wired.some((mg) => mg.channel_type.startsWith('slack')),
-    agyTooling: configRow?.enable_agy_tooling === 1,
-    opencodeTooling: configRow?.enable_opencode_tooling === 1,
   };
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {

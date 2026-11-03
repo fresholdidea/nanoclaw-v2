@@ -20,16 +20,19 @@ import { moduleApprovalsPendingApprovals } from './module-approvals-pending-appr
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { migration018 } from './018-approvals-approver-user-id.js';
 import { migration019 } from './019-wiring-threads.js';
-import { migration020 as migration020ProviderTooling } from './020-provider-tooling.js';
 import { migration020 } from './020-container-config-timezone.js';
-import { migration021 as migration021ProviderChain } from './021-provider-chain.js';
 import { migration021 } from './021-approval-question.js';
 import { migration022 } from './022-messaging-group-detached.js';
 import { migration023 } from './023-approvals-instance.js';
-import { migration024 as migration024WiringThreadFilter } from './024-wiring-thread-filter.js';
-import { migration025 as migration025DestinationThread } from './025-destination-thread.js';
 import { migration024 } from './024-host-coordination.js';
 import { migration025 } from './025-container-config-speed.js';
+// Local (fork) migrations. Identity is the `name`; never rename one (the live DB
+// has them applied by name, and a new name re-runs ADD COLUMN and crash-loops
+// initDb). Appended after upstream's entries; `version:` is only an ordering hint.
+import { migration020 as migration020ProviderTooling } from './020-provider-tooling.js';
+import { migration021 as migration021ProviderChain } from './021-provider-chain.js';
+import { migration024 as migration024WiringThreadFilter } from './024-wiring-thread-filter.js';
+import { migration025 as migration025DestinationThread } from './025-destination-thread.js';
 import { migration026 } from './026-agent-group-architecture.js';
 
 interface MigrationBase {
@@ -92,16 +95,16 @@ export const migrations: Migration[] = [
   migration015,
   migration016,
   migration019,
-  migration020ProviderTooling,
   migration020,
-  migration021ProviderChain,
   migration021,
   migration022,
   migration023,
-  migration024WiringThreadFilter,
-  migration025DestinationThread,
   migration024,
   migration025,
+  migration020ProviderTooling,
+  migration021ProviderChain,
+  migration024WiringThreadFilter,
+  migration025DestinationThread,
   migration026,
 ];
 

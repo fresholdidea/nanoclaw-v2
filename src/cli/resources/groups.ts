@@ -18,7 +18,6 @@ import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
   getContainerConfig,
-  updateContainerConfig,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
@@ -100,7 +99,6 @@ function presentConfig(row: ContainerConfigRow, ctx: CallerContext): Record<stri
     packages_apt: JSON.parse(row.packages_apt),
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
-    provider_chain: row.provider_chain ? (JSON.parse(row.provider_chain) as string[]) : null,
     cli_scope: row.cli_scope,
     timezone: row.timezone,
     updated_at: row.updated_at,
@@ -491,20 +489,12 @@ registerResource({
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
-        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
-        '--provider-chain <p1,p2,...>, --no-fallback.',
+        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
       handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
-
-        const hasProviderChain = args['provider-chain'] !== undefined || args.provider_chain !== undefined;
-        const hasNoFallback = args['no-fallback'] !== undefined || args.no_fallback !== undefined;
-
-        if (hasProviderChain && hasNoFallback) {
-          throw new Error('--provider-chain and --no-fallback are mutually exclusive — use one or the other');
-        }
 
         const updates: Partial<
           Pick<
@@ -545,25 +535,13 @@ registerResource({
           updates.cli_scope = scope;
         }
 
-        if (Object.keys(updates).length === 0 && !hasProviderChain && !hasNoFallback) {
+        if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone, --provider-chain, --no-fallback',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
           );
         }
 
-        if (Object.keys(updates).length > 0) await updateContainerConfigScalars(id, updates);
-
-        if (hasProviderChain) {
-          const raw = (args['provider-chain'] ?? args.provider_chain) as string;
-          const chain = raw
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean);
-          await updateContainerConfig(id, { providerChain: chain });
-        } else if (hasNoFallback) {
-          const primary = (updates.provider ?? row.provider ?? 'claude') as string;
-          await updateContainerConfig(id, { providerChain: [primary] });
-        }
+        await updateContainerConfigScalars(id, updates);
 
         const updated = (await getContainerConfig(id))!;
         return presentConfig(updated, ctx);

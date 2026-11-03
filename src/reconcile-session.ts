@@ -31,11 +31,10 @@
  */
 import fs from 'fs';
 
-import { IDLE_CHAT_SHUTDOWN_MS, IDLE_TASK_SHUTDOWN_MS } from './config.js';
+import { ABSOLUTE_CEILING_MS_RAW, CLAIM_STUCK_MS_RAW, IDLE_CHAT_SHUTDOWN_MS, IDLE_TASK_SHUTDOWN_MS } from './config.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { ABSOLUTE_CEILING_MS_RAW, CLAIM_STUCK_MS_RAW } from './config.js';
 import { log } from './log.js';
 import { heartbeatPath, outsideMailboxSession, withExistingMailboxSession } from './session-manager.js';
 import {

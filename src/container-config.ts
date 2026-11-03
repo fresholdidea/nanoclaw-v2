@@ -302,24 +302,6 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
-export const DEFAULT_PROVIDER_CHAIN = ['claude', 'codex', 'opencode'];
-
-export function resolveProviderChain(provider: string | undefined, providerChainJson: string | null): string[] {
-  const primary = provider ?? 'claude';
-  let chain: string[] = [];
-  if (providerChainJson) {
-    try {
-      const parsed: unknown = JSON.parse(providerChainJson);
-      if (Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string')) chain = parsed;
-    } catch {
-      chain = [];
-    }
-  }
-  if (chain.length === 0) chain = primary === 'claude' ? [...DEFAULT_PROVIDER_CHAIN] : [primary];
-  if (chain[0] !== primary) chain = [primary, ...chain.filter((entry) => entry !== primary)];
-  return chain;
-}
-
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -328,9 +310,6 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
-  providerChain?: string[];
-  enableAgyTooling?: boolean;
-  enableOpencodeTooling?: boolean;
   groupName?: string;
   assistantName?: string;
   agentGroupId?: string;
@@ -498,9 +477,6 @@ export function configFromDb(
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
     skills: parseSkillSelection(row.skills, group.name),
     provider: row.provider ?? undefined,
-    providerChain: resolveProviderChain(row.provider ?? undefined, row.provider_chain),
-    enableAgyTooling: row.enable_agy_tooling === 1,
-    enableOpencodeTooling: row.enable_opencode_tooling === 1,
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,

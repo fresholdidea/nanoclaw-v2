@@ -56,10 +56,15 @@ export interface ContainerConfigRow {
   packages_npm: string; // JSON: string[]
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
-  enable_agy_tooling: number;
-  enable_opencode_tooling: number;
-  /** JSON array of provider names, or NULL to derive from instance default. Added by migration 021. */
-  provider_chain: string | null;
+  /**
+   * Columns kept only because the live DB carries them (migrations
+   * provider-tooling / provider-chain). No code reads or writes them: the
+   * AGY/OpenCode tooling and the provider fallback chain were dropped in the
+   * 2026-11 rebuild. Optional so upstream fixtures need not set them.
+   */
+  enable_agy_tooling?: number;
+  enable_opencode_tooling?: number;
+  provider_chain?: string | null;
   timezone: string | null; // IANA id; NULL = follow the install-global timezone
   speed: ContainerSpeed | null; // NULL = install/provider default
   /**
