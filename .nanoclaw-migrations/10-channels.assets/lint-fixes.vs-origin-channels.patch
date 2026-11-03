@@ -1,0 +1,184 @@
+diff -ruN a/src/channels/slack.ts b/src/channels/slack.ts
+--- a/src/channels/slack.ts	2026-11-03 16:59:47
++++ b/src/channels/slack.ts	2026-11-03 16:59:47
+@@ -17,7 +17,7 @@
+ import { createSlackAdapter, type SlackAdapter } from '@chat-adapter/slack';
+ 
+ import { readEnvFile } from '../env.js';
+-import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults } from './adapter.js';
++import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
+ import { createChatSdkBridge } from './chat-sdk-bridge.js';
+ import { registerChannelAdapter } from './channel-registry.js';
+ import { setSlackAuthorIsBotResolver } from './slack-a2a-guard.js';
+diff -ruN a/src/channels/telegram-pairing.test.ts b/src/channels/telegram-pairing.test.ts
+--- a/src/channels/telegram-pairing.test.ts	2026-11-03 16:59:47
++++ b/src/channels/telegram-pairing.test.ts	2026-11-03 16:59:54
+@@ -167,7 +167,7 @@
+     const r = await createPairing('main');
+     const p = waitForPairing(r.code, { pollMs: 50 });
+     setTimeout(() => {
+-      tryConsume({ text: `@b ${r.code}`, botUsername: 'b', platformId: 'tg:1', isGroup: true, name: 'Group' });
++      void tryConsume({ text: `@b ${r.code}`, botUsername: 'b', platformId: 'tg:1', isGroup: true, name: 'Group' });
+     }, 100);
+     const consumed = await p;
+     expect(consumed.status).toBe('consumed');
+@@ -178,7 +178,7 @@
+     const r = await createPairing('main');
+     const waiter = waitForPairing(r.code, { pollMs: 30 });
+     setTimeout(() => {
+-      tryConsume({ text: '000000', botUsername: 'b', platformId: 'tg:1', isGroup: false });
++      void tryConsume({ text: '000000', botUsername: 'b', platformId: 'tg:1', isGroup: false });
+     }, 60);
+     await expect(waiter).rejects.toThrow(/invalidated/);
+   });
+@@ -217,7 +217,7 @@
+       onAttempt: (a) => attempts.push(a.candidate),
+     });
+     setTimeout(() => {
+-      tryConsume({ text: '999999', botUsername: 'b', platformId: 'tg:1', isGroup: false });
++      void tryConsume({ text: '999999', botUsername: 'b', platformId: 'tg:1', isGroup: false });
+     }, 60);
+     await expect(waiter).rejects.toThrow(/invalidated by wrong code \(999999\)/);
+     expect(attempts).toEqual(['999999']);
+@@ -232,7 +232,7 @@
+       onAttempt: (a) => attempts.push(a.candidate),
+     });
+     setTimeout(() => {
+-      tryConsume({ text: r.code, botUsername: 'b', platformId: 'tg:1', isGroup: false });
++      void tryConsume({ text: r.code, botUsername: 'b', platformId: 'tg:1', isGroup: false });
+     }, 60);
+     const consumed = await waiter;
+     expect(consumed.status).toBe('consumed');
+diff -ruN a/src/modules/canvas-actions/canvas-api.ts b/src/modules/canvas-actions/canvas-api.ts
+--- a/src/modules/canvas-actions/canvas-api.ts	2026-11-03 16:59:47
++++ b/src/modules/canvas-actions/canvas-api.ts	2026-11-03 16:59:47
+@@ -101,13 +101,13 @@
+       signal: AbortSignal.timeout(30_000),
+     });
+   } catch (err) {
+-    throw new Error(`slack files.info failed: ${err instanceof Error ? err.message : String(err)}`);
++    throw new Error(`slack files.info failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+   }
+   let info: Record<string, unknown>;
+   try {
+     info = (await infoRes.json()) as Record<string, unknown>;
+-  } catch {
+-    throw new Error(`slack files.info failed: HTTP ${infoRes.status}, non-JSON body`);
++  } catch (err) {
++    throw new Error(`slack files.info failed: HTTP ${infoRes.status}, non-JSON body`, { cause: err });
+   }
+   if (info.ok !== true) {
+     throw new Error(`slack files.info failed: ${String(info.error ?? `HTTP ${infoRes.status}`)}`);
+@@ -123,7 +123,7 @@
+       signal: AbortSignal.timeout(30_000),
+     });
+   } catch (err) {
+-    throw new Error(`canvas download failed: ${err instanceof Error ? err.message : String(err)}`);
++    throw new Error(`canvas download failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+   }
+   if (!res.ok) throw new Error(`canvas download failed: HTTP ${res.status}`);
+   return res.text();
+diff -ruN a/src/modules/slack-onboarding/thread-title.test.ts b/src/modules/slack-onboarding/thread-title.test.ts
+--- a/src/modules/slack-onboarding/thread-title.test.ts	2026-11-03 16:59:47
++++ b/src/modules/slack-onboarding/thread-title.test.ts	2026-11-03 16:59:47
+@@ -141,7 +141,7 @@
+     mod.setTitleDelaysForTest(0, 0);
+ 
+     const longText = 'Can you help me put together the quarterly report for the design review?';
+-    sessionCreated(dmEvent(longText));
++    await sessionCreated(dmEvent(longText));
+ 
+     await flushTitles();
+     expect(registry.setThreadTitle.mock.calls).toEqual([['slack', 'slack:D1', 'slack:D1:171', longText.slice(0, 45)]]);
+@@ -152,8 +152,8 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(dmEvent('first conversation'));
+-    sessionCreated(dmEvent('second conversation', { session: { id: 'sess-2' }, threadId: 'slack:D1:999' }));
++    await sessionCreated(dmEvent('first conversation'));
++    await sessionCreated(dmEvent('second conversation', { session: { id: 'sess-2' }, threadId: 'slack:D1:999' }));
+ 
+     await flushTitles();
+     expect(registry.setThreadTitle).toHaveBeenCalledTimes(2);
+@@ -169,7 +169,7 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(dmEvent('hello there', { sessionMode: 'shared', threadId: null }));
++    await sessionCreated(dmEvent('hello there', { sessionMode: 'shared', threadId: null }));
+ 
+     await flushTitles();
+     expect(registry.setThreadTitle).not.toHaveBeenCalled();
+@@ -181,7 +181,7 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(
++    await sessionCreated(
+       dmEvent('hello there', {
+         mg: { id: 'mg-room', channel_type: 'slack', platform_id: 'slack:C9', instance: 'slack', is_group: 1 },
+         platformId: 'slack:C9',
+@@ -197,7 +197,7 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(dmEvent('hello there', { threadId: null }));
++    await sessionCreated(dmEvent('hello there', { threadId: null }));
+ 
+     await flushTitles();
+     expect(registry.setThreadTitle).not.toHaveBeenCalled();
+@@ -207,7 +207,7 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(
++    await sessionCreated(
+       dmEvent('hi', {
+         mg: { id: 'mg-dm', channel_type: 'slack', platform_id: 'slack:D1', instance: 'slack-teamster', is_group: 0 },
+       }),
+@@ -221,7 +221,7 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(
++    await sessionCreated(
+       dmEvent('ignored', { message: { id: 'm1', kind: 'chat', content: 'plain text hello', timestamp: now() } }),
+     );
+ 
+@@ -233,7 +233,7 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(dmEvent('   '));
++    await sessionCreated(dmEvent('   '));
+ 
+     await flushTitles();
+     expect(registry.setThreadTitle).not.toHaveBeenCalled();
+@@ -244,7 +244,7 @@
+     const { mod, sessionCreated, registry } = await loadModule();
+     mod.setTitleDelaysForTest(0, 0);
+ 
+-    sessionCreated(dmEvent('let’s go'));
++    await sessionCreated(dmEvent('let’s go'));
+ 
+     await flushTitles();
+     expect(registry.setSuggestedPrompts).toHaveBeenCalledWith('slack', 'slack:D1', []);
+@@ -256,7 +256,7 @@
+     mod.setTitleDelaysForTest(10, 20);
+     registry.setThreadTitle.mockRejectedValueOnce(new Error('channel_not_found'));
+ 
+-    sessionCreated(dmEvent('needs a retry'));
++    await sessionCreated(dmEvent('needs a retry'));
+     expect(registry.setThreadTitle).not.toHaveBeenCalled(); // nothing before the initial delay
+ 
+     await vi.advanceTimersByTimeAsync(10);
+@@ -276,7 +276,7 @@
+     mod.setTitleDelaysForTest(0, 0);
+     registry.setThreadTitle.mockRejectedValue(new Error('channel_not_found'));
+ 
+-    sessionCreated(dmEvent('never lands'));
++    await sessionCreated(dmEvent('never lands'));
+ 
+     await vi.advanceTimersByTimeAsync(60_000);
+     expect(registry.setThreadTitle).toHaveBeenCalledTimes(2); // initial + one retry, never a third
