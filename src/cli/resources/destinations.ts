@@ -60,6 +60,12 @@ registerResource({
       type: 'string',
       description: "The target's ID — messaging_groups.id for channels, agent_groups.id for agents.",
     },
+    {
+      name: 'thread_id',
+      type: 'string',
+      description:
+        'Channel destinations only: pin every send to one thread/topic of the chat (e.g. a Telegram forum topic). NULL = reply in the session thread, otherwise top level. Set with --thread on add: full thread id or bare topic number.',
+    },
     { name: 'channel_type', type: 'string', description: 'Resolved channel type for channel destinations.' },
     { name: 'display_name', type: 'string', description: 'Resolved chat title or agent name.' },
     { name: 'created_at', type: 'string', description: 'Auto-set.' },
@@ -80,6 +86,7 @@ registerResource({
                ad.local_name,
                ad.target_type,
                ad.target_id,
+               ad.thread_id,
                CASE WHEN ad.target_type = 'channel' THEN mg.channel_type ELSE NULL END AS channel_type,
                CASE WHEN ad.target_type = 'channel' THEN mg.name ELSE ag.name END AS display_name,
                ad.created_at
@@ -94,7 +101,8 @@ registerResource({
     },
     add: {
       access: 'approval',
-      description: 'Add a destination for an agent. Use --agent-group-id, --local-name, --target-type, --target-id.',
+      description:
+        'Add a destination for an agent. Use --agent-group-id, --local-name, --target-type, --target-id. For a channel target, --thread <topic-number|full-thread-id> pins every send to that thread/topic. Re-adding an existing local name replaces its target and thread.',
       handler: async (args) => {
         const agentGroupId = args.agent_group_id as string;
         const localName = args.local_name as string;
@@ -106,17 +114,42 @@ registerResource({
           throw new Error('--target-type must be channel or agent');
         }
         if (!targetId) throw new Error('--target-id is required');
+        let threadId: string | null = null;
+        if (args.thread !== undefined && String(args.thread).trim() !== '') {
+          if (targetType !== 'channel') throw new Error('--thread applies to channel destinations only');
+          const mg = await getDb().get<{ platform_id: string }>(
+            'SELECT platform_id FROM messaging_groups WHERE id = ?',
+            targetId,
+          );
+          if (!mg) throw new Error(`messaging group not found: ${targetId}`);
+          const raw = String(args.thread).trim();
+          if (/^\d+$/.test(raw)) threadId = `${mg.platform_id}:${raw}`;
+          else if (raw.startsWith(`${mg.platform_id}:`)) threadId = raw;
+          else
+            throw new Error(
+              `--thread must be a thread of ${mg.platform_id} (full id or bare topic number), got "${raw}"`,
+            );
+        }
         await getDb().run(
-          `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
+          `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, thread_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (agent_group_id, local_name) DO UPDATE SET
+             target_type = excluded.target_type, target_id = excluded.target_id, thread_id = excluded.thread_id`,
           agentGroupId,
           localName,
           targetType,
           targetId,
+          threadId,
           new Date().toISOString(),
         );
         await projectDestinationsToSessions(agentGroupId);
-        return { agent_group_id: agentGroupId, local_name: localName, target_type: targetType, target_id: targetId };
+        return {
+          agent_group_id: agentGroupId,
+          local_name: localName,
+          target_type: targetType,
+          target_id: targetId,
+          thread_id: threadId,
+        };
       },
     },
     remove: {

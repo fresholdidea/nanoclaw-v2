@@ -1,5 +1,16 @@
 // ── Central DB entities ──
 
+/** Agent architecture tiers (`agent_groups.tier`). */
+export const AGENT_TIERS = ['orchestrator', 'account', 'specialist', 'worker', 'personal'] as const;
+export type AgentTier = (typeof AGENT_TIERS)[number];
+
+/** Decoded `agent_groups.persona` — every key optional, all strings. */
+export interface AgentPersona {
+  emoji?: string;
+  color?: string;
+  initials?: string;
+}
+
 export interface AgentGroup {
   id: string;
   name: string;
@@ -7,6 +18,18 @@ export interface AgentGroup {
   /** @deprecated Use container_configs.provider instead. */
   agent_provider: string | null;
   created_at: string;
+  /**
+   * Architecture metadata (migration 026). Optional on the type so callers
+   * that mint a group can omit them; rows read back always carry them
+   * (NULL = unclassified). Validated on write in `src/db/agent-groups.ts`.
+   */
+  tier?: AgentTier | null;
+  /** Agent group id this group reports to. */
+  reports_to?: string | null;
+  /** One-line role description. */
+  role?: string | null;
+  /** JSON-encoded `AgentPersona`. */
+  persona?: string | null;
 }
 
 /**
@@ -33,6 +56,10 @@ export interface ContainerConfigRow {
   packages_npm: string; // JSON: string[]
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
+  enable_agy_tooling: number;
+  enable_opencode_tooling: number;
+  /** JSON array of provider names, or NULL to derive from instance default. Added by migration 021. */
+  provider_chain: string | null;
   timezone: string | null; // IANA id; NULL = follow the install-global timezone
   speed: ContainerSpeed | null; // NULL = install/provider default
   /**
@@ -159,6 +186,15 @@ export interface MessagingGroupAgent {
    * updating.
    */
   threads?: number | null;
+  /**
+   * Per-wiring thread filter (migration 024). NULL = unscoped. Otherwise the
+   * exact effective thread id this wiring is confined to (e.g. a Telegram
+   * forum topic `telegram:-100123:4`): the wiring engages only in that
+   * thread, and while it matches, unscoped wirings on the same messaging
+   * group stand down. Lets one chat fan out by topic to specialist agents
+   * with an orchestrator as the catch-all.
+   */
+  thread_filter?: string | null;
   created_at: string;
 }
 
@@ -268,6 +304,12 @@ export interface AgentDestination {
   local_name: string;
   target_type: 'channel' | 'agent';
   target_id: string;
+  /**
+   * Channel destinations only (migration 025): pin sends to one thread/topic
+   * of the target chat. NULL = follow the session thread when replying, top
+   * level otherwise.
+   */
+  thread_id?: string | null;
   created_at: string;
 }
 

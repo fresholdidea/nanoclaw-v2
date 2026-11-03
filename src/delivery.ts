@@ -36,6 +36,7 @@ import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './sess
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
+import { OutboundJournalPendingError } from './mailbox/index.js';
 import type { OutboundMessage } from './mailbox/index.js';
 
 const ACTIVE_POLL_MS = 1000;
@@ -275,6 +276,8 @@ async function drainSession(session: Session): Promise<void> {
     if (!existing) return;
     ({ delivered, pending } = existing);
   } catch (err) {
+    // The runner is mid-commit (or died with a leftover the sweep replays): next poll.
+    if (err instanceof OutboundJournalPendingError) return;
     log.error('Session mailbox delivery failed', {
       agentGroupId: agentGroup.id,
       sessionId: session.id,

@@ -19,11 +19,22 @@ const envConfig = readEnvFile([
   'CONTAINER_PIDS_LIMIT',
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
+  'NANOCLAW_IDLE_CHAT_MS',
+  'NANOCLAW_IDLE_TASK_MS',
+  'NANOCLAW_DEFAULT_EFFORT',
   'WEBHOOK_PORT',
   'WEBHOOK_HOST',
   'NANOCLAW_ABSOLUTE_CEILING_MS',
   'NANOCLAW_CLAIM_STUCK_MS',
 ]);
+
+// Install-wide default model and reasoning effort for agent containers, applied
+// at spawn to any group that has not set its own (`ncl groups config update
+// --model/--effort`). Unset means the provider SDK's own default. Unlike
+// DEFAULT_AGENT_PROVIDER these are read at spawn, not stamped at creation, so a
+// change takes effect on the next container start for every unpinned group.
+export const DEFAULT_MODEL = process.env.NANOCLAW_DEFAULT_MODEL || envConfig.NANOCLAW_DEFAULT_MODEL || '';
+export const DEFAULT_EFFORT = process.env.NANOCLAW_DEFAULT_EFFORT || envConfig.NANOCLAW_DEFAULT_EFFORT || '';
 
 /**
  * @deprecated WhatsApp adapter copies now read the ASSISTANT_NAME .env key
@@ -43,13 +54,6 @@ export const DEFAULT_AGENT_PROVIDER = (
   'claude'
 ).toLowerCase();
 
-// Instance-wide default model for agent containers, applied when the group has
-// no model of its own. Unset means the provider SDK's own default, which is
-// what every existing install gets. Unlike DEFAULT_AGENT_PROVIDER this is read
-// at spawn rather than stamped at creation, so changing it takes effect on the
-// next container start for every group that has not set one.
-export const DEFAULT_MODEL = process.env.NANOCLAW_DEFAULT_MODEL || envConfig.NANOCLAW_DEFAULT_MODEL || '';
-
 // Fast serving tier for every agent container: faster output at a higher
 // per-token price. Off unless explicitly turned on, and only by '1' or 'true' —
 // a typo must not silently start charging the faster rate.
@@ -66,7 +70,7 @@ export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 
 // Absolute paths needed for container mounts
-const PROJECT_ROOT = process.cwd();
+export const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
@@ -97,6 +101,38 @@ export const CONTAINER_INSTALL_LABEL = `nanoclaw-install=${INSTALL_SLUG}`;
 // Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
 export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
 export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '';
+
+/**
+ * Idle-shutdown windows for a running container with nothing in flight.
+ *
+ * A container that finishes a turn keeps polling forever — nothing in the
+ * runner shuts it down. Before these knobs existed, the only thing that
+ * eventually reaped it was the host sweep's 30-minute stuck-detector ceiling,
+ * so every idle container held its RAM for half an hour after its last turn.
+ *
+ * Keeping a container warm does NOT improve prompt-cache hit rate: the
+ * Anthropic cache is server-side, ~5-minute TTL, keyed on prefix hash (see the
+ * comment block in container/agent-runner/src/poll-loop.ts). A cold container
+ * resuming the same transcript hits the same cache entries. The only thing a
+ * warm container buys is the ~5–12s respawn, so these windows trade a little
+ * reply latency for RAM, and nothing else.
+ *
+ * Two windows because the two session kinds differ: a chat thread may get a
+ * human follow-up, a task thread never does — a scheduled run fires, does its
+ * turn, and no one replies to it.
+ */
+function idleWindowMs(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+export const IDLE_CHAT_SHUTDOWN_MS = idleWindowMs(
+  process.env.NANOCLAW_IDLE_CHAT_MS || envConfig.NANOCLAW_IDLE_CHAT_MS,
+  10 * 60 * 1000,
+);
+export const IDLE_TASK_SHUTDOWN_MS = idleWindowMs(
+  process.env.NANOCLAW_IDLE_TASK_MS || envConfig.NANOCLAW_IDLE_TASK_MS,
+  2 * 60 * 1000,
+);
 
 // Fork-bomb backstop. cgroups v2 counts THREADS, not processes, and Chromium is
 // thread-hungry — a browsing agent with several tabs open runs into the high

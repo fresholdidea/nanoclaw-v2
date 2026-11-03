@@ -11,9 +11,10 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
+import { DEFAULT_EFFORT, DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { isSecretShaped, looksLikeCredential } from './drivers/types.js';
 import { isValidTimezone } from './timezone.js';
 import { log } from './log.js';
 import type { AgentGroup, ContainerConfigRow, ContainerSpeed } from './types.js';
@@ -86,6 +87,11 @@ const SECRET_QUERY_KEY_RE =
 /** camelCase → snake_case before matching, so `authToken` hits the word list. */
 const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
 
+/** Whether a URL query key names a credential (SECRET_QUERY_KEY_RE). */
+export function isSecretQueryKey(key: string): boolean {
+  return SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'));
+}
+
 /**
  * Server names and env keys end up in provider config writers that emit
  * formats with structural syntax (codex writes TOML table headers), so an
@@ -96,6 +102,67 @@ const CAMEL_SPLIT_RE = /([a-z0-9])([A-Z])/g;
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** What a container agent sees in place of an MCP env or header value. */
+export const REDACTED_VALUE = '<redacted>';
+
+/**
+ * Values that name a credential without being one, optionally behind an auth
+ * scheme (`Bearer placeholder`): the template convention (PLACEHOLDER_VALUE in
+ * templates/mcp.ts, which imports this module), the vault-managed marker, and
+ * a bare `${VAR}` / `$VAR` reference.
+ */
+function isPlaceholderValue(value: string): boolean {
+  const bare = value.replace(/^(Bearer|Token|Basic)\s+/i, '');
+  return (
+    bare === '' ||
+    bare === 'placeholder' ||
+    bare === 'onecli-managed' ||
+    /^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)$/.test(bare)
+  );
+}
+
+/** A credential-format token anywhere in an arg (`Authorization: Bearer sk-…`, `--key=ghp_…`). */
+function containsCredential(value: string): boolean {
+  return looksLikeCredential(value) || value.split(/[\s=:,]+/).some(looksLikeCredential);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A copy of a stored `mcp_servers` blob that is safe to show a container
+ * agent: every env and header value becomes `<redacted>` unless it is a
+ * placeholder, and an arg carrying a credential-format token is replaced
+ * whole. Keys, commands and URLs stay, so the agent can still see how each
+ * server is wired. Hand-edited rows are shown, not validated — only redacted.
+ */
+export function redactMcpServerSecrets(servers: unknown): unknown {
+  if (!isPlainRecord(servers)) return servers;
+  return Object.fromEntries(
+    Object.entries(servers).map(([name, entry]) => {
+      if (!isPlainRecord(entry)) return [name, entry];
+      const shown: Record<string, unknown> = { ...entry };
+      for (const field of ['env', 'headers']) {
+        const values = entry[field];
+        if (!isPlainRecord(values)) continue;
+        shown[field] = Object.fromEntries(
+          Object.entries(values).map(([key, value]) => [
+            key,
+            typeof value === 'string' && isPlaceholderValue(value) ? value : REDACTED_VALUE,
+          ]),
+        );
+      }
+      if (Array.isArray(entry.args)) {
+        shown.args = entry.args.map((arg) =>
+          typeof arg === 'string' && containsCredential(arg) ? REDACTED_VALUE : arg,
+        );
+      }
+      return [name, shown];
+    }),
+  );
+}
 
 /** The owning plugin's name when a stored MCP server entry was stamped from a plugin. */
 export function mcpServerPluginOwner(entry: unknown): string | undefined {
@@ -162,7 +229,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): McpServerC
       throw new Error('url must not contain credentials or fragments; use the credential gateway');
     }
     for (const key of parsed.searchParams.keys()) {
-      if (SECRET_QUERY_KEY_RE.test(key.replace(CAMEL_SPLIT_RE, '$1_$2'))) {
+      if (isSecretQueryKey(key)) {
         throw new Error(`url query parameter "${key}" looks like a credential; use the credential gateway`);
       }
     }
@@ -235,6 +302,24 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+export const DEFAULT_PROVIDER_CHAIN = ['claude', 'codex', 'opencode'];
+
+export function resolveProviderChain(provider: string | undefined, providerChainJson: string | null): string[] {
+  const primary = provider ?? 'claude';
+  let chain: string[] = [];
+  if (providerChainJson) {
+    try {
+      const parsed: unknown = JSON.parse(providerChainJson);
+      if (Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string')) chain = parsed;
+    } catch {
+      chain = [];
+    }
+  }
+  if (chain.length === 0) chain = primary === 'claude' ? [...DEFAULT_PROVIDER_CHAIN] : [primary];
+  if (chain[0] !== primary) chain = [primary, ...chain.filter((entry) => entry !== primary)];
+  return chain;
+}
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -243,6 +328,9 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
+  providerChain?: string[];
+  enableAgyTooling?: boolean;
+  enableOpencodeTooling?: boolean;
   groupName?: string;
   assistantName?: string;
   agentGroupId?: string;
@@ -270,6 +358,32 @@ export interface ContainerConfig {
 export async function resolveGroupTimezone(agentGroupId: string): Promise<string> {
   const tz = (await getContainerConfig(agentGroupId))?.timezone;
   return tz && isValidTimezone(tz) ? tz : TIMEZONE;
+}
+
+/**
+ * (group, server, env key) triples already reported this process. The blob is
+ * re-sanitized on every spawn and every dashboard push; one line is enough.
+ */
+const reportedSecretEnv = new Set<string>();
+
+/**
+ * Container env refuses secret-shaped values outright (validateSpec). MCP env
+ * cannot — a server may have no other credential source — but a raw
+ * credential there is copied into container.json and readable inside the
+ * container, so it is reported: the key, never the value.
+ */
+function warnSecretShapedEnv(groupName: string, server: string, env: Record<string, string>): void {
+  for (const [key, value] of Object.entries(env)) {
+    if (isPlaceholderValue(value) || !isSecretShaped(key, value)) continue;
+    const id = `${groupName}\0${server}\0${key}`;
+    if (reportedSecretEnv.has(id)) continue;
+    reportedSecretEnv.add(id);
+    log.warn('MCP server env carries a secret-shaped value; route the credential through the gateway instead', {
+      group: groupName,
+      server,
+      key,
+    });
+  }
 }
 
 /**
@@ -307,6 +421,7 @@ export function sanitizeStoredMcpServers(raw: unknown, groupName: string): Recor
         delete server.cwd;
         log.warn('Stripping cwd from stored MCP server without plugin provenance', { group: groupName, server: name });
       }
+      if (server.type !== 'http') warnSecretShapedEnv(groupName, name, server.env ?? {});
       servers[name] = server;
       // eslint-disable-next-line no-catch-all/no-catch-all -- validation failures are data errors, not bugs
     } catch (err) {
@@ -360,7 +475,19 @@ export function parseSkillSelection(raw: string | undefined, groupName: string):
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
-export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
+/** Install-wide fallbacks applied by configFromDb when the row leaves a field unset. */
+export interface ContainerConfigDefaults {
+  model?: string;
+  effort?: string;
+}
+
+const INSTALL_DEFAULTS: ContainerConfigDefaults = { model: DEFAULT_MODEL, effort: DEFAULT_EFFORT };
+
+export function configFromDb(
+  row: ContainerConfigRow,
+  group: AgentGroup,
+  defaults: ContainerConfigDefaults = INSTALL_DEFAULTS,
+): ContainerConfig {
   return {
     mcpServers: sanitizeStoredMcpServers(JSON.parse(row.mcp_servers), group.name),
     packages: {
@@ -371,14 +498,17 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
     skills: parseSkillSelection(row.skills, group.name),
     provider: row.provider ?? undefined,
+    providerChain: resolveProviderChain(row.provider ?? undefined, row.provider_chain),
+    enableAgyTooling: row.enable_agy_tooling === 1,
+    enableOpencodeTooling: row.enable_opencode_tooling === 1,
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
-    // The group's own model wins; NANOCLAW_DEFAULT_MODEL fills in for groups
-    // that have none. Both absent leaves the field out and the SDK decides.
-    model: row.model ?? (DEFAULT_MODEL || undefined),
-    effort: row.effort ?? undefined,
+    // The group's own model/effort win; NANOCLAW_DEFAULT_MODEL / _EFFORT fill in
+    // for groups that have none. All absent leaves the field out and the SDK decides.
+    model: row.model || defaults.model || undefined,
+    effort: row.effort || defaults.effort || undefined,
     // A cleared group value falls back to the install-wide default.
     ...speedFields(parseContainerSpeed(row.speed) ?? (FAST_MODE ? 'fast' : undefined)),
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,

@@ -462,6 +462,20 @@ export function withExistingMailboxSession<T>(
   return runMailboxSession(agentGroupId, sessionId, action, false);
 }
 
+/**
+ * Run `fn` outside any mailbox session the current async context holds.
+ *
+ * Deferred work that is scheduled from inside a session but runs later —
+ * container exit callbacks above all — inherits the AsyncLocalStorage store
+ * of whoever scheduled it, so its own withMailboxSession on the same key
+ * trips the nesting guard even though the scheduling session finished long
+ * ago. Exiting the store gives the callback a fresh top-level context; it
+ * must not be used from code that is still inside the session it would hide.
+ */
+export function outsideMailboxSession<T>(fn: () => T): T {
+  return activeMailboxKeys.exit(fn);
+}
+
 async function runMailboxSession<T>(
   agentGroupId: string,
   sessionId: string,

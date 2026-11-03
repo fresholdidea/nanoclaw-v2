@@ -85,6 +85,7 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
+  outsideMailboxSession,
   sessionContextPath,
   sessionDir,
   writeSessionContext,
@@ -219,6 +220,16 @@ export function getActiveContainerCount(): number {
 
 export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
+}
+
+/**
+ * Whether a runner may be alive for the session — registered, or a surviving
+ * container left running while its adoption is retried. Gate every host write
+ * to outbound.db on this, not isContainerRunning: an unregistered survivor is
+ * still that file's writer.
+ */
+export function isSessionRuntimeLive(sessionId: string): boolean {
+  return activeContainers.has(sessionId) || pendingAdoptions.has(sessionId);
 }
 
 export function getContainerStartedAtMs(sessionId: string): number | undefined {
@@ -732,6 +743,32 @@ async function finishAndResolve(
   }
 }
 
+/**
+ * A session whose container dies at boot gets re-woken on the next due message,
+ * forever. Nothing counted those deaths and `started-then-died` logged at info,
+ * so a crash loop read exactly like a clean exit: the `ads` group spawned
+ * 5,549 containers over five days in Aug 2026 and was only broken by an
+ * unrelated host restart. Count consecutive boot deaths per session and raise
+ * the level once a session is plainly looping, so it reaches the error log.
+ */
+const BOOT_FAILURE_ALERT_AFTER = 3;
+const consecutiveBootFailures = new Map<string, number>();
+
+export type SessionEndLog = { level: 'info' } | { level: 'error'; consecutiveBootFailures: number };
+
+/** How this session's end should be logged, given how its recent ends went. */
+export function describeSessionEnd(sessionId: string, failure?: SessionFailure): SessionEndLog {
+  const diedAtBoot =
+    failure?.kind === 'started-then-died' && typeof failure.exitCode === 'number' && failure.exitCode !== 0;
+  if (!diedAtBoot) {
+    consecutiveBootFailures.delete(sessionId);
+    return { level: 'info' };
+  }
+  const streak = (consecutiveBootFailures.get(sessionId) ?? 0) + 1;
+  consecutiveBootFailures.set(sessionId, streak);
+  return streak >= BOOT_FAILURE_ALERT_AFTER ? { level: 'error', consecutiveBootFailures: streak } : { level: 'info' };
+}
+
 // Fence-read schedule: brief in-line retries (~30s), then the whole
 // finalization defers to the resync cadence. A store outage never forces a
 // choice between clobbering a newer incarnation and leaking the runtime.
@@ -832,11 +869,18 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   if (failure && failure.kind !== 'started-then-died') {
     log.error('Session failed', { sessionId, containerName, kind: failure.kind, retryable: failure.retryable });
   } else {
-    log.info('Session ended', {
-      sessionId,
-      containerName,
-      exitCode: failure && failure.kind === 'started-then-died' ? failure.exitCode : undefined,
-    });
+    const exitCode = failure && failure.kind === 'started-then-died' ? failure.exitCode : undefined;
+    const end = describeSessionEnd(sessionId, failure);
+    if (end.level === 'error') {
+      log.error('Session crash-looping at boot', {
+        sessionId,
+        containerName,
+        exitCode,
+        consecutiveBootFailures: end.consecutiveBootFailures,
+      });
+    } else {
+      log.info('Session ended', { sessionId, containerName, exitCode });
+    }
   }
 
   if (activeContainers.get(sessionId) === runtime) {
@@ -868,7 +912,12 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   if (!entry) return;
 
   if (onExit) {
-    entry.exitCallbacks.push(onExit);
+    // Callers kill from inside a mailbox session (the sweep's SLA check, a
+    // restart dispatched mid-delivery); the callback would inherit that
+    // context and trip the nesting guard when it opens its own session on
+    // the same key. The container is gone by the time it runs, so it gets a
+    // fresh top-level context instead.
+    entry.exitCallbacks.push(() => outsideMailboxSession(onExit));
   }
 
   entry.stopReason = reason;

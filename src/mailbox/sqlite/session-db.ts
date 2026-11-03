@@ -27,11 +27,28 @@ export function openInboundDb(dbPath: string): Database.Database {
   return db;
 }
 
-/** Open the outbound DB for a session (host reads only). */
+/**
+ * Open the outbound DB for a session (host reads only).
+ *
+ * Must be a truly read-only open, not read-write + `query_only`. File locks
+ * taken inside the container are invisible to the host across the bind mount
+ * (Docker Desktop / virtiofs), so a host connection that sees the container's
+ * mid-commit `-journal` concludes it is a crash leftover. A writable connection
+ * then rolls that live transaction back — `query_only` does not prevent this —
+ * and the file ends up corrupt. A read-only connection instead fails with
+ * SQLITE_READONLY_ROLLBACK (see isOutboundRollbackPending); the container's own
+ * next open, or the mailbox's recoverOutboundJournal once no container is
+ * running, replays a genuine leftover.
+ */
 export function openOutboundDb(dbPath: string): Database.Database {
   const db = new Database(dbPath, { readonly: true });
   db.pragma('busy_timeout = 5000');
   return db;
+}
+
+/** True when a read-only outbound open hit a journal it may not roll back (mid-commit, or a dead container's leftover). */
+export function isOutboundRollbackPending(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === 'SQLITE_READONLY_ROLLBACK';
 }
 
 /** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
@@ -63,14 +80,24 @@ export interface DestinationRow {
   channel_type: string | null;
   platform_id: string | null;
   agent_group_id: string | null;
+  thread_id: string | null;
+}
+
+/** Lazy on-open migration for session DBs created before `thread_id` existed. */
+export function migrateDestinationsTable(db: Database.Database): void {
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info('destinations')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!cols.has('thread_id')) db.prepare('ALTER TABLE destinations ADD COLUMN thread_id TEXT').run();
 }
 
 export function replaceDestinations(db: Database.Database, entries: DestinationRow[]): void {
+  migrateDestinationsTable(db);
   const tx = db.transaction((rows: DestinationRow[]) => {
     db.prepare('DELETE FROM destinations').run();
     const stmt = db.prepare(
-      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-       VALUES (@name, @display_name, @type, @channel_type, @platform_id, @agent_group_id)`,
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id, thread_id)
+       VALUES (@name, @display_name, @type, @channel_type, @platform_id, @agent_group_id, @thread_id)`,
     );
     for (const row of rows) stmt.run(row);
   });
@@ -180,8 +207,9 @@ export function getProcessingClaims(outDb: Database.Database): ProcessingClaim[]
  * tick (which would kill the freshly respawned container before its
  * agent-runner can run its own startup cleanup).
  *
- * Safe because the host only writes to outbound.db when no container is
- * running (we just killed it). Returns the number of rows deleted.
+ * Only safe once the container is gone — callers on a kill path must defer
+ * this to the kill's onExit callback, never run it right after requesting the
+ * stop. Returns the number of rows deleted.
  */
 export function deleteOrphanProcessingClaims(outDb: Database.Database): number {
   return outDb.prepare("DELETE FROM processing_ack WHERE status = 'processing'").run().changes;

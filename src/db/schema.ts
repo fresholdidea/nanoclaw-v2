@@ -13,7 +13,11 @@ CREATE TABLE agent_groups (
   name             TEXT NOT NULL,
   folder           TEXT NOT NULL UNIQUE,
   agent_provider   TEXT,
-  created_at       TEXT NOT NULL
+  created_at       TEXT NOT NULL,
+  tier             TEXT,   -- migration 026: orchestrator | account | specialist | worker | personal
+  reports_to       TEXT,   -- migration 026: agent_groups.id (validated in code, no FK)
+  role             TEXT,   -- migration 026: one-line role description
+  persona          TEXT    -- migration 026: JSON {emoji?, color?, initials?}
 );
 
 -- Platform groups/channels. unknown_sender_policy governs what happens

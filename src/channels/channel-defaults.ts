@@ -144,6 +144,7 @@ export interface EngageValues {
   engage_pattern?: unknown;
   threads?: unknown;
   session_mode?: unknown;
+  thread_filter?: unknown;
 }
 
 /**

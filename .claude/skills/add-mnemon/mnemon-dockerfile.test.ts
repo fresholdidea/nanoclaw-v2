@@ -33,4 +33,15 @@ describe('container/Dockerfile installs the mnemon binary', () => {
   it('sets MNEMON_DATA_DIR into the .claude mount', () => {
     expect(text).toMatch(/ENV\s+MNEMON_DATA_DIR=/);
   });
+
+  // The live store is WAL-mode SQLite and cannot be opened across the macOS
+  // Docker mount, so `mnemon` must be the shim and the binary mnemon-real.
+  it('installs the release binary as mnemon-real', () => {
+    expect(text).toContain('/usr/local/bin/mnemon-real');
+  });
+
+  it('installs the shim and queue writer', () => {
+    expect(text).toMatch(/COPY\s+mnemon-shim\.sh\s+\/usr\/local\/bin\/mnemon\b/);
+    expect(text).toMatch(/COPY\s+mnemon-queue\.mjs\s+\/usr\/local\/lib\/mnemon-queue\.mjs/);
+  });
 });

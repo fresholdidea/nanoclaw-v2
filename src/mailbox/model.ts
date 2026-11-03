@@ -129,6 +129,8 @@ export type DestinationRecord =
       type: 'channel';
       channelType: string;
       platformId: string;
+      /** Pinned thread/topic for every send; null = session thread / top level. */
+      threadId: string | null;
       agentGroupId: null;
     })
   | (DestinationRecordBase & {
@@ -474,12 +476,15 @@ export function parseDestinationRecord(value: unknown): DestinationRecord {
     'type',
     'channelType',
     'platformId',
+    'threadId',
     'agentGroupId',
   ]);
   const common = {
     name: text(record, 'name'),
     displayName: nullableText(record, 'displayName'),
   };
+  // Optional on the wire: pre-025 projections and older hosts omit it.
+  const threadId = record.threadId === undefined ? null : nullableText(record, 'threadId');
   const type = oneOf(record, 'type', ['channel', 'agent'] as const);
   const channelType = nullableText(record, 'channelType');
   const platformId = nullableText(record, 'platformId');
@@ -488,7 +493,7 @@ export function parseDestinationRecord(value: unknown): DestinationRecord {
   if (type === 'channel') {
     if (channelType === null || platformId === null || agentGroupId !== null)
       throw new Error('invalid DestinationRecord: channel routing fields');
-    return { ...common, type, channelType, platformId, agentGroupId: null };
+    return { ...common, type, channelType, platformId, threadId, agentGroupId: null };
   }
 
   if (channelType !== null || platformId !== null || agentGroupId === null)

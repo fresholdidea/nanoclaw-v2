@@ -2,6 +2,7 @@ import fs from 'fs';
 import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
+import { OutboundJournalPendingError } from '../index.js';
 import { sessionMailboxDir, sessionMailboxPath } from './paths.js';
 export { inboundDbPath, outboundDbPath, sessionMailboxDir, sessionMailboxPath } from './paths.js';
 import {
@@ -16,6 +17,7 @@ import {
   getMostRecentPeerSourceSessionId,
   getProcessingClaims,
   insertMessage,
+  isOutboundRollbackPending,
   markDelivered,
   markDeliveryFailed,
   markMessageFailed,
@@ -194,6 +196,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
             channel_type: record.channelType,
             platform_id: record.platformId,
             agent_group_id: record.agentGroupId,
+            thread_id: record.type === 'channel' ? record.threadId : null,
           };
         }),
       ),
@@ -310,7 +313,7 @@ export function wrapSqliteOutbound(
   nextSequence = () => nextEvenAcross(undefined, writable()),
 ): OutboundMailbox {
   const readable = () => (typeof source === 'function' ? source() : source);
-  return {
+  return surfacePendingJournal({
     getTerminalProcessingAcks: () =>
       (
         readable()
@@ -335,6 +338,8 @@ export function wrapSqliteOutbound(
         return { messageId: record.messageId, statusChanged: record.statusChanged };
       }),
     deleteOrphanProcessingClaims: () => deleteOrphanProcessingClaims(writable()),
+    // A writable connection's first read replays the hot journal.
+    recoverOutboundJournal: () => void writable().prepare('SELECT 1 FROM sqlite_master LIMIT 1').get(),
     getContainerState: () => {
       const row = getContainerState(readable());
       if (!row) return null;
@@ -424,7 +429,33 @@ export function wrapSqliteOutbound(
       readable()
         .prepare("SELECT 1 FROM messages_out WHERE channel_type = 'agent' AND platform_id != ? LIMIT 1")
         .get(selfAgentGroupId) !== undefined,
-  };
+  });
+}
+
+function rethrowPendingJournal(err: unknown): never {
+  if (isOutboundRollbackPending(err)) throw new OutboundJournalPendingError({ cause: err });
+  throw err;
+}
+
+/**
+ * The host's outbound connection is read-only, so a write journal it finds
+ * fails the read with SQLITE_READONLY_ROLLBACK. Surface that as the
+ * driver-neutral OutboundJournalPendingError from every operation, so callers
+ * inside a mailbox session (not only at its boundary) can tell it apart.
+ */
+function surfacePendingJournal(mailbox: OutboundMailbox): OutboundMailbox {
+  const wrapped: Record<string, unknown> = {};
+  for (const [name, op] of Object.entries(mailbox) as Array<[string, (...args: unknown[]) => unknown]>) {
+    wrapped[name] = (...args: unknown[]) => {
+      try {
+        const result = op(...args);
+        return result instanceof Promise ? result.catch(rethrowPendingJournal) : result;
+      } catch (err) {
+        return rethrowPendingJournal(err);
+      }
+    };
+  }
+  return wrapped as unknown as OutboundMailbox;
 }
 
 export class SqliteAgentMailbox implements AgentMailbox {

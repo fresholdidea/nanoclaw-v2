@@ -109,6 +109,18 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
     if (args.cli_scope !== undefined) {
       return DENY('Cannot change cli_scope from a group-scoped agent.');
     }
+
+    // Same treatment for the org-chart columns: an agent must not promote
+    // itself to orchestrator or re-parent itself. The generic list/get verbs
+    // only read (`groups list --tier x` is a filter); everything else on the
+    // resource is a write.
+    if (cmd.resource === 'groups' && cmd.generic !== 'list' && cmd.generic !== 'get') {
+      for (const key of ['tier', 'reports_to', 'reports-to'] as const) {
+        if (args[key] !== undefined) {
+          return DENY('Cannot change tier or reports_to from a group-scoped agent.');
+        }
+      }
+    }
   }
 
   if (cmd.access === 'approval') {

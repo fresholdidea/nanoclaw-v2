@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import {
   mcpServerPluginOwner,
   parseMcpServerConfig,
+  redactMcpServerSecrets,
   validateMcpServerName,
   type AdditionalMountConfig,
   type McpServerConfig,
@@ -11,12 +12,13 @@ import {
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
-import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
+import { createAgentGroup, getAgentGroupByFolder, normalizeAgentArchitectureUpdates } from '../../db/agent-groups.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
   getContainerConfig,
+  updateContainerConfig,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
@@ -33,10 +35,11 @@ import {
   type RestampResult,
 } from '../../templates/restamp.js';
 import { isValidTimezone } from '../../timezone.js';
-import type { AgentGroup, ContainerConfigRow } from '../../types.js';
+import { AGENT_TIERS, type AgentGroup, type ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 import { localizeIsoTimestamps } from '../format.js';
 import { projectDestinationsToSessions } from './destinations.js';
+import type { CallerContext } from '../frame.js';
 
 /**
  * Parse a --timezone flag: undefined = not passed, null = explicit clear
@@ -71,8 +74,18 @@ function assertDeclaredSpeedTier(speed: string, provider: string): void {
   }
 }
 
+/**
+ * MCP server env/header values are credentials. Host operators see them as
+ * stored; a container agent gets them redacted — its own group's secrets have
+ * no business in model context, and a `global`-scope agent can read every
+ * group's config.
+ */
+function mcpServersFor(ctx: CallerContext, servers: unknown): unknown {
+  return ctx.caller === 'host' ? servers : redactMcpServerSecrets(servers);
+}
+
 /** Deserialize JSON columns for display. */
-function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
+function presentConfig(row: ContainerConfigRow, ctx: CallerContext): Record<string, unknown> {
   return {
     agent_group_id: row.agent_group_id,
     provider: row.provider,
@@ -83,14 +96,25 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     assistant_name: row.assistant_name,
     max_messages_per_prompt: row.max_messages_per_prompt,
     skills: JSON.parse(row.skills),
-    mcp_servers: JSON.parse(row.mcp_servers),
+    mcp_servers: mcpServersFor(ctx, JSON.parse(row.mcp_servers)),
     packages_apt: JSON.parse(row.packages_apt),
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
+    provider_chain: row.provider_chain ? (JSON.parse(row.provider_chain) as string[]) : null,
     cli_scope: row.cli_scope,
     timezone: row.timezone,
     updated_at: row.updated_at,
   };
+}
+
+/** `--ro` / `--rw` are presence flags. The client parses a value-less flag as
+ *  boolean true, but accept an explicit true/false too so `--rw false` reads as
+ *  false rather than as the non-empty (truthy) string "false". */
+function mountAccessFlag(v: unknown, flag: string): boolean {
+  if (v === undefined) return false;
+  if (v === true || v === 'true' || v === '1') return true;
+  if (v === false || v === 'false' || v === '0') return false;
+  throw new Error(`--${flag} takes no value, or true/false — got "${v}"`);
 }
 
 registerResource({
@@ -118,12 +142,48 @@ registerResource({
       required: true,
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
+    {
+      name: 'tier',
+      type: 'string',
+      description:
+        `Architecture tier: ${AGENT_TIERS.join(' | ')}. Pass "" to clear. ` +
+        'A group-scoped container agent cannot change it.',
+      updatable: true,
+    },
+    {
+      name: 'reports_to',
+      type: 'string',
+      description:
+        'Agent group id this group reports to (must exist; no self-reference or cycle). Pass "" to clear. ' +
+        'A group-scoped container agent cannot change it.',
+      updatable: true,
+    },
+    {
+      name: 'role',
+      type: 'string',
+      description: 'One-line role description (max 200 chars). Pass "" to clear.',
+      updatable: true,
+    },
+    {
+      name: 'persona',
+      type: 'string',
+      description:
+        'JSON object with optional string keys emoji, color, initials — e.g. \'{"emoji":"🦉","color":"#1e90ff","initials":"ZD"}\'. ' +
+        'Stored canonically; pass "" to clear.',
+      updatable: true,
+    },
   ],
   // `create` and `delete` are custom (below): create needs a `--template`
   // branch, and the generic create inserts a bare agent_groups row but never
   // the container_config a working group needs; the generic single-table
   // DELETE violates FK constraints (#2525).
   operations: { list: 'open', get: 'open', update: 'approval' },
+  // Architecture columns: `""` clears, tier is an enum, reports_to must name
+  // an existing group, persona is validated JSON. One validator shared with
+  // `updateAgentGroup` so the DB layer and the CLI agree.
+  preUpdate: async (updates, current) => {
+    await normalizeAgentArchitectureUpdates(String(current.id), updates);
+  },
   customOperations: {
     connect: {
       access: 'open',
@@ -414,13 +474,15 @@ registerResource({
     },
     'config get': {
       access: 'open',
-      description: 'Show the container config for a group. Use --id <group-id>.',
-      handler: async (args) => {
+      description:
+        'Show the container config for a group. Use --id <group-id>. ' +
+        'From inside a container, MCP server env and header values show as "<redacted>" (placeholders stay readable).',
+      handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
-        return presentConfig(row);
+        return presentConfig(row, ctx);
       },
     },
     'config update': {
@@ -429,12 +491,20 @@ registerResource({
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
-        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
-      handler: async (args) => {
+        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
+        '--provider-chain <p1,p2,...>, --no-fallback.',
+      handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const hasProviderChain = args['provider-chain'] !== undefined || args.provider_chain !== undefined;
+        const hasNoFallback = args['no-fallback'] !== undefined || args.no_fallback !== undefined;
+
+        if (hasProviderChain && hasNoFallback) {
+          throw new Error('--provider-chain and --no-fallback are mutually exclusive — use one or the other');
+        }
 
         const updates: Partial<
           Pick<
@@ -475,16 +545,28 @@ registerResource({
           updates.cli_scope = scope;
         }
 
-        if (Object.keys(updates).length === 0) {
+        if (Object.keys(updates).length === 0 && !hasProviderChain && !hasNoFallback) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone, --provider-chain, --no-fallback',
           );
         }
 
-        await updateContainerConfigScalars(id, updates);
+        if (Object.keys(updates).length > 0) await updateContainerConfigScalars(id, updates);
+
+        if (hasProviderChain) {
+          const raw = (args['provider-chain'] ?? args.provider_chain) as string;
+          const chain = raw
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+          await updateContainerConfig(id, { providerChain: chain });
+        } else if (hasNoFallback) {
+          const primary = (updates.provider ?? row.provider ?? 'claude') as string;
+          await updateContainerConfig(id, { providerChain: [primary] });
+        }
 
         const updated = (await getContainerConfig(id))!;
-        return presentConfig(updated);
+        return presentConfig(updated, ctx);
       },
     },
     'config add-mcp-server': {
@@ -493,7 +575,7 @@ registerResource({
         'Add an MCP server to a group. Requires `ncl groups restart` to take effect. ' +
         'Use --id <group-id> --name <server-name> with either --command <cmd> [--args <json-array>] [--env <json-object>] ' +
         'or --url <url> [--headers <json-object>] (HTTPS, or plain HTTP for localhost / host.docker.internal).',
-      handler: async (args) => {
+      handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const name = args.name as string;
@@ -520,7 +602,7 @@ registerResource({
         });
         await updateContainerConfigJson(id, 'mcp_servers', servers);
 
-        return { added: name, servers };
+        return { added: name, servers: mcpServersFor(ctx, servers) };
       },
     },
     'config remove-mcp-server': {
@@ -623,9 +705,20 @@ registerResource({
       access: 'approval',
       hostOnly: true,
       description:
-        "Mount a host directory into a group's containers. OPERATOR-ONLY — never runnable from " +
-        'inside a container (mounting host paths is a filesystem-access boundary). Requires ' +
-        '`ncl groups restart` to take effect. Use --id <group-id> --host <host-path> --container <container-path> [--ro].',
+        "Mount a host directory into a group's containers — read-only unless --rw.\n" +
+        'OPERATOR-ONLY — never runnable from inside a container (mounting host paths is a ' +
+        'filesystem-access boundary). Requires `ncl groups restart` to take effect.\n' +
+        'Use --id <group-id> --host <host-path> --container <container-path> [--ro | --rw].\n' +
+        '--rw only expresses intent: the mount allowlist (~/.config/nanoclaw/mount-allowlist.json) ' +
+        'still decides. A --rw mount under a root that does not set allowReadWrite is downgraded ' +
+        'to read-only at spawn time.\n' +
+        'To make one subdirectory of a read-only mount writable, add it as its own --rw mount at the ' +
+        'nested container path. The first allowlist root containing a path decides, so when the ' +
+        "parent's root refuses read-write, list a read-write root for the subdirectory before it.",
+      examples: [
+        'ncl groups config add-mount --id ag-123 --host ~/Documents/notes --container notes',
+        'ncl groups config add-mount --id ag-123 --host ~/Documents/notes/inbox --container notes/inbox --rw',
+      ],
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -633,14 +726,19 @@ registerResource({
         const containerPath = (args.container ?? args['container-path']) as string | undefined;
         if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
 
+        const ro = mountAccessFlag(args.ro ?? args.readonly, 'ro');
+        const rw = mountAccessFlag(args.rw, 'rw');
+        if (ro && rw) throw new Error('--ro and --rw are mutually exclusive');
+
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
-        const mount: AdditionalMountConfig = {
-          hostPath,
-          containerPath,
-          ...(args.ro || args.readonly ? { readonly: true } : {}),
-        };
+        const mount: AdditionalMountConfig = { hostPath, containerPath };
+        // The validator grants read-write only on an explicit `readonly: false`
+        // (src/modules/mount-security/index.ts) — an omitted key is forced
+        // read-only. So --rw has to write the key, not merely leave it out.
+        if (rw) mount.readonly = false;
+        else if (ro) mount.readonly = true;
         const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
         if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
           existing.push(mount);

@@ -235,3 +235,45 @@ describe('wirings-update — same validation as create', () => {
     await expect(update({ id: 'mga-legacy', engage_pattern: '' })).rejects.toThrow(/--engage-pattern/);
   });
 });
+
+describe('wirings — thread_filter (topic-scoped wirings)', () => {
+  it('expands a bare topic number against the messaging group platform id', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', thread_filter: '4' });
+    expect(row.thread_filter).toBe('pid-mg-group:4');
+    expect((await getMessagingGroupAgent(String(row.id)))?.thread_filter).toBe('pid-mg-group:4');
+  });
+
+  it('accepts a full thread id of the same chat and rejects one from another chat', async () => {
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      thread_filter: 'pid-mg-group:12',
+    });
+    expect(row.thread_filter).toBe('pid-mg-group:12');
+    await expect(update({ id: row.id, thread_filter: 'pid-other:12' })).rejects.toThrow(
+      /thread of this messaging group/,
+    );
+  });
+
+  it('rejects a filter on a wiring whose thread policy resolves off', async () => {
+    // DM context on declchan declares threads: false.
+    await expect(create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1', thread_filter: '4' })).rejects.toThrow(
+      /--thread-filter/,
+    );
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', thread_filter: '4' });
+    await expect(update({ id: row.id, threads: 'false' })).rejects.toThrow(/--thread-filter/);
+  });
+
+  it('accepts a comma-separated list, expanded and deduplicated', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1', thread_filter: '8, 20,8' });
+    expect(row.thread_filter).toBe('pid-mg-group:8,pid-mg-group:20');
+  });
+
+  it('omitted stores NULL and an empty string clears it', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    expect(row.thread_filter).toBeUndefined();
+    await update({ id: row.id, thread_filter: '4' });
+    const cleared = (await update({ id: row.id, thread_filter: '' })) as { thread_filter: string | null };
+    expect(cleared.thread_filter).toBeNull();
+  });
+});

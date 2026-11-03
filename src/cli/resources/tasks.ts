@@ -237,6 +237,21 @@ async function listTasks(args: Record<string, unknown>, ctx: CallerContext) {
   return rows;
 }
 
+/** Read-only series projection shared by the CLI and the dashboard collector. */
+export async function collectTaskSeries(deadline = Infinity) {
+  const rows = [];
+  for (const session of (await getActiveSessions()).filter((s) => isTaskThread(s.thread_id))) {
+    if (performance.now() > deadline) throw new Error('Task collection budget exhausted');
+    const found = await withInbound(session, (db) =>
+      selectLiveTasks(db).map((row) => enrichListRow(db, toOutput(session, row))),
+    );
+    // A session row whose mailbox was never created holds no tasks; skip it the
+    // way tasks-list does rather than failing the whole collection over it.
+    if (found) rows.push(...found);
+  }
+  return rows;
+}
+
 async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of await selectedSessions(args, ctx)) {

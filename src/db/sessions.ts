@@ -66,7 +66,27 @@ export async function findSessionByAgentGroup(agentGroupId: string): Promise<Ses
        WHERE agent_group_id = ?
          AND status = 'active'
          AND NOT (messaging_group_id IS NULL AND thread_id IS NOT NULL AND thread_id LIKE 'system:%')
-       ORDER BY created_at DESC
+       ORDER BY COALESCE(last_active, created_at) DESC
+       LIMIT 1`,
+    agentGroupId,
+  );
+}
+
+/**
+ * The group's primary channel-facing session: the most recently active
+ * `(messaging group, no thread)` session. Fresh agent-to-agent sends target
+ * this so a2a shares context with the conversation humans actually see,
+ * instead of pooling in the hidden `(null, null)` fallback session — the
+ * split-brain behind the 2026-08-20 provenance incidents.
+ */
+export async function findPrimaryChannelSession(agentGroupId: string): Promise<Session | undefined> {
+  return getDb().get<Session>(
+    `SELECT * FROM sessions
+       WHERE agent_group_id = ?
+         AND status = 'active'
+         AND messaging_group_id IS NOT NULL
+         AND thread_id IS NULL
+       ORDER BY COALESCE(last_active, created_at) DESC
        LIMIT 1`,
     agentGroupId,
   );

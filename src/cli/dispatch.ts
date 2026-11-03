@@ -21,6 +21,7 @@ import { getSession } from '../db/sessions.js';
 import { guard, type GuardActor } from '../guard/index.js';
 import { registerApprovalHandler, requestApproval } from '../modules/approvals/index.js';
 import type { PendingApproval } from '../types.js';
+import { renderCardArgs } from './approval-card.js';
 import type { CallerContext, ErrorCode, RequestFrame, ResponseFrame } from './frame.js';
 import { normalizeArgs } from './args.js';
 import { localizeIsoTimestamps } from './format.js';
@@ -161,12 +162,8 @@ export async function dispatch(
     const agentGroup = await getAgentGroup(ctx.agentGroupId);
     const agentName = agentGroup?.name ?? ctx.agentGroupId;
 
-    // Arguments are agent-controlled: JSON-encode each flag and value inside a
-    // code fence so no value can add lines, pass as another flag, or close the
-    // fence and reach the card's markup.
-    const argSummary = Object.entries(req.args)
-      .map(([k, v]) => `--${/^[\w-]+$/.test(k) ? k : JSON.stringify(k)} ${JSON.stringify(v)}`)
-      .join(' ');
+    // Arguments are agent-controlled: render each as JSON inside the code fence, with secrets redacted.
+    const argSummary = renderCardArgs(req.args);
     const commandLine = escapeInvisibles(`ncl ${req.command}${argSummary ? ' ' + argSummary : ''}`);
     const title = `CLI: ${req.command}`;
     const question = `Agent ${quoteForCard(agentName)} wants to run:\n` + '```\n' + commandLine + '\n```';

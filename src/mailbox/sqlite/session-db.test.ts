@@ -5,11 +5,21 @@
  * insertRecurrence) live beside the SQLite task implementation.
  */
 import Database from 'better-sqlite3';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { ensureSchema, getInboundSourceSessionId, migrateMessagesInTable, syncProcessingAcks } from './session-db.js';
+import {
+  ensureSchema,
+  getInboundSourceSessionId,
+  isOutboundRollbackPending,
+  migrateMessagesInTable,
+  openOutboundDb,
+  openOutboundDbRw,
+  syncProcessingAcks,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -152,5 +162,143 @@ describe('syncProcessingAcks — script-skip counter', () => {
     syncProcessingAcks(inDb, outDb);
 
     expect(status(inDb, 't1')).toBe('completed');
+  });
+});
+
+describe('openOutboundDb read-only enforcement', () => {
+  // The host must never replay a journal itself: across the bind mount it
+  // cannot see the runner's locks, so a live runner's mid-commit journal looks
+  // exactly like a crash leftover and replaying it corrupts the file. Only the
+  // explicit recovery path (writable, runner confirmed gone) may replay.
+  it('refuses a hot DELETE journal on the read path; only the writable recovery replays it', async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const outDbPath = path.join(TEST_DIR, 'outbound.db');
+    ensureSchema(outDbPath, 'outbound');
+
+    const seedDb = new Database(outDbPath);
+    const seed = seedDb.prepare('INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES (?, ?, ?, ?, ?)');
+    seedDb.transaction(() => {
+      for (let i = 0; i < 64; i++) {
+        seed.run(
+          `baseline-${i}`,
+          i * 2 + 1,
+          new Date().toISOString(),
+          'chat',
+          JSON.stringify({ text: `committed-${i}`, padding: 'x'.repeat(8192) }),
+        );
+      }
+    })();
+    seedDb.close();
+
+    const childScript = String.raw`
+      const Database = require('better-sqlite3');
+      const db = new Database(process.argv[1]);
+      db.pragma('journal_mode = DELETE');
+      db.pragma('synchronous = FULL');
+      db.pragma('cache_size = 4');
+      db.exec('BEGIN IMMEDIATE');
+      db.prepare('UPDATE messages_out SET content = ?')
+        .run(JSON.stringify({ text: 'uncommitted', padding: 'y'.repeat(8192) }));
+      process.stdout.write('ready\n');
+      setInterval(() => {}, 1000);
+    `;
+    const child = spawn(process.execPath, ['--input-type=commonjs', '-e', childScript, outDbPath], {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`child did not create hot journal: ${stderr}`)), 5000);
+        child.once('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        child.stdout.once('data', (chunk) => {
+          clearTimeout(timer);
+          if (!String(chunk).includes('ready')) {
+            reject(new Error(`unexpected child output: ${String(chunk)} ${stderr}`));
+            return;
+          }
+          resolve();
+        });
+      });
+
+      expect(fs.existsSync(`${outDbPath}-journal`)).toBe(true);
+      const exitPromise = once(child, 'exit');
+      child.kill('SIGKILL');
+      await exitPromise;
+
+      const refused = openOutboundDb(outDbPath);
+      try {
+        let caught: unknown;
+        try {
+          refused.prepare("SELECT content FROM messages_out WHERE id = 'baseline-0'").get();
+        } catch (err) {
+          caught = err;
+        }
+        expect(isOutboundRollbackPending(caught)).toBe(true);
+      } finally {
+        refused.close();
+      }
+      expect(fs.existsSync(`${outDbPath}-journal`)).toBe(true);
+
+      const recovery = openOutboundDbRw(outDbPath);
+      recovery.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
+      recovery.close();
+      expect(fs.existsSync(`${outDbPath}-journal`)).toBe(false);
+
+      const hostOutDb = openOutboundDb(outDbPath);
+      try {
+        expect(hostOutDb.readonly).toBe(true);
+        const row = hostOutDb.prepare("SELECT content FROM messages_out WHERE id = 'baseline-0'").get() as {
+          content: string;
+        };
+        expect(JSON.parse(row.content)).toEqual({ text: 'committed-0', padding: 'x'.repeat(8192) });
+
+        for (const sql of [
+          "INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('new', 3, 'now', 'chat', '{}')",
+          "UPDATE messages_out SET content = '{}' WHERE id = 'baseline-0'",
+          "DELETE FROM messages_out WHERE id = 'baseline-0'",
+        ]) {
+          expect(() => hostOutDb.prepare(sql).run()).toThrow(/attempt to write a readonly database/);
+        }
+      } finally {
+        hostOutDb.close();
+      }
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exitPromise = once(child, 'exit');
+        child.kill('SIGKILL');
+        await exitPromise;
+      }
+    }
+  }, 10_000);
+
+  it('allows SELECT queries but rejects mutations with attempt to write a readonly database', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const outDbPath = path.join(TEST_DIR, 'outbound.db');
+    ensureSchema(outDbPath, 'outbound');
+
+    const hostOutDb = openOutboundDb(outDbPath);
+
+    // SELECT succeeds
+    const rows = hostOutDb.prepare('SELECT * FROM messages_out').all();
+    expect(rows).toEqual([]);
+
+    // INSERT fails under PRAGMA query_only = ON
+    expect(() => {
+      hostOutDb
+        .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('m1', 1, 'now', 'chat', '{}')")
+        .run();
+    }).toThrow(/attempt to write a readonly database/);
+
+    hostOutDb.close();
   });
 });

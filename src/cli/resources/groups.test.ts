@@ -13,6 +13,7 @@
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('../../container-runner.js', () => ({
@@ -26,10 +27,19 @@ vi.mock('../../container-runner.js', () => ({
 vi.mock('../../container-restart.js', () => ({
   restartAgentGroupContainers: vi.fn().mockResolvedValue(0),
 }));
+// The allowlist path is a module-level const in production; route it through a
+// getter so the mount tests can point it at a per-test temp file.
+const mockState = vi.hoisted(() => ({ allowlistPath: '' }));
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-groups' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-cli-groups',
+    get MOUNT_ALLOWLIST_PATH() {
+      return mockState.allowlistPath;
+    },
+  };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-groups';
@@ -42,6 +52,7 @@ import { dispatch } from '../dispatch.js';
 import { projectDestinationsToSessions } from './destinations.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
+import { validateMount } from '../../modules/mount-security/index.js';
 import { configFromDb } from '../../container-config.js';
 import type { ContainerConfig } from '../../container-config.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
@@ -417,12 +428,15 @@ describe('groups config (host-only)', () => {
     const GID = 'ag-mount';
     await createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
     await ensureContainerConfig(GID);
-    const args = { id: GID, host: '/data/.gmail-mcp', container: '/home/node/.gmail-mcp', ro: true };
+    // containerPath is relative: the validator rejects absolute paths and
+    // mounts every entry under /workspace/extra/, so an absolute fixture here
+    // would model a mount that can never take effect.
+    const args = { id: GID, host: '/data/.gmail-mcp', container: '.gmail-mcp', ro: true };
 
     const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
     expect(add.ok).toBe(true);
     expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual([
-      { hostPath: '/data/.gmail-mcp', containerPath: '/home/node/.gmail-mcp', readonly: true },
+      { hostPath: '/data/.gmail-mcp', containerPath: '.gmail-mcp', readonly: true },
     ]);
 
     // idempotent: a second add does not duplicate
@@ -433,7 +447,7 @@ describe('groups config (host-only)', () => {
       {
         id: 'r3',
         command: 'groups-config-remove-mount',
-        args: { id: GID, host: '/data/.gmail-mcp', container: '/home/node/.gmail-mcp' },
+        args: { id: GID, host: '/data/.gmail-mcp', container: '.gmail-mcp' },
       },
       { caller: 'host' },
     );
@@ -537,5 +551,312 @@ describe('groups config (host-only)', () => {
       expect((await getContainerConfig(GID))!.provider).toBe(TURBO_PROVIDER);
       expect(await speedOf()).toBe('turbo');
     });
+  });
+});
+
+/**
+ * Regression: `add-mount` could not express read-write intent.
+ *
+ * The validator grants read-write only on an explicit `readonly: false`
+ * (mount-security/index.ts) — an omitted key is forced read-only. The handler
+ * only ever emitted `readonly: true` (with --ro) or omitted the key, so every
+ * mount created through the CLI came out read-only and RW mounts had to be
+ * hand-written into `container_configs`. Live symptom: a group with ~/.mnemon
+ * mounted could read the store but every write failed with "Read-only file
+ * system".
+ *
+ * These tests run the CLI intent all the way through the validator, because
+ * the JSON shape alone is not the contract that broke.
+ */
+describe('groups config add-mount readonly intent (--ro / --rw)', () => {
+  const GID = 'ag-mount-rw';
+  let hostRoot: string;
+  let seq = 0;
+
+  /** Point the validator at a fresh allowlist granting (or refusing) RW under `hostRoot`. */
+  function writeAllowlist(allowReadWrite: boolean): void {
+    // A new file per call: the loader caches on path + mtime, and mtime alone
+    // is too coarse to distinguish rewrites within a test run.
+    const file = path.join(TEST_DIR, `mount-allowlist-${seq++}.json`);
+    fs.writeFileSync(file, JSON.stringify({ allowedRoots: [{ path: hostRoot, allowReadWrite }], blockedPatterns: [] }));
+    mockState.allowlistPath = file;
+  }
+
+  async function addMount(dir: string, extra: Record<string, unknown>): Promise<{ ok: boolean }> {
+    fs.mkdirSync(path.join(hostRoot, dir), { recursive: true });
+    return dispatch(
+      {
+        id: `r-${dir}`,
+        command: 'groups-config-add-mount',
+        args: { id: GID, host: path.join(hostRoot, dir), container: dir, ...extra },
+      },
+      { caller: 'host' },
+    );
+  }
+
+  /** The mount as stored, looked up by its container path. */
+  async function stored(dir: string): Promise<{ hostPath: string; containerPath: string; readonly?: boolean }> {
+    const mounts = JSON.parse((await getContainerConfig(GID))!.additional_mounts) as Array<{
+      hostPath: string;
+      containerPath: string;
+      readonly?: boolean;
+    }>;
+    const found = mounts.find((m) => m.containerPath === dir);
+    if (!found) throw new Error(`no mount stored for ${dir}`);
+    return found;
+  }
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    hostRoot = path.join(TEST_DIR, 'hostroot');
+    fs.mkdirSync(hostRoot, { recursive: true });
+
+    await runMigrations(await initTestDb());
+    await createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('writes readonly: false for --rw and read-write survives to the validator', async () => {
+    writeAllowlist(true);
+    expect((await addMount('rw', { rw: true })).ok).toBe(true);
+
+    const mount = await stored('rw');
+    expect(mount.readonly).toBe(false);
+    const result = validateMount(mount);
+    expect(result.allowed).toBe(true);
+    expect(result.effectiveReadonly).toBe(false);
+  });
+
+  it('writes readonly: true for --ro', async () => {
+    writeAllowlist(true);
+    expect((await addMount('ro', { ro: true })).ok).toBe(true);
+
+    const mount = await stored('ro');
+    expect(mount.readonly).toBe(true);
+    expect(validateMount(mount).effectiveReadonly).toBe(true);
+  });
+
+  it('omits the key with no flag, which the validator forces to read-only', async () => {
+    // Same allowlist as the --rw case: only the CLI intent differs.
+    writeAllowlist(true);
+    expect((await addMount('plain', {})).ok).toBe(true);
+
+    const mount = await stored('plain');
+    expect(mount).not.toHaveProperty('readonly');
+    expect(validateMount(mount).effectiveReadonly).toBe(true);
+  });
+
+  it('downgrades --rw to read-only when the allowlist root refuses read-write', async () => {
+    writeAllowlist(false);
+    expect((await addMount('denied', { rw: true })).ok).toBe(true);
+
+    // The CLI records the intent; the allowlist is what actually decides.
+    const mount = await stored('denied');
+    expect(mount.readonly).toBe(false);
+    const result = validateMount(mount);
+    expect(result.allowed).toBe(true);
+    expect(result.effectiveReadonly).toBe(true);
+  });
+
+  it('rejects --ro and --rw together instead of silently picking one', async () => {
+    writeAllowlist(true);
+    const resp = await addMount('both', { ro: true, rw: true });
+
+    expect(resp.ok).toBe(false);
+    const err = (resp as { ok: false; error: { code: string; message: string } }).error;
+    expect(err.code).toBe('handler-error');
+    expect(err.message).toMatch(/mutually exclusive/i);
+    expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual([]);
+  });
+
+  it('reads --rw false as false rather than as a truthy string', async () => {
+    writeAllowlist(true);
+    expect((await addMount('explicit-false', { rw: 'false' })).ok).toBe(true);
+
+    expect(await stored('explicit-false')).not.toHaveProperty('readonly');
+  });
+});
+
+describe('groups config update --provider-chain / --no-fallback', () => {
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await runMigrations(await initTestDb());
+  });
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('sets provider_chain via --provider-chain (comma-separated)', async () => {
+    const GID = 'ag-chain';
+    await createAgentGroup({ id: GID, name: 'chain', folder: 'chain', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      {
+        id: 'r-chain-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'provider-chain': 'claude,codex,opencode' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    const stored = (await getContainerConfig(GID))!.provider_chain;
+    expect(JSON.parse(stored!)).toEqual(['claude', 'codex', 'opencode']);
+  });
+
+  it('collapses chain to [primary] via --no-fallback', async () => {
+    const GID = 'ag-nofallback';
+    await createAgentGroup({ id: GID, name: 'nofb', folder: 'nofb', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID, 'codex');
+
+    const resp = await dispatch(
+      {
+        id: 'r-nofb-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'no-fallback': true },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    const stored = (await getContainerConfig(GID))!.provider_chain;
+    expect(JSON.parse(stored!)).toEqual(['codex']);
+  });
+
+  it('does NOT throw "Nothing to update" when only --provider-chain is given', async () => {
+    const GID = 'ag-chain-only';
+    await createAgentGroup({ id: GID, name: 'co', folder: 'co', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      {
+        id: 'r-co-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'provider-chain': 'claude,codex' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+  });
+
+  it('throws when --no-fallback and --provider-chain are both given', async () => {
+    const GID = 'ag-conflict';
+    await createAgentGroup({ id: GID, name: 'cf', folder: 'cf', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
+
+    const resp = await dispatch(
+      {
+        id: 'r-cf-1',
+        command: 'groups-config-update',
+        args: { id: GID, 'provider-chain': 'claude,codex', 'no-fallback': true },
+      },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(false);
+    expect((resp as { ok: false; error: { code: string; message: string } }).error.message).toMatch(
+      /mutually exclusive/i,
+    );
+  });
+});
+
+describe('groups update — architecture columns (tier / reports_to / role / persona)', () => {
+  const ZED = 'ag-zed';
+  const BUILDER = 'ag-builder';
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await runMigrations(await initTestDb());
+    await createAgentGroup({ id: ZED, name: 'Zed', folder: 'zed', agent_provider: null, created_at: now() });
+    await createAgentGroup({
+      id: BUILDER,
+      name: 'Builder',
+      folder: 'builder',
+      agent_provider: null,
+      created_at: now(),
+    });
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  const update = (id: string, args: Record<string, unknown>) =>
+    dispatch({ id: 'req', command: 'groups-update', args: { id, ...args } }, { caller: 'host' });
+
+  it('sets every column, canonicalizes persona, and surfaces them on get/list', async () => {
+    const resp = await update(BUILDER, {
+      tier: 'worker',
+      'reports-to': ZED,
+      role: '  Executes build tasks for Zed  ',
+      persona: '{"initials":"BD","emoji":"🔧","color":" #1e90ff "}',
+    });
+    expect(errorMessage(resp)).toBeUndefined();
+
+    const got = await dispatch({ id: 'g', command: 'groups-get', args: { id: BUILDER } }, { caller: 'host' });
+    expect(got.ok && got.data).toMatchObject({
+      id: BUILDER,
+      tier: 'worker',
+      reports_to: ZED,
+      role: 'Executes build tasks for Zed',
+      persona: JSON.stringify({ initials: 'BD', emoji: '🔧', color: '#1e90ff' }),
+    });
+
+    const listed = await dispatch({ id: 'l', command: 'groups-list', args: { tier: 'worker' } }, { caller: 'host' });
+    expect(listed.ok && (listed.data as Array<{ id: string }>).map((g) => g.id)).toEqual([BUILDER]);
+  });
+
+  it('clears each column with ""', async () => {
+    expect(
+      errorMessage(await update(BUILDER, { tier: 'worker', 'reports-to': ZED, role: 'x', persona: '{}' })),
+    ).toBeUndefined();
+    const resp = await update(BUILDER, { tier: '', 'reports-to': '', role: '', persona: '' });
+    expect(errorMessage(resp)).toBeUndefined();
+    expect(resp.ok && resp.data).toMatchObject({ tier: null, reports_to: null, role: null, persona: null });
+  });
+
+  it('rejects an unknown tier', async () => {
+    expect(errorMessage(await update(BUILDER, { tier: 'boss' }))).toMatch(/tier must be one of: orchestrator/);
+  });
+
+  it('rejects reports_to that does not exist, points at itself, or forms a cycle', async () => {
+    expect(errorMessage(await update(BUILDER, { 'reports-to': 'ag-nope' }))).toMatch(/agent group not found: ag-nope/);
+    expect(errorMessage(await update(BUILDER, { 'reports-to': BUILDER }))).toMatch(/cannot point at the group itself/);
+
+    expect(errorMessage(await update(BUILDER, { 'reports-to': ZED }))).toBeUndefined();
+    expect(errorMessage(await update(ZED, { 'reports-to': BUILDER }))).toMatch(/would form a cycle/);
+  });
+
+  it('rejects a multi-line role and malformed persona payloads', async () => {
+    expect(errorMessage(await update(BUILDER, { role: 'line one\nline two' }))).toMatch(/single line/);
+    expect(errorMessage(await update(BUILDER, { persona: 'not json' }))).toMatch(/JSON object/);
+    expect(errorMessage(await update(BUILDER, { persona: '["x"]' }))).toMatch(/JSON object/);
+    expect(errorMessage(await update(BUILDER, { persona: '{"avatar":"x"}' }))).toMatch(/unknown key "avatar"/);
+    expect(errorMessage(await update(BUILDER, { persona: '{"emoji":7}' }))).toMatch(/persona\.emoji must be a string/);
+  });
+
+  it('a group-scoped container agent cannot change tier or reports_to', async () => {
+    await ensureContainerConfig(BUILDER);
+    const resp = await dispatch(
+      { id: 'a', command: 'groups-update', args: { tier: 'orchestrator' } },
+      { caller: 'agent', sessionId: 'sess-b', agentGroupId: BUILDER, messagingGroupId: 'mg-b' },
+    );
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+      expect(resp.error.message).toMatch(/tier or reports_to/);
+    }
   });
 });

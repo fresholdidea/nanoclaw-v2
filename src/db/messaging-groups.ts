@@ -259,6 +259,9 @@ export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promi
   if (mga.threads !== undefined && mga.threads !== null) {
     await getDb().run('UPDATE messaging_group_agents SET threads = ? WHERE id = ?', mga.threads, mga.id);
   }
+  if (mga.thread_filter !== undefined && mga.thread_filter !== null) {
+    await getDb().run('UPDATE messaging_group_agents SET thread_filter = ? WHERE id = ?', mga.thread_filter, mga.id);
+  }
 
   await ensureAgentDestinationForWiring(mga);
 }
@@ -358,6 +361,7 @@ export async function updateMessagingGroupAgent(
       | 'session_mode'
       | 'priority'
       | 'threads'
+      | 'thread_filter'
     >
   >,
 ): Promise<void> {

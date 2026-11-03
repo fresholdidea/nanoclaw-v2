@@ -1,27 +1,37 @@
 /**
- * Structural guard for the mnemon entrypoint reach-in.
+ * Structural guard: container/entrypoint.sh must NOT run `mnemon setup`.
  *
- * container/entrypoint.sh runs on every container start; the inserted
- * `mnemon setup --target claude-code` line is what registers the Claude Code
- * memory hooks. The entrypoint is a shell script, not an invocable function, so
- * the guard is structural: assert the setup invocation is present. Drop it on an
- * upgrade and the hooks silently never register — this test goes red.
+ * On this install MNEMON_DATA_DIR is /workspace/extra/mnemon, the mount of the
+ * shared host store ~/.mnemon. `mnemon setup` writes prompt/{guide,skill}.md
+ * and data/default/mnemon.db under MNEMON_DATA_DIR, i.e. into the store that
+ * host hooks read by path, and installs Claude Code hooks that duplicate the
+ * curated container skill (container/skills/mnemon/SKILL.md). Live spawns
+ * bypass the entrypoint (`bash -c 'exec bun …'` in src/container-runner.ts),
+ * so the line only ever ran on a bare `docker run` of the image.
+ *
+ * The stock /add-mnemon skill adds this line in Phase 2 step 2; this install
+ * skips that step. Re-add it and this test goes red. Comment lines are ignored
+ * so the entrypoint may still explain the absence.
  */
 import fs from 'fs';
 import path from 'path';
 
 import { describe, it, expect } from 'vitest';
 
-function entrypoint(): string {
+function entrypointCommands(): string {
   // From src/ up to repo root, then into container/.
   const p = path.resolve(__dirname, '..', 'container', 'entrypoint.sh');
-  return fs.readFileSync(p, 'utf8');
+  return fs
+    .readFileSync(p, 'utf8')
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('#'))
+    .join('\n');
 }
 
-describe('container/entrypoint.sh runs mnemon setup on start', () => {
-  const text = entrypoint();
+describe('container/entrypoint.sh does not run mnemon setup', () => {
+  const text = entrypointCommands();
 
-  it('invokes mnemon setup targeting claude-code', () => {
-    expect(text).toMatch(/mnemon\s+setup\s+--target\s+claude-code/);
+  it('never invokes mnemon setup, through the shim or the real binary', () => {
+    expect(text).not.toMatch(/mnemon(?:-real)?\s+setup/);
   });
 });

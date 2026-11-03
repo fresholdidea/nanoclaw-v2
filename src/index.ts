@@ -4,8 +4,10 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
+import path from 'path';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
-import { CENTRAL_DB_PATH } from './config.js';
+import { CENTRAL_DB_PATH, PROJECT_ROOT } from './config.js';
+import { rotateHostLogs } from './log-rotate.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import {
   abortGatewaySessionObservers,
@@ -19,6 +21,7 @@ import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { migrateLegacyTaskSeries } from './modules/scheduling/migrate-legacy.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { startGatewayApprovalCoordinator, stopGatewayApprovalCoordinator } from './gateway-approval-coordinator.js';
 import { startGatewayAvailabilityMonitor } from './gateway-availability.js';
@@ -71,6 +74,8 @@ import {
 let stopGatewayAvailabilityMonitor: (() => void) | undefined;
 
 async function main(): Promise<void> {
+  // Bound the launchd-captured logs before anything else writes to them.
+  for (const copy of rotateHostLogs(path.join(PROJECT_ROOT, 'logs'))) log.info('Rotated host log', { copy });
   log.info('NanoClaw starting');
 
   // 0. Circuit breaker — backoff on rapid restarts
@@ -100,6 +105,12 @@ async function main(): Promise<void> {
   const inboundReady = new Promise<void>((resolve) => {
     releaseInbound = resolve;
   });
+
+  // 2b. Move legacy task series (living in chat/system sessions, where
+  // group-scoped `ncl tasks` can't see them) into per-series task sessions.
+  // Idempotent. Ordering is load-bearing: before adapters, delivery polls,
+  // and the sweep (nothing else touches session DBs during the move).
+  await migrateLegacyTaskSeries();
 
   // 2. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
@@ -198,6 +209,24 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
+  // 8a. Dashboard (optional). startDashboard() reads DASHBOARD_SECRET/PORT itself
+  // and no-ops when the secret is unset.
+  try {
+    const { startDashboard } = await import('./dashboard-pusher.js');
+    await startDashboard();
+  } catch (err) {
+    log.error('Failed to start dashboard', { err });
+  }
+
+  // 8b. mnemon sync — snapshot refresh + container write-queue replay.
+  // No-ops (with a log line) when no ~/.mnemon store exists.
+  try {
+    const { startMnemonSync } = await import('./mnemon-sync.js');
+    startMnemonSync();
+  } catch (err) {
+    log.error('Failed to start mnemon sync', { err });
+  }
+
   // 9. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
@@ -207,6 +236,20 @@ async function main(): Promise<void> {
 /** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
+  // Dashboard and mnemon sync start after startHostModules(), so they stop
+  // first — same LIFO rule stopHostModules() applies to its own registrants.
+  try {
+    const { stopDashboardPusher } = await import('./dashboard-pusher.js');
+    stopDashboardPusher();
+  } catch {
+    /* ignore if not started or not installed */
+  }
+  try {
+    const { stopMnemonSync } = await import('./mnemon-sync.js');
+    stopMnemonSync();
+  } catch {
+    /* ignore if not started */
+  }
   hostAbortController.abort();
   stopGatewayAvailabilityMonitor?.();
   await stopGatewayApprovalCoordinator();

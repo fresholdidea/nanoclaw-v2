@@ -31,15 +31,22 @@
  */
 import fs from 'fs';
 
+import { IDLE_CHAT_SHUTDOWN_MS, IDLE_TASK_SHUTDOWN_MS } from './config.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { ABSOLUTE_CEILING_MS_RAW, CLAIM_STUCK_MS_RAW } from './config.js';
 import { log } from './log.js';
-import { heartbeatPath, withExistingMailboxSession } from './session-manager.js';
-import { getContainerStartedAtMs, isContainerRunning, killContainer } from './container-runner.js';
+import { heartbeatPath, outsideMailboxSession, withExistingMailboxSession } from './session-manager.js';
+import {
+  getContainerStartedAtMs,
+  isContainerRunning,
+  isSessionRuntimeLive,
+  killContainer,
+} from './container-runner.js';
 import { requestWake } from './request-wake.js';
 import type { Session } from './types.js';
+import { OutboundJournalPendingError } from './mailbox/index.js';
 import type { ContainerState, InboundMailbox, OutboundMailbox } from './mailbox/index.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -77,6 +84,7 @@ const BACKOFF_BASE_MS = 5000;
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
+  | { action: 'kill-idle'; heartbeatAgeMs: number; idleMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
 
 /**
@@ -90,8 +98,15 @@ export function decideStuckAction(args: {
   containerStartedAtMs?: number; // fallback when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ messageId: string; statusChanged: string }>;
+  /**
+   * Idle window for this session kind (IDLE_*_SHUTDOWN_MS). Omitted = no idle
+   * shutdown, only the stuck checks.
+   */
+  idleMs?: number;
+  /** Messages due this tick; due work means "not idle". */
+  hasDueWork?: boolean;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerStartedAtMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerStartedAtMs, containerState, claims, idleMs, hasDueWork } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
 
   // Ceiling check prefers the heartbeat file's mtime. A freshly-spawned
@@ -116,6 +131,18 @@ export function decideStuckAction(args: {
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
     if (heartbeatAge > ceiling) {
       return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
+    }
+
+    // Idle shutdown — the "not stuck, just done" case. The runner has no
+    // self-shutdown, so without this a finished container idles until the
+    // ceiling reaps it and logs a warning. Every condition says no work is
+    // happening: no 'processing' claim (a turn holds one until the provider's
+    // result event), nothing due, no tool in flight, quiet past the window. A
+    // message claimed between this decision and the kill costs a retry, not a
+    // message: the caller resets the claim and the next tick respawns.
+    const toolInFlight = containerState?.currentTool != null;
+    if (idleMs !== undefined && claims.length === 0 && !hasDueWork && !toolInFlight && heartbeatAge > idleMs) {
+      return { action: 'kill-idle', heartbeatAgeMs: heartbeatAge, idleMs };
     }
   }
 
@@ -157,10 +184,11 @@ async function reconcileActiveSession(session: Session): Promise<void> {
     let shouldWake = false;
     const exists = await withExistingMailboxSession(agentGroup.id, session.id, async (mailbox) => {
       mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks());
+      journalPendingSince.delete(session.id);
       dueCount = mailbox.countDueMessages();
       shouldWake = dueCount > 0 && !isContainerRunning(session.id);
       if (!shouldWake) {
-        await maintainSessionMailbox(mailbox, session, agentGroup.id);
+        await maintainSessionMailbox(mailbox, session, agentGroup.id, dueCount);
       }
       return true;
     });
@@ -175,9 +203,13 @@ async function reconcileActiveSession(session: Session): Promise<void> {
     await requestWake(session, 'due-message');
 
     await withExistingMailboxSession(agentGroup.id, session.id, async (mailbox) => {
-      await maintainSessionMailbox(mailbox, session, agentGroup.id);
+      await maintainSessionMailbox(mailbox, session, agentGroup.id, dueCount);
     });
   } catch (err) {
+    if (err instanceof OutboundJournalPendingError) {
+      await recoverPendingOutboundJournal(session, agentGroup.id);
+      return;
+    }
     log.error('Session mailbox sweep failed', {
       agentGroupId: agentGroup.id,
       sessionId: session.id,
@@ -186,16 +218,86 @@ async function reconcileActiveSession(session: Session): Promise<void> {
   }
 }
 
+/** When each session's outbound reads started failing on a pending journal (cleared by any clean read). */
+const journalPendingSince = new Map<string, number>();
+
+/**
+ * The host opens outbound.db read-only, so it can never replay a write journal.
+ * While the runner lives the journal is its in-flight commit — leave it, the
+ * next tick reads cleanly. Once the runner is gone it is a crash leftover that
+ * would otherwise block every read (and so every wake) for the session: replay
+ * it, and the next tick proceeds normally.
+ */
+async function recoverPendingOutboundJournal(session: Session, agentGroupId: string): Promise<void> {
+  const now = Date.now();
+  const pendingSince = journalPendingSince.get(session.id) ?? now;
+  journalPendingSince.set(session.id, pendingSince);
+
+  if (isSessionRuntimeLive(session.id)) {
+    enforceCeilingWithJournalPending(session, agentGroupId, now, pendingSince);
+    return;
+  }
+  /* eslint-disable no-catch-all/no-catch-all -- a failed replay is retried next tick; it must not break the sweep */
+  try {
+    await withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
+      // Re-check inside the session: a wake may have spawned a runner meanwhile.
+      if (isSessionRuntimeLive(session.id)) return;
+      mailbox.recoverOutboundJournal();
+      journalPendingSince.delete(session.id);
+      log.warn('Replayed leftover outbound journal from a dead runner', { sessionId: session.id });
+    });
+  } catch (err) {
+    log.error('Outbound journal recovery failed', { agentGroupId, sessionId: session.id, err });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
+ * A runner wedged mid-commit keeps its journal on disk, so every outbound read
+ * fails and the regular SLA check never runs. Keep the absolute ceiling alive
+ * from the heartbeat alone — otherwise the session wedges for good. Requires
+ * the journal to have been pending across ticks, not one unlucky sample.
+ */
+function enforceCeilingWithJournalPending(
+  session: Session,
+  agentGroupId: string,
+  now: number,
+  pendingSince: number,
+): void {
+  const lastSignOfLife = Math.max(heartbeatMtimeMs(agentGroupId, session.id), getContainerStartedAtMs(session.id) ?? 0);
+  const heartbeatAgeMs = now - lastSignOfLife;
+  const pendingMs = now - pendingSince;
+  if (isContainerRunning(session.id) && pendingMs >= CLAIM_STUCK_MS && heartbeatAgeMs > ABSOLUTE_CEILING_MS) {
+    log.warn('Killing container past absolute ceiling with its outbound journal stuck', {
+      sessionId: session.id,
+      heartbeatAgeMs,
+      journalPendingMs: pendingMs,
+    });
+    killAndReset(session, agentGroupId, 'absolute-ceiling');
+    return;
+  }
+  if (pendingMs >= CLAIM_STUCK_MS) {
+    log.warn('Outbound journal pending across ticks while the runner lives', {
+      sessionId: session.id,
+      journalPendingMs: pendingMs,
+    });
+  } else {
+    log.debug('Outbound journal in flight; retrying next tick', { sessionId: session.id });
+  }
+}
+
 async function maintainSessionMailbox(
   mailbox: InboundMailbox & OutboundMailbox,
   session: Session,
   agentGroupId: string,
+  dueCount: number,
 ): Promise<void> {
   const alive = isContainerRunning(session.id);
   if (alive) {
-    await enforceRunningContainerSla(mailbox, mailbox, session, agentGroupId);
+    await enforceRunningContainerSla(mailbox, session, agentGroupId, dueCount);
   }
-  if (!alive) {
+  // An unregistered survivor (adoption pending) is still outbound.db's writer.
+  if (!alive && !isSessionRuntimeLive(session.id)) {
     resetStuckProcessingRows(mailbox, mailbox, session, 'container not running');
   }
 
@@ -251,10 +353,10 @@ function bashTimeoutMs(state: ContainerState | null): number | null {
  * one that issued the wake.
  */
 async function enforceRunningContainerSla(
-  inDb: InboundMailbox,
   outDb: OutboundMailbox,
   session: Session,
   agentGroupId: string,
+  dueCount: number,
 ): Promise<void> {
   let incarnationStartMs = 0;
   const claimRow = await getSessionClaim(session.id);
@@ -277,6 +379,8 @@ async function enforceRunningContainerSla(
     containerStartedAtMs: getContainerStartedAtMs(session.id),
     containerState: outDb.getContainerState(),
     claims: gatedClaims,
+    idleMs: isTaskThread(session.thread_id) ? IDLE_TASK_SHUTDOWN_MS : IDLE_CHAT_SHUTDOWN_MS,
+    hasDueWork: dueCount > 0,
   });
 
   if (decision.action === 'ok') return;
@@ -287,8 +391,18 @@ async function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    killContainer(session.id, 'absolute-ceiling');
-    resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
+    killAndReset(session, agentGroupId, 'absolute-ceiling');
+    return;
+  }
+
+  if (decision.action === 'kill-idle') {
+    // Info, not warn: the normal end of a container's life, not a fault.
+    log.info('Stopping idle container', {
+      sessionId: session.id,
+      heartbeatAgeMs: decision.heartbeatAgeMs,
+      idleMs: decision.idleMs,
+    });
+    killAndReset(session, agentGroupId, 'idle');
     return;
   }
 
@@ -298,8 +412,42 @@ async function enforceRunningContainerSla(
     claimAgeMs: decision.claimAgeMs,
     toleranceMs: decision.toleranceMs,
   });
-  killContainer(session.id, 'claim-stuck');
-  resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+  killAndReset(session, agentGroupId, 'claim-stuck');
+}
+
+/**
+ * Kill, then reset the session's processing rows once the container is gone.
+ * The reset deletes claims from outbound.db, and the stop is asynchronous: the
+ * dying runner can still be writing during its grace period, and cross-mount
+ * locks don't reach the host, so writing before onExit corrupts the file.
+ * If a wake already spawned a successor, skip: it is now the writer, its
+ * startup clears the stale claim, and the incarnation gate keeps that claim
+ * from counting against it.
+ */
+function killAndReset(session: Session, agentGroupId: string, reason: string): void {
+  // The kill is issued from inside the sweep's mailbox session for this very
+  // key, and the exit callback inherits that async context. Leave it before
+  // opening the reset's own session, or the nesting guard rejects it and the
+  // claims are never reset (the sweep's session is long over by then).
+  const resetAfterExit = (): void =>
+    outsideMailboxSession(() => {
+      void withExistingMailboxSession(agentGroupId, session.id, (mailbox) => {
+        // Checked inside the session, adjacent to the writes (no await between).
+        if (isSessionRuntimeLive(session.id)) return;
+        try {
+          resetStuckProcessingRows(mailbox, mailbox, session, reason);
+        } catch (err) {
+          if (!(err instanceof OutboundJournalPendingError)) throw err;
+          // The stop's SIGKILL often lands mid-commit. Nothing else writes now.
+          mailbox.recoverOutboundJournal();
+          journalPendingSince.delete(session.id);
+          resetStuckProcessingRows(mailbox, mailbox, session, reason);
+        }
+      }).catch((err: unknown) =>
+        log.error('Post-kill processing reset failed', { sessionId: session.id, reason, err }),
+      );
+    });
+  killContainer(session.id, reason, resetAfterExit);
 }
 
 export function _resetStuckProcessingRowsForTesting(

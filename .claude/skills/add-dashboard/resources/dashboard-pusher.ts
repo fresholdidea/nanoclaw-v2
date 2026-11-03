@@ -3,11 +3,13 @@
  * snapshot to the dashboard's /api/ingest endpoint every interval.
  */
 import fs from 'fs';
+import { collectDashboardHud } from './hud/index.js';
+import { localDay } from './hud/io.js';
 import path from 'path';
 import http from 'http';
 import Database from 'better-sqlite3';
 
-import { getAllAgentGroups, getAgentGroup } from './db/agent-groups.js';
+import { getAllAgentGroups, getAgentGroup, parseAgentPersona } from './db/agent-groups.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
 import { getAllMessagingGroups, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { getDestinations } from './modules/agent-to-agent/db/agent-destinations.js';
@@ -16,9 +18,10 @@ import { getAllUsers, getUser } from './modules/permissions/db/users.js';
 import { getUserRoles, getAdminsOfAgentGroup } from './modules/permissions/db/user-roles.js';
 import { getUserDmsForUser } from './modules/permissions/db/user-dms.js';
 import { getActiveAdapters, getRegisteredChannelNames } from './channels/channel-registry.js';
-import { DATA_DIR, ASSISTANT_NAME } from './config.js';
-import { getDb } from './db/connection.js';
+import { DATA_DIR, ASSISTANT_NAME, TIMEZONE } from './config.js';
+import { configFromDb, redactMcpServerSecrets } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
+import { getDb } from './db/connection.js';
 import { log } from './log.js';
 import { readEnvFile } from './env.js';
 
@@ -97,6 +100,7 @@ function postJson(config: PusherConfig, urlPath: string, data: unknown): void {
   req.end();
 }
 
+/* eslint-disable-next-line no-control-regex */
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
 // Transcripts and logs only grow, and a busy agent's transcript can pass the
@@ -204,8 +208,12 @@ async function push(config: PusherConfig): Promise<void> {
 }
 
 async function collectSnapshot(): Promise<Record<string, unknown>> {
+  // One pass over every session outbound.db feeds both the per-group
+  // `lastActiveAt` and the top-level `a2a_edges`; results are cached by
+  // file mtime (see `collectOutboundStats`) since this runs every minute.
+  const outbound = collectOutboundStats();
   const [agentGroups, sessions, channels, users, tokens, contextWindows] = await Promise.all([
-    collectAgentGroups(),
+    collectAgentGroups(outbound.lastActiveByGroup),
     collectSessions(),
     collectChannels(),
     collectUsers(),
@@ -221,64 +229,215 @@ async function collectSnapshot(): Promise<Record<string, unknown>> {
     channels,
     users,
     tokens,
+    hud: await collectDashboardHud(tokens),
     context_windows: contextWindows,
     activity: collectActivity(),
     messages: collectMessages(),
+    a2a_edges: outbound.edges,
   };
 }
 
-async function collectAgentGroups() {
-  const groups = await getAllAgentGroups();
-  return Promise.all(
-    groups.map(async (g) => {
-      const [sessions, destinations, rawMembers, rawAdmins, containerConfig, wirings] = await Promise.all([
-        getSessionsByAgentGroup(g.id),
-        getDestinations(g.id),
-        getMembers(g.id),
-        getAdminsOfAgentGroup(g.id),
-        getContainerConfig(g.id),
-        getDb().all<Record<string, unknown>>(
-          `SELECT mga.*, mg.channel_type, mg.platform_id, mg.name as mg_name, mg.is_group, mg.unknown_sender_policy
+async function collectAgentGroups(lastActiveByGroup: ReadonlyMap<string, string> = new Map()) {
+  const result = [];
+  for (const g of await getAllAgentGroups()) {
+    const sessions = await getSessionsByAgentGroup(g.id);
+    const running = sessions.filter((s) => s.container_status === 'running' || s.container_status === 'idle');
+    const destinations = await getDestinations(g.id);
+    const members = await Promise.all(
+      (await getMembers(g.id)).map(async (m) => {
+        const user = await getUser(m.user_id);
+        return { ...m, display_name: user?.display_name ?? null };
+      }),
+    );
+    const admins = await Promise.all(
+      (await getAdminsOfAgentGroup(g.id)).map(async (a) => {
+        const user = await getUser(a.user_id);
+        return { ...a, display_name: user?.display_name ?? null };
+      }),
+    );
+
+    // Wirings
+    const db = getDb();
+    const wirings = await db.all<Record<string, unknown>>(
+      `SELECT mga.*, mg.channel_type, mg.platform_id, mg.name as mg_name, mg.is_group, mg.unknown_sender_policy
          FROM messaging_group_agents mga
          JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
          WHERE mga.agent_group_id = ?`,
-          g.id,
-        ),
-      ]);
-      const running = sessions.filter((s) => s.container_status === 'running' || s.container_status === 'idle');
-      const members = await Promise.all(
-        rawMembers.map(async (m) => {
-          const user = await getUser(m.user_id);
-          return { ...m, display_name: user?.display_name ?? null };
-        }),
-      );
-      const admins = await Promise.all(
-        rawAdmins.map(async (a) => {
-          const user = await getUser(a.user_id);
-          return { ...a, display_name: user?.display_name ?? null };
-        }),
-      );
+      g.id,
+    );
+    const row = await getContainerConfig(g.id);
+    const config = row ? configFromDb(row, g) : undefined;
 
-      return {
-        id: g.id,
-        name: g.name,
-        folder: g.folder,
-        agent_provider: g.agent_provider,
-        container_config: containerConfig ?? null,
-        sessionCount: sessions.length,
-        runningSessions: running.length,
-        wirings,
-        destinations,
-        members,
-        admins,
-        created_at: g.created_at,
-      };
-    }),
-  );
+    result.push({
+      id: g.id,
+      name: g.name,
+      folder: g.folder,
+      agent_provider: g.agent_provider,
+      // The dashboard serves this snapshot back as JSON and only lists server
+      // names; MCP env/header values are credentials and stay on the host.
+      container_config: config
+        ? { ...config, mcpServers: redactMcpServerSecrets(config.mcpServers) }
+        : { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' as const },
+      sessionCount: sessions.length,
+      runningSessions: running.length,
+      wirings,
+      destinations,
+      members,
+      admins,
+      created_at: g.created_at,
+      // Architecture metadata (agent_groups migration 026). Additive — every
+      // field above keeps its shape so older dashboard builds still ingest.
+      tier: g.tier ?? null,
+      reports_to: g.reports_to ?? null,
+      role: g.role ?? null,
+      persona: parseAgentPersona(g.persona),
+      lastActiveAt: lastActiveByGroup.get(g.id) ?? null,
+    });
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Session outbound.db scan — per-group last activity + agent-to-agent edges
+// ---------------------------------------------------------------------------
+
+export interface A2aEdge {
+  /** Sending agent group id (the session's `ag-…` directory). */
+  from: string;
+  /** Receiving agent group id (`messages_out.platform_id` on an `agent` row). */
+  to: string;
+  /** Agent-to-agent messages sent in the trailing 7 days. */
+  count7d: number;
+  /** ISO timestamp of the newest counted message. */
+  lastAt: string;
+}
+
+interface OutboundFileStats {
+  mtimeMs: number;
+  size: number;
+  /** MAX(messages_out.timestamp) — null for an empty table. */
+  lastAt: string | null;
+  /** `channel_type='agent'` rows newer than the cutoff at scan time. */
+  agentRows: Array<{ ts: string; to: string }>;
+}
+
+const A2A_WINDOW_MS = 7 * 86400000;
+const outboundStatsCache = new Map<string, OutboundFileStats>();
+
+/** Test hook: forget every cached outbound.db scan. */
+export function resetDashboardCaches(): void {
+  outboundStatsCache.clear();
+  tokenScanCache.clear();
+}
+
+/**
+ * Read one outbound.db, through the mtime/size cache. Opens read-only and
+ * tolerates a missing, locked, or corrupt file by returning the cached entry
+ * (if any) or null — a container mid-write must never fail the push.
+ */
+function readOutboundStats(dbPath: string, cutoff: string): OutboundFileStats | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(dbPath);
+  } catch {
+    outboundStatsCache.delete(dbPath);
+    return null;
+  }
+  const cached = outboundStatsCache.get(dbPath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
+
+  let db: Database.Database | undefined;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const last = db.prepare('SELECT MAX(timestamp) AS last_at FROM messages_out').get() as
+      | { last_at: string | null }
+      | undefined;
+    const rows = db
+      .prepare(
+        `SELECT timestamp AS ts, platform_id AS "to" FROM messages_out
+          WHERE channel_type = 'agent' AND platform_id IS NOT NULL AND timestamp > ?`,
+      )
+      .all(cutoff) as Array<{ ts: string; to: string }>;
+    const entry: OutboundFileStats = {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      lastAt: last?.last_at ?? null,
+      agentRows: rows,
+    };
+    outboundStatsCache.set(dbPath, entry);
+    return entry;
+  } catch {
+    return cached ?? null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Walk `data/v2-sessions/<ag>/<session>/outbound.db` once and derive:
+ * - `lastActiveByGroup`: newest `messages_out.timestamp` per agent group
+ * - `edges`: agent-to-agent traffic in the trailing 7 days, keyed (from, to)
+ */
+function collectOutboundStats(): { lastActiveByGroup: Map<string, string>; edges: A2aEdge[] } {
+  const lastActiveByGroup = new Map<string, string>();
+  const edgeMap = new Map<string, A2aEdge>();
+  const sessionsDir = path.join(DATA_DIR, 'v2-sessions');
+  if (!fs.existsSync(sessionsDir)) return { lastActiveByGroup, edges: [] };
+
+  const cutoff = new Date(Date.now() - A2A_WINDOW_MS).toISOString();
+  const seen = new Set<string>();
+
+  try {
+    for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
+      const agPath = path.join(sessionsDir, agDir);
+      let sessDirs: string[];
+      try {
+        sessDirs = fs.readdirSync(agPath).filter((d) => d.startsWith('sess-'));
+      } catch {
+        continue;
+      }
+      for (const sessDir of sessDirs) {
+        const dbPath = path.join(agPath, sessDir, 'outbound.db');
+        seen.add(dbPath);
+        const stats = readOutboundStats(dbPath, cutoff);
+        if (!stats) continue;
+
+        if (stats.lastAt) {
+          const prev = lastActiveByGroup.get(agDir);
+          if (!prev || stats.lastAt > prev) lastActiveByGroup.set(agDir, stats.lastAt);
+        }
+        for (const row of stats.agentRows) {
+          // Cached rows age out of the window between rescans.
+          if (row.ts <= cutoff) continue;
+          const key = `${agDir}\u0000${row.to}`;
+          const edge = edgeMap.get(key);
+          if (edge) {
+            edge.count7d++;
+            if (row.ts > edge.lastAt) edge.lastAt = row.ts;
+          } else {
+            edgeMap.set(key, { from: agDir, to: row.to, count7d: 1, lastAt: row.ts });
+          }
+        }
+      }
+    }
+  } catch {
+    /* skip */
+  }
+
+  // Drop cache entries for files that no longer exist on disk.
+  for (const key of outboundStatsCache.keys()) if (!seen.has(key)) outboundStatsCache.delete(key);
+
+  const edges = [...edgeMap.values()].sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
+  return { lastActiveByGroup, edges };
 }
 
 async function collectSessions() {
-  return getDb().all<Record<string, unknown>>(
+  const db = getDb();
+  return db.all<Record<string, unknown>>(
     `SELECT s.*, ag.name as agent_group_name, ag.folder as agent_group_folder,
               mg.channel_type, mg.platform_id, mg.name as messaging_group_name
        FROM sessions s
@@ -305,9 +464,8 @@ async function collectChannels() {
       };
     }
 
-    const wiringAgents = await getMessagingGroupAgents(mg.id);
     const agents = await Promise.all(
-      wiringAgents.map(async (a) => {
+      (await getMessagingGroupAgents(mg.id)).map(async (a) => {
         const group = await getAgentGroup(a.agent_group_id);
         return { agent_group_id: a.agent_group_id, agent_group_name: group?.name ?? null, priority: a.priority };
       }),
@@ -336,44 +494,44 @@ async function collectChannels() {
 }
 
 async function collectUsers() {
-  const users = await getAllUsers();
-  return Promise.all(
-    users.map(async (u) => {
-      const [roles, dms, memberships] = await Promise.all([
-        getUserRoles(u.id),
-        getUserDmsForUser(u.id),
-        getDb().all<Record<string, unknown>>(
-          `SELECT agm.agent_group_id, ag.name as agent_group_name
+  const result = [];
+  for (const u of await getAllUsers()) {
+    const roles = await getUserRoles(u.id);
+    const dms = await getUserDmsForUser(u.id);
+
+    const db = getDb();
+    const memberships = await db.all<Record<string, unknown>>(
+      `SELECT agm.agent_group_id, ag.name as agent_group_name
          FROM agent_group_members agm
          JOIN agent_groups ag ON ag.id = agm.agent_group_id
          WHERE agm.user_id = ?`,
-          u.id,
-        ),
-      ]);
+      u.id,
+    );
 
-      let privilege = 'none';
-      if (roles.some((r) => r.role === 'owner')) privilege = 'owner';
-      else if (roles.some((r) => r.role === 'admin' && !r.agent_group_id)) privilege = 'global_admin';
-      else if (roles.some((r) => r.role === 'admin')) privilege = 'admin';
-      else if (memberships.length > 0) privilege = 'member';
+    let privilege = 'none';
+    if (roles.some((r) => r.role === 'owner')) privilege = 'owner';
+    else if (roles.some((r) => r.role === 'admin' && !r.agent_group_id)) privilege = 'global_admin';
+    else if (roles.some((r) => r.role === 'admin')) privilege = 'admin';
+    else if (memberships.length > 0) privilege = 'member';
 
-      return {
-        id: u.id,
-        kind: u.kind,
-        display_name: u.display_name,
-        privilege,
-        roles,
-        memberships,
-        dmChannels: dms.map((d) => ({ channel_type: d.channel_type })),
-        created_at: u.created_at,
-      };
-    }),
-  );
+    result.push({
+      id: u.id,
+      kind: u.kind,
+      display_name: u.display_name,
+      privilege,
+      roles,
+      memberships,
+      dmChannels: dms.map((d) => ({ channel_type: d.channel_type })),
+      created_at: u.created_at,
+    });
+  }
+  return result;
 }
 
 async function collectTokens() {
   const sessionsDir = path.join(DATA_DIR, 'v2-sessions');
   const allEntries: Array<{
+    timestamp: string | null;
     model: string;
     inputTokens: number;
     outputTokens: number;
@@ -447,10 +605,19 @@ async function collectTokens() {
     totals.cacheCreationTokens += e.cacheCreationTokens;
   }
 
-  return { totals, byModel, byGroup };
+  const daily: Record<string, number> = {};
+  let asOf: string | null = null;
+  for (const e of allEntries) {
+    if (!e.timestamp || !Number.isFinite(Date.parse(e.timestamp))) continue;
+    const day = localDay(new Date(e.timestamp), TIMEZONE);
+    daily[day] = (daily[day] ?? 0) + e.inputTokens + e.outputTokens + e.cacheReadTokens + e.cacheCreationTokens;
+    if (!asOf || e.timestamp > asOf) asOf = e.timestamp;
+  }
+  return { totals, byModel, byGroup, daily, asOf };
 }
 
 interface TokenEntry {
+  timestamp: string | null;
   model: string;
   inputTokens: number;
   outputTokens: number;
@@ -511,6 +678,7 @@ function scanJsonlTokens(agentDir: string, seen: Set<string>): TokenEntry[] {
               const hit = parseUsageLine(line);
               if (!hit) return;
               fileEntries.push({
+                timestamp: hit.timestamp ?? null,
                 model: hit.model || 'unknown',
                 inputTokens: hit.usage.input_tokens || 0,
                 outputTokens: hit.usage.output_tokens || 0,
@@ -617,20 +785,12 @@ async function collectContextWindows() {
   return results;
 }
 
-// "YYYY-MM-DDTHH" in the host's local time — the chart's hour labels are read
-// by a human, so bucket by local hour, not UTC. sv-SE renders "YYYY-MM-DD HH".
-function localHourKey(d: Date): string {
-  return d
-    .toLocaleString('sv-SE', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false })
-    .replace(' ', 'T');
-}
-
 function collectActivity() {
   const now = Date.now();
   const buckets: Record<string, { inbound: number; outbound: number }> = {};
 
   for (let i = 0; i < 24; i++) {
-    const key = localHourKey(new Date(now - i * 3600000));
+    const key = new Date(now - i * 3600000).toISOString().slice(0, 13);
     buckets[key] = { inbound: 0, outbound: 0 };
   }
 
@@ -656,7 +816,7 @@ function collectActivity() {
               timestamp: string;
             }[];
             for (const row of rows) {
-              const key = localHourKey(new Date(row.timestamp));
+              const key = row.timestamp.slice(0, 13);
               if (buckets[key]) buckets[key][direction]++;
             }
             db.close();

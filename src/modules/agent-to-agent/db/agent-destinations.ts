@@ -46,9 +46,9 @@ import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-pol
  */
 export async function createDestination(row: AgentDestination): Promise<void> {
   await getDb().run(
-    `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-     VALUES (@agent_group_id, @local_name, @target_type, @target_id, @created_at)`,
-    row,
+    `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, thread_id, created_at)
+     VALUES (@agent_group_id, @local_name, @target_type, @target_id, @thread_id, @created_at)`,
+    { ...row, thread_id: row.thread_id ?? null },
   );
 }
 

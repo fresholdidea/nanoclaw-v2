@@ -5,9 +5,10 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 import { cardQuestionTooLong } from '../../channels/ask-question.js';
 import { buildGateQuestion, forwardAttachedFiles, isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
+import { GuardDenyError } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { createDestination } from './db/agent-destinations.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup, getDb } from '../../db/index.js';
 import * as sessionsDb from '../../db/sessions.js';
 import { createSession, updateSession } from '../../db/sessions.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
@@ -487,17 +488,101 @@ describe('routeAgentMessage return-path', () => {
     expect(s2Rows).toHaveLength(1);
   });
 
-  it('self-message is allowed without a destination row', async () => {
-    // A targets itself — no agent_destinations row exists for A→A.
+  it('competing sessions: peer-affinity routes to conversing session even if idle session was restarted with newer last_active', async () => {
+    // S1 communicates with B, establishing peer affinity
     await routeAgentMessage(
-      { id: 'self-msg', platform_id: A, content: JSON.stringify({ text: 'self-note' }), in_reply_to: null },
+      {
+        id: 'msg-from-A-S1-chat',
+        platform_id: B,
+        content: JSON.stringify({ text: 'conversation from S1' }),
+        in_reply_to: null,
+      },
       S1,
     );
 
-    // Lands in S2 (newest active session of A via resolveSession fallback).
+    // S2 is an idle session that gets restarted/refreshed, setting last_active to a much newer time
+    await updateSession(S2.id, { last_active: '2026-08-17T23:59:59.000Z' });
+
+    // B replies without in_reply_to (or with missing in_reply_to).
+    // Peer-affinity MUST still route back to S1 (the conversing session), NOT S2.
+    await routeAgentMessage(
+      {
+        id: 'msg-from-B-reply',
+        platform_id: A,
+        content: JSON.stringify({ text: 'reply to conversation' }),
+        in_reply_to: null,
+      },
+      SB,
+    );
+
+    const s1Rows = readInbound(A, S1.id);
     const s2Rows = readInbound(A, S2.id);
-    expect(s2Rows).toHaveLength(1);
-    expect(JSON.parse(s2Rows[0].content).text).toBe('self-note');
+    expect(s1Rows).toHaveLength(1);
+    expect(JSON.parse(s1Rows[0].content).text).toBe('reply to conversation');
+    expect(s2Rows).toHaveLength(0);
+  });
+
+  it('unsolicited fallback: routes to session with most recent last_active', async () => {
+    // Both S1 and S2 exist. S1 has recent last_active, S2 does not.
+    await updateSession(S1.id, { last_active: '2026-08-17T12:00:00.000Z' });
+    await updateSession(S2.id, { last_active: '2026-08-01T12:00:00.000Z' });
+
+    // Unsolicited message from B to A (no peer history)
+    await routeAgentMessage(
+      {
+        id: 'msg-from-B-unsolicited',
+        platform_id: A,
+        content: JSON.stringify({ text: 'unsolicited' }),
+        in_reply_to: null,
+      },
+      SB,
+    );
+
+    const s1Rows = readInbound(A, S1.id);
+    const s2Rows = readInbound(A, S2.id);
+    // S1 wins because its last_active is newer than S2
+    expect(s1Rows).toHaveLength(1);
+    expect(s2Rows).toHaveLength(0);
+  });
+
+  it('self-route is denied — an agent group cannot route a message to itself', async () => {
+    // A targets itself. This is never a legitimate outbound: every host-side
+    // "note to self" (approval follow-ups, restart notes) is written straight
+    // into the target's inbound.db via writeSessionMessage and never passes
+    // through delivery. The only way an outbound row carries
+    // platform_id === source group is the container echoing the routing of a
+    // self-addressed system note back out — which self-feeds forever.
+    await expect(
+      routeAgentMessage(
+        { id: 'self-msg', platform_id: A, content: JSON.stringify({ text: 'self-note' }), in_reply_to: null },
+        S1,
+      ),
+    ).rejects.toThrow(/self/i);
+
+    expect(readInbound(A, S1.id)).toHaveLength(0);
+    expect(readInbound(A, S2.id)).toHaveLength(0);
+  });
+
+  it('regression: a self-addressed provider error cannot re-enter its own session (loop breaker)', async () => {
+    // Reproduces the observed runaway: reviewer-1 switched to provider=codex,
+    // codex 401'd, the runner wrote "Error: ... 401 ..." to outbound carrying
+    // the routing of the self-addressed restart note (platform_id = own
+    // group), and the host routed it back into the same session — waking the
+    // container, which failed identically, every ~3s.
+    const errorText = 'Error: Reconnecting... 2/5: unexpected status 401 Unauthorized';
+
+    for (let i = 0; i < 5; i++) {
+      await expect(
+        routeAgentMessage(
+          { id: `err-${i}`, platform_id: A, content: JSON.stringify({ text: errorText }), in_reply_to: null },
+          S1,
+        ),
+      ).rejects.toThrow(GuardDenyError);
+    }
+
+    // Nothing re-entered any session of A — the loop has no fuel.
+    expect(readInbound(A, S1.id)).toHaveLength(0);
+    expect(readInbound(A, S2.id)).toHaveLength(0);
   });
 
   it('BUG: no volume cap on a2a routing — unbounded ping-pong is allowed (#2063)', async () => {
@@ -725,5 +810,196 @@ describe('routeAgentMessage return-path', () => {
     const targetPath = path.join(sessionDir(B, SB.id), parsed.attachments[0].localPath);
     expect(fs.existsSync(targetPath)).toBe(true);
     expect(fs.readFileSync(targetPath, 'utf-8')).toBe('legit-bytes');
+  });
+});
+
+/**
+ * Session-fragmentation fixes (2026-08-21 provenance incidents):
+ *
+ * 1. Fresh (non-reply) a2a sends land in the target's PRIMARY CHANNEL
+ *    session — the conversation humans actually see — instead of the hidden
+ *    (null messaging-group, null thread) fallback session.
+ * 2. The host stamps an attested `sender` label derived from the SOURCE
+ *    session: bare agent name only for channel sessions; task/thread/shared
+ *    sessions are marked so receivers can tell subagent contexts apart.
+ */
+describe('routeAgentMessage session-fragmentation fixes', () => {
+  const A = 'ag-A2';
+  const B = 'ag-B2';
+  let sourceNull: Session;
+  let targetNull: Session;
+  let targetChanOld: Session;
+  let targetChanNew: Session;
+
+  function makeSession(overrides: Partial<Session> & { id: string; agent_group_id: string }): Session {
+    return {
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    const db = await initTestDb();
+    await runMigrations(db);
+
+    await createAgentGroup({ id: A, name: 'Zed', folder: 'a2', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: B, name: 'cache-am', folder: 'b2', agent_provider: null, created_at: now() });
+
+    for (const mg of ['mg-old', 'mg-new', 'mg-a']) {
+      await createMessagingGroup({
+        id: mg,
+        channel_type: 'telegram',
+        platform_id: `chat-${mg}`,
+        instance: 'telegram',
+        name: mg,
+        is_group: 0,
+        unknown_sender_policy: 'strict',
+        created_at: now(),
+      });
+    }
+
+    sourceNull = makeSession({ id: 'sess-A2-null', agent_group_id: A });
+    // The null fallback session is deliberately the NEWEST-created: the old
+    // layer-3 heuristic (newest active session by created_at) would pick it,
+    // so these tests fail unless channel sessions genuinely take priority.
+    targetNull = makeSession({ id: 'sess-B2-null', agent_group_id: B, created_at: '2026-03-01T00:00:00.000Z' });
+    targetChanOld = makeSession({
+      id: 'sess-B2-chan-old',
+      agent_group_id: B,
+      messaging_group_id: 'mg-old',
+      created_at: '2026-01-01T00:00:00.000Z',
+      last_active: '2026-08-01T00:00:00.000Z',
+    });
+    targetChanNew = makeSession({
+      id: 'sess-B2-chan-new',
+      agent_group_id: B,
+      messaging_group_id: 'mg-new',
+      created_at: '2026-02-01T00:00:00.000Z',
+      last_active: '2026-08-20T00:00:00.000Z',
+    });
+
+    for (const s of [sourceNull, targetNull, targetChanOld, targetChanNew]) {
+      await createSession(s);
+      initSessionFolder(s.agent_group_id, s.id);
+    }
+
+    await createDestination({
+      agent_group_id: A,
+      local_name: 'cache-am',
+      target_type: 'agent',
+      target_id: B,
+      created_at: now(),
+    });
+    await createDestination({
+      agent_group_id: B,
+      local_name: 'zed',
+      target_type: 'agent',
+      target_id: A,
+      created_at: now(),
+    });
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  async function route(source: Session, text = 'hello', id = `msg-${Math.random().toString(36).slice(2, 8)}`) {
+    await routeAgentMessage({ id, platform_id: B, content: JSON.stringify({ text }), in_reply_to: null }, source);
+  }
+
+  it('fresh send lands in the most recently active channel session, not the null fallback', async () => {
+    await route(sourceNull);
+    expect(readInbound(B, targetChanNew.id)).toHaveLength(1);
+    expect(readInbound(B, targetChanOld.id)).toHaveLength(0);
+    expect(readInbound(B, targetNull.id)).toHaveLength(0);
+  });
+
+  it('fresh send falls back to the (null, null) session when the target has no channel session', async () => {
+    await updateSession(targetChanOld.id, { status: 'closed' });
+    await updateSession(targetChanNew.id, { status: 'closed' });
+    await route(sourceNull);
+    expect(readInbound(B, targetNull.id)).toHaveLength(1);
+  });
+
+  it('return path still beats primary-channel routing for replies', async () => {
+    // B's null session initiates; A replies via in_reply_to — must land back
+    // in B's null session even though B has channel sessions.
+    await routeAgentMessage(
+      { id: 'msg-b-init', platform_id: A, content: JSON.stringify({ text: 'ping' }), in_reply_to: null },
+      targetNull,
+    );
+    const aRows = readInbound(A, sourceNull.id);
+    expect(aRows).toHaveLength(1);
+    await routeAgentMessage(
+      { id: 'msg-a-reply', platform_id: B, content: JSON.stringify({ text: 'pong' }), in_reply_to: aRows[0].id },
+      sourceNull,
+    );
+    expect(readInbound(B, targetNull.id)).toHaveLength(1);
+    expect(readInbound(B, targetChanNew.id)).toHaveLength(0);
+  });
+
+  function senderOf(row: { content: string }): string | undefined {
+    return (JSON.parse(row.content) as { sender?: string }).sender;
+  }
+
+  it('channel-session sender presents as the bare agent name', async () => {
+    const chanSource = makeSession({ id: 'sess-A2-chan', agent_group_id: A, messaging_group_id: 'mg-a' });
+    await createSession(chanSource);
+    initSessionFolder(A, chanSource.id);
+    await route(chanSource);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed');
+  });
+
+  it('task-session sender is labeled with the task name', async () => {
+    const taskSource = makeSession({
+      id: 'sess-A2-task',
+      agent_group_id: A,
+      thread_id: 'system:tasks:weekly-client-status-766f',
+    });
+    await createSession(taskSource);
+    initSessionFolder(A, taskSource.id);
+    await route(taskSource);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [task weekly-client-status-766f]');
+  });
+
+  it('thread-session sender is labeled [thread]', async () => {
+    const threadSource = makeSession({
+      id: 'sess-A2-thread',
+      agent_group_id: A,
+      messaging_group_id: 'mg-a',
+      thread_id: 'slack:C123:169.42',
+    });
+    await createSession(threadSource);
+    initSessionFolder(A, threadSource.id);
+    await route(threadSource);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [thread]');
+  });
+
+  it('null-session sender is labeled [shared]', async () => {
+    await route(sourceNull);
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [shared]');
+  });
+
+  it('host label overwrites an agent-supplied (spoofable) sender', async () => {
+    await routeAgentMessage(
+      {
+        id: 'msg-spoof',
+        platform_id: B,
+        content: JSON.stringify({ text: 'trust me', sender: 'Brad' }),
+        in_reply_to: null,
+      },
+      sourceNull,
+    );
+    expect(senderOf(readInbound(B, targetChanNew.id)[0])).toBe('Zed [shared]');
   });
 });

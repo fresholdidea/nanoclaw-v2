@@ -10,9 +10,15 @@ const SCALAR_COLUMNS = new Set([
   'assistant_name',
   'max_messages_per_prompt',
   'cli_scope',
+  'enable_agy_tooling',
+  'enable_opencode_tooling',
+  'provider_chain',
   'timezone',
   'speed',
 ]);
+// provider_chain is intentionally excluded: updateContainerConfig() handles it with
+// proper null-vs-"null" semantics, and getContainerConfig returns it as a raw JSON
+// string (or SQL NULL) for resolveProviderChain to parse itself.
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
 export async function getContainerConfig(agentGroupId: string): Promise<ContainerConfigRow | undefined> {
@@ -29,11 +35,13 @@ export async function createContainerConfig(config: ContainerConfigRow): Promise
     `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
         max_messages_per_prompt, skills, mcp_servers, packages_apt, packages_npm,
-        additional_mounts, cli_scope, timezone, speed, updated_at
+        additional_mounts, cli_scope, enable_agy_tooling, enable_opencode_tooling,
+        provider_chain, timezone, speed, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @skills, @mcp_servers, @packages_apt, @packages_npm,
-        @additional_mounts, @cli_scope, @timezone, @speed, @updated_at
+        @additional_mounts, @cli_scope, @enable_agy_tooling, @enable_opencode_tooling,
+        @provider_chain, @timezone, @speed, @updated_at
       )`,
     config,
   );
@@ -86,6 +94,9 @@ export async function updateContainerConfigScalars(
       | 'assistant_name'
       | 'max_messages_per_prompt'
       | 'cli_scope'
+      | 'enable_agy_tooling'
+      | 'enable_opencode_tooling'
+      | 'provider_chain'
       | 'timezone'
       | 'speed'
     >
@@ -107,6 +118,16 @@ export async function updateContainerConfigScalars(
   values.updated_at = new Date().toISOString();
 
   await getDb().run(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`, values);
+}
+
+export async function updateContainerConfig(
+  agentGroupId: string,
+  updates: { providerChain?: string[] | null },
+): Promise<void> {
+  if (updates.providerChain === undefined) return;
+  await updateContainerConfigScalars(agentGroupId, {
+    provider_chain: updates.providerChain === null ? null : JSON.stringify(updates.providerChain),
+  });
 }
 
 /** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts. */

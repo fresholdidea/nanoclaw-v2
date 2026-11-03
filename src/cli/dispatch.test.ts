@@ -391,6 +391,44 @@ describe('CLI scope enforcement', () => {
     }
   });
 
+  // Org-chart columns (tier / reports_to) are treated like cli_scope: a
+  // group-scoped agent must not promote or re-parent itself.
+  it.each([
+    ['tier', { tier: 'orchestrator' }],
+    ['reports_to', { reports_to: 'other-group' }],
+    ['reports-to (hyphenated)', { 'reports-to': 'other-group' }],
+  ])('group: blocks %s changes on a groups write', async (_label, args) => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const resp = await dispatch({ id: '1', command: 'groups-test', args }, agentCtx());
+
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.error.code).toBe('forbidden');
+      expect(resp.error.message).toContain('tier or reports_to');
+    }
+  });
+
+  it('group: still allows role/persona on a groups write and --tier as a list filter', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
+
+    const write = await dispatch(
+      { id: '1', command: 'groups-test', args: { role: 'Builder', persona: '{"emoji":"🔧"}' } },
+      agentCtx(),
+    );
+    expect(write.ok).toBe(true);
+
+    const list = await dispatch({ id: '2', command: 'groups-list-data', args: { tier: 'worker' } }, agentCtx());
+    expect(list.ok).toBe(true);
+  });
+
+  it('global: tier/reports_to changes pass the guard', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'global' });
+
+    const resp = await dispatch({ id: '1', command: 'groups-test', args: { tier: 'orchestrator' } }, agentCtx());
+    expect(resp.ok).toBe(true);
+  });
+
   it('group: blocks non-group resources', async () => {
     mockGetContainerConfig.mockReturnValue({ cli_scope: 'group' });
 

@@ -13,6 +13,18 @@ export function registerAgentMailbox(next: AgentMailboxFactory): void {
   factory = next;
 }
 
+/**
+ * An outbound read found a write journal the host may not replay: either the
+ * runner is mid-commit (transient — retry next tick) or a dead runner left it
+ * behind (replay with recoverOutboundJournal once no runner is live).
+ */
+export class OutboundJournalPendingError extends Error {
+  constructor(options?: { cause?: unknown }) {
+    super('Outbound mailbox has a pending write journal', options);
+    this.name = 'OutboundJournalPendingError';
+  }
+}
+
 export function resetAgentMailboxForTesting(): AgentMailboxFactory | undefined {
   const previous = factory;
   active = undefined;
