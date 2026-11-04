@@ -88,6 +88,8 @@ echo '{"data":[{"id":"ag-sales","name":"Sales"},{"id":"ag-ops","name":"Ops"},{"i
 
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
+// A throwaway HOME: zsh reads ~/.zshenv even under -c, and one that prepends
+// ~/.local/bin puts the real onecli ahead of the stub (and the real vault).
 function run(script: string, shell = 'sh', tmp = root) {
   const r = spawnSync(shell, ['-c', script], {
     cwd: root,
@@ -97,6 +99,7 @@ function run(script: string, shell = 'sh', tmp = root) {
       CALLS: calls,
       ROOT: root,
       TMPDIR: tmp,
+      HOME: root,
     },
     encoding: 'utf8',
   });
@@ -116,7 +119,7 @@ describe('/add-vercel OneCLI steps', () => {
   function saveToken(shell: string, prefix = '', tmp = root) {
     const made = spawnSync(shell, ['-c', block('SKILL.md', '### Set up Vercel API credential')], {
       encoding: 'utf8',
-      env: { ...process.env, TMPDIR: tmp },
+      env: { ...process.env, TMPDIR: tmp, HOME: root },
     });
     const dir = made.stdout.trim();
     fs.writeFileSync(path.join(dir, 'token'), TOKEN);

@@ -36,13 +36,15 @@ echo '{"id":"sec-new"}'
 });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
+// A throwaway HOME: zsh reads ~/.zshenv even under -c, and one that prepends
+// ~/.local/bin puts the real onecli ahead of the stub (and the real vault).
 function run(shell: string, prefix = '') {
   const script = BLOCK.replace(
     `'<path to the key>' <source file>`,
     `'.profiles["anthropic:default"].key' "$ROOT/auth-profiles.json"`,
   );
   const r = spawnSync(shell, ['-c', prefix + script], {
-    env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, ROOT: root },
+    env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, ROOT: root, HOME: root },
     encoding: 'utf8',
   });
   const read = (name: string) => fs.readFileSync(path.join(root, name), 'utf8').trim();

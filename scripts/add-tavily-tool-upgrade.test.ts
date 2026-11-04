@@ -27,6 +27,8 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
+// A throwaway HOME: zsh reads ~/.zshenv even under -c, and one that prepends
+// ~/.local/bin puts the real onecli ahead of the stub (and the real vault).
 function run(secretName: string, attachExit = 0, extraSecret = '', grantsUnknown = false) {
   fs.writeFileSync(
     path.join(root, 'bin', 'onecli'),
@@ -44,7 +46,7 @@ esac
     'sh',
     ['-c', `${ATTACH.replaceAll('{{AGENT_GROUP_ID}}', 'ag-research')}\nrc=$?\necho still-here\nexit $rc`],
     {
-      env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, CALLS: calls },
+      env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, CALLS: calls, HOME: root },
       encoding: 'utf8',
     },
   );
@@ -96,7 +98,7 @@ describe('Tavily paid-key upgrade on OneCLI grants', () => {
       run('Tavily');
       fs.writeFileSync(calls, '');
       const r = spawnSync(shell, ['-c', ATTACH.replaceAll('{{AGENT_GROUP_ID}}', 'ag-research')], {
-        env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, CALLS: calls },
+        env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, CALLS: calls, HOME: root },
         encoding: 'utf8',
       });
       expect(r.status).toBe(0);
@@ -132,7 +134,7 @@ describe('Tavily paid-key upgrade on OneCLI grants', () => {
       { mode: 0o755 },
     );
     const r = spawnSync('sh', ['-c', ATTACH.replaceAll('{{AGENT_GROUP_ID}}', 'ag-research')], {
-      env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, CALLS: calls },
+      env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, CALLS: calls, HOME: root },
       encoding: 'utf8',
     });
     expect(r.status).toBe(0);
@@ -148,7 +150,7 @@ describe('Tavily paid-key upgrade on OneCLI grants', () => {
       { mode: 0o755 },
     );
     const r = spawnSync('sh', ['-c', ATTACH.replaceAll('{{AGENT_GROUP_ID}}', 'ag-research')], {
-      env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}` },
+      env: { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH}`, HOME: root },
       encoding: 'utf8',
     });
     expect(r.status).not.toBe(0);
