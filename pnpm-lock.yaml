@@ -22,7 +22,7 @@ importers:
         version: 1.2.0
       '@nanoco/nanoclaw-dashboard':
         specifier: link:/Users/bradhess/Documents/GitHub/nanoclaw-dashboard
-        version: link:../../nanoclaw-dashboard
+        version: link:../nanoclaw-dashboard
       '@onecli-sh/sdk':
         specifier: 2.2.1
         version: 2.2.1
