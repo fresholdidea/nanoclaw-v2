@@ -95,14 +95,20 @@ registerProviderContainerConfig(
 );
 
 /**
- * Sync `.agents/skills/<name>` symlinks to the selected skill set. Targets are
- * container paths (`/app/skills/<name>`) — dangling on the host, valid inside.
+ * Sync `.agents/skills/<name>` symlinks to the selected skill set plus the
+ * group's own skills. Targets are container paths — dangling on the host,
+ * valid inside: shared skills at `/app/skills/<name>`, group skills (real dirs
+ * with a SKILL.md under `<groupDir>/skills/`) at `/workspace/agent/skills/<name>`,
+ * the RW group mount, so the agent can still update them in place. A group
+ * skill wins over a shared skill of the same name.
  */
 function syncCodexSkillLinks(groupDir: string, selectedSkills: string[]): void {
   const skillsDir = path.join(groupDir, '.agents', 'skills');
   fs.mkdirSync(skillsDir, { recursive: true });
 
-  const desired = new Set(selectedSkills);
+  const desired = new Map(selectedSkills.map((skill) => [skill, `/app/skills/${skill}`]));
+  for (const skill of groupSkillNames(groupDir)) desired.set(skill, `/workspace/agent/skills/${skill}`);
+
   for (const entry of fs.readdirSync(skillsDir)) {
     const entryPath = path.join(skillsDir, entry);
     let isSymlink = false;
@@ -111,15 +117,29 @@ function syncCodexSkillLinks(groupDir: string, selectedSkills: string[]): void {
     } catch {
       continue;
     }
-    if (isSymlink && !desired.has(entry)) fs.unlinkSync(entryPath);
+    if (isSymlink && fs.readlinkSync(entryPath) !== desired.get(entry)) fs.unlinkSync(entryPath);
   }
 
-  for (const skill of selectedSkills) {
+  for (const [skill, target] of desired) {
     const linkPath = path.join(skillsDir, skill);
     try {
       fs.lstatSync(linkPath);
     } catch {
-      fs.symlinkSync(`/app/skills/${skill}`, linkPath);
+      fs.symlinkSync(target, linkPath);
     }
   }
+}
+
+/** Real dirs holding a SKILL.md under `<groupDir>/skills/`; links are not followed. */
+function groupSkillNames(groupDir: string): string[] {
+  const root = path.join(groupDir, 'skills');
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(root, entry.name, 'SKILL.md')))
+    .map((entry) => entry.name);
 }

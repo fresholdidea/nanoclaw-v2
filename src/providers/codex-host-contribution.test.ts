@@ -183,6 +183,47 @@ describe('codex host contribution against real core', () => {
     expect(fs.lstatSync(mirrored).isSymbolicLink()).toBe(false);
   });
 
+  it("links the group's own skills into .agents/skills, ahead of a same-named shared skill", async () => {
+    const ag = group('ag-codex-local', 'codex-local-group');
+    await createAgentGroup(ag);
+    await ensureContainerConfig(ag.id);
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    for (const name of ['meeting-prep', 'shared-too']) {
+      fs.mkdirSync(path.join(groupDir, 'skills', name), { recursive: true });
+      fs.writeFileSync(path.join(groupDir, 'skills', name, 'SKILL.md'), `---\nname: ${name}\n---\n`);
+    }
+    fs.mkdirSync(path.join(groupDir, 'skills', 'notes')); // no SKILL.md: not a skill
+    const skillsDir = path.join(groupDir, '.agents', 'skills');
+    fs.mkdirSync(skillsDir, { recursive: true });
+    fs.symlinkSync('/app/skills/shared-too', path.join(skillsDir, 'shared-too')); // a previous spawn's shared link
+
+    const contributionFn = getProviderContainerConfig('codex');
+    await contributionFn!({
+      sessionDir: path.join(DATA_DIR, 'v2-sessions', ag.id, 'session-1'),
+      agentGroupId: ag.id,
+      groupDir,
+      selectedSkills: ['shared-too', 'welcome'],
+      hostEnv: process.env,
+    });
+
+    const link = (name: string) => fs.readlinkSync(path.join(skillsDir, name));
+    expect(link('meeting-prep')).toBe('/workspace/agent/skills/meeting-prep');
+    expect(link('shared-too')).toBe('/workspace/agent/skills/shared-too');
+    expect(link('welcome')).toBe('/app/skills/welcome');
+    expect(fs.existsSync(path.join(skillsDir, 'notes'))).toBe(false);
+
+    // Removing a group skill drops its link on the next spawn.
+    fs.rmSync(path.join(groupDir, 'skills', 'meeting-prep'), { recursive: true });
+    await contributionFn!({
+      sessionDir: path.join(DATA_DIR, 'v2-sessions', ag.id, 'session-1'),
+      agentGroupId: ag.id,
+      groupDir,
+      selectedSkills: ['welcome'],
+      hostEnv: process.env,
+    });
+    expect(fs.readdirSync(skillsDir).sort()).toEqual(['shared-too', 'welcome']);
+  });
+
   newCoreIt('lets new core realize declared surfaces without legacy duplicates', async () => {
     const ag = group('ag-codex-contract', 'codex-contract-group');
     await createAgentGroup(ag);
