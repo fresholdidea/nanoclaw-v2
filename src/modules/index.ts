@@ -24,6 +24,7 @@ import './interactive/index.js';
 import './permissions/index.js';
 import './agent-to-agent/index.js';
 import './self-mod/index.js';
+import './gemini-broker/index.js';
 import './community-portal/index.js';
 import './slack-room-membership/index.js';
 import './canvas-actions/index.js';

@@ -11,6 +11,7 @@ import './agents.js';
 import './self-mod.js';
 import './canvas.js';
 import './rooms.js';
+import './gemini.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import '../modules/index.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
