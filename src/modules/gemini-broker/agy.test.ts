@@ -3,12 +3,19 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { parseAgyOutput, prepareBrokerHome, pruneConversations, runAgy } from './agy.js';
+import { leaksSecret, parseAgyOutput, prepareBrokerHome, runAgy, scrubBrokerHome, tokenSecrets } from './agy.js';
 import { type BrokerConfig, loadBrokerConfig } from './config.js';
 import { BrokerError } from './paths.js';
 
 let root: string;
 let cfg: BrokerConfig;
+const TOKEN = JSON.stringify({
+  token: {
+    access_token: 'ya29.ACCESS-TOKEN-VALUE-0123456789abcdef',
+    refresh_token: '1//REFRESH-TOKEN-VALUE-0123456789',
+  },
+  auth_method: 'personal',
+});
 
 function fakeAgy(body: string): string {
   const bin = path.join(root, 'fake-agy');
@@ -16,10 +23,14 @@ function fakeAgy(body: string): string {
   return bin;
 }
 
+function agyDir(): string {
+  return path.join(cfg.homeDir, '.gemini', 'antigravity-cli');
+}
+
 beforeEach(() => {
   root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-agy-')));
   const stateDir = path.join(root, 'state');
-  fs.writeFileSync(path.join(root, 'token'), 'fake-token');
+  fs.writeFileSync(path.join(root, 'token'), TOKEN);
   cfg = {
     ...loadBrokerConfig({ GEMINI_BROKER_SOURCE_TOKEN: path.join(root, 'token') }),
     stateDir,
@@ -33,8 +44,7 @@ afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 describe('prepareBrokerHome', () => {
   it('writes deny-all rules and copies the token with tight modes', () => {
     prepareBrokerHome(cfg);
-    const dir = path.join(cfg.homeDir, '.gemini', 'antigravity-cli');
-    const settings = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf-8'));
+    const settings = JSON.parse(fs.readFileSync(path.join(agyDir(), 'settings.json'), 'utf-8'));
     expect(settings.permissions.deny).toEqual([
       'command(*)',
       'mcp(*)',
@@ -42,14 +52,14 @@ describe('prepareBrokerHome', () => {
       'execute_url(*)',
       'write_file(*)',
     ]);
-    expect(fs.readFileSync(path.join(dir, 'antigravity-oauth-token'), 'utf-8')).toBe('fake-token');
-    expect(fs.statSync(path.join(dir, 'antigravity-oauth-token')).mode & 0o777).toBe(0o600);
+    expect(fs.readFileSync(path.join(agyDir(), 'antigravity-oauth-token'), 'utf-8')).toBe(TOKEN);
+    expect(fs.statSync(path.join(agyDir(), 'antigravity-oauth-token')).mode & 0o777).toBe(0o600);
     expect(fs.statSync(cfg.homeDir).mode & 0o777).toBe(0o700);
   });
 
   it('keeps a refreshed copy until the source sign-in is newer', () => {
     prepareBrokerHome(cfg);
-    const copy = path.join(cfg.homeDir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+    const copy = path.join(agyDir(), 'antigravity-oauth-token');
     fs.writeFileSync(copy, 'refreshed-by-agy');
     prepareBrokerHome(cfg);
     expect(fs.readFileSync(copy, 'utf-8')).toBe('refreshed-by-agy');
@@ -63,6 +73,32 @@ describe('prepareBrokerHome', () => {
   it('explains a missing sign-in', () => {
     fs.rmSync(path.join(root, 'token'));
     expect(() => prepareBrokerHome(cfg)).toThrow(/not signed in/);
+  });
+});
+
+describe('scrubBrokerHome', () => {
+  it("removes everything a run left behind but the token and agy's binaries", () => {
+    prepareBrokerHome(cfg);
+    for (const d of ['conversations', 'brain', 'knowledge', 'bin', 'builtin']) fs.mkdirSync(path.join(agyDir(), d));
+    fs.writeFileSync(path.join(agyDir(), 'conversations', 'c1.db'), 'client content');
+    fs.writeFileSync(path.join(agyDir(), 'conversation_summaries.db'), 'summaries');
+    fs.writeFileSync(path.join(cfg.homeDir, '.gemini', 'GEMINI.md'), 'remember: ...');
+    fs.writeFileSync(path.join(cfg.homeDir, 'stray.txt'), 'x');
+    scrubBrokerHome(cfg);
+    expect(fs.readdirSync(agyDir()).sort()).toEqual(['antigravity-oauth-token', 'bin', 'builtin']);
+    expect(fs.readdirSync(path.join(cfg.homeDir, '.gemini'))).toEqual(['antigravity-cli']);
+    expect(fs.readdirSync(cfg.homeDir)).toEqual(['.gemini']);
+  });
+});
+
+describe('token leak check', () => {
+  it('finds the token, or a long piece of it, in an answer', () => {
+    prepareBrokerHome(cfg);
+    const secrets = tokenSecrets(cfg);
+    expect(secrets).toContain('ya29.ACCESS-TOKEN-VALUE-0123456789abcdef');
+    expect(leaksSecret('Here: 1//REFRESH-TOKEN-VALUE-0123456789', secrets)).toBe(true);
+    expect(leaksSecret('partial ACCESS-TOKEN-VALUE-0123456789abc leak', secrets)).toBe(true);
+    expect(leaksSecret('An ordinary answer about tokens and OAuth.', secrets)).toBe(false);
   });
 });
 
@@ -98,13 +134,13 @@ describe('runAgy', () => {
   it('runs with the isolated HOME, a bare env, the sandbox and the model', async () => {
     const log = path.join(root, 'argv.log');
     cfg.agyBin = fakeAgy(
-      `printf '%s\\n' "HOME=$HOME" "PWD=$PWD" "SECRET=$ANTHROPIC_API_KEY" "$@" > '${log}'\necho '{"status":"SUCCESS","response":"ok","usage":{"input_tokens":5}}'`,
+      `printf '%s\\n' "HOME=$HOME" "PWD=$PWD" "SECRET=$ANTHROPIC_API_KEY" "$@" > '${log}'\necho '{"status":"SUCCESS","response":"ok ✓","usage":{"input_tokens":5}}'`,
     );
     process.env.ANTHROPIC_API_KEY = 'must-not-leak';
     try {
       const work = fs.mkdtempSync(path.join(root, 'work-'));
       const result = await runAgy(cfg, { cwd: work, prompt: 'Question?', model: 'gemini-3.8-flash-high' });
-      expect(result.response).toBe('ok');
+      expect(result.response).toBe('ok ✓');
       const lines = fs.readFileSync(log, 'utf-8').split('\n');
       expect(lines).toContain(`HOME=${cfg.homeDir}`);
       expect(lines).toContain(`PWD=${work}`);
@@ -134,23 +170,25 @@ describe('runAgy', () => {
     await expect(runAgy(cfg, { cwd: root, prompt: 'q', model: 'm' })).rejects.toThrow(/not installed/);
   });
 
-  it('kills the child on abort', async () => {
-    cfg.agyBin = fakeAgy('sleep 30');
+  it('kills the whole process group on abort and settles only after it exits', async () => {
+    const pidFile = path.join(root, 'child.pid');
+    cfg.agyBin = fakeAgy(`sleep 30 &\necho $! > '${pidFile}'\nwait`);
     const controller = new AbortController();
     const run = runAgy(cfg, { cwd: root, prompt: 'q', model: 'm', signal: controller.signal });
-    setTimeout(() => controller.abort(), 100);
+    for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 20));
+    controller.abort();
     await expect(run).rejects.toThrow(/shut down/);
-  });
-});
-
-describe('pruneConversations', () => {
-  it('removes this run and anything older than a day, keeps the rest', () => {
-    const conv = path.join(cfg.homeDir, '.gemini', 'antigravity-cli', 'conversations');
-    fs.mkdirSync(conv, { recursive: true });
-    for (const n of ['c1.db', 'c2.db', 'old.db']) fs.writeFileSync(path.join(conv, n), 'x');
-    const old = new Date(Date.now() - 2 * 24 * 3600 * 1000);
-    fs.utimesSync(path.join(conv, 'old.db'), old, old);
-    pruneConversations(cfg, 'c1');
-    expect(fs.readdirSync(conv)).toEqual(['c2.db']);
+    const helper = Number(fs.readFileSync(pidFile, 'utf-8').trim());
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i++) {
+      try {
+        process.kill(helper, 0);
+        await new Promise((r) => setTimeout(r, 20));
+        // eslint-disable-next-line no-catch-all/no-catch-all -- ESRCH is the signal that the helper is gone
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
   });
 });

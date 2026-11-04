@@ -6,16 +6,23 @@
  * allows non-workspace reads. A document with planted instructions must not
  * be able to reach any of that, so every run gets:
  *
- *   - its own HOME (data/gemini-broker/home), holding only a copy of the
- *     sign-in token and a settings.json that denies commands, MCP, URL
- *     reads/actuation and every file write; agy auto-denies anything that
- *     would need an interactive approval, so non-workspace reads fail too;
+ *   - its own HOME (data/gemini-broker/home), scrubbed before and after each
+ *     run down to a copy of the sign-in token and agy's own binaries, with a
+ *     settings.json that denies commands, MCP, URL reads/actuation and every
+ *     file write; agy auto-denies anything that would need an interactive
+ *     approval, so non-workspace reads fail too, and nothing one group's run
+ *     leaves behind (conversations, memories) reaches the next;
  *   - a fresh workspace under the OS temp dir with only the requested files,
  *     so no `.git` ancestor turns the NanoClaw checkout into its workspace;
- *   - `--sandbox` and `--disable-slash-commands`, a bare PATH and env.
+ *   - `--sandbox` and `--disable-slash-commands` (which also keeps the browser
+ *     off), a bare PATH and env, and its own process group so a shutdown or
+ *     timeout kills the whole tree.
  *
- * Verified 2026-11-04 against agy 1.1.13: `whoami`/`curl` and outside reads
- * are refused; Google search grounding still works (it is server-side).
+ * Verified 2026-11-04 against agy 1.1.13: `whoami`, `curl`, `ls`/`grep`
+ * outside the workspace and outside reads are refused; the browser is off;
+ * Google search grounding still works (it is server-side); the refresh token
+ * does not rotate, so the broker's copy and the operator's never invalidate
+ * each other.
  */
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -26,34 +33,50 @@ import type { BrokerConfig } from './config.js';
 import { BrokerError } from './paths.js';
 
 const DENY_RULES = ['command(*)', 'mcp(*)', 'read_url(*)', 'execute_url(*)', 'write_file(*)'];
-
-/** Per-conversation artifacts agy keeps in its home; they hold request content. */
-const CONVERSATION_DIRS = ['conversations', 'annotations', 'presence', 'brain'];
+const TOKEN_FILE = 'antigravity-oauth-token';
+/** What survives a scrub: the token copy and agy's own binaries and update state. */
+const KEEP = new Set([TOKEN_FILE, 'bin', 'builtin', 'updater', 'installation_id']);
 
 function agyStateDir(cfg: BrokerConfig): string {
   return path.join(cfg.homeDir, '.gemini', 'antigravity-cli');
 }
 
+function removeAllExcept(dir: string, keep: ReadonlySet<string>): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+  for (const name of entries) {
+    if (!keep.has(name)) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+  }
+}
+
+/** Delete everything agy wrote outside its token and binaries: conversations, caches, memories, logs. */
+export function scrubBrokerHome(cfg: BrokerConfig): void {
+  removeAllExcept(cfg.homeDir, new Set(['.gemini']));
+  removeAllExcept(path.join(cfg.homeDir, '.gemini'), new Set(['antigravity-cli']));
+  removeAllExcept(agyStateDir(cfg), KEEP);
+}
+
 /**
- * Create the isolated HOME, (re)write its deny rules, and refresh the token
- * copy when Brad's interactive sign-in is newer. agy rewrites settings.json
- * on start, so the rules are written before every run.
+ * Create the isolated HOME, scrub it, (re)write its deny rules, and refresh
+ * the token copy when Brad's interactive sign-in is newer.
  */
 export function prepareBrokerHome(cfg: BrokerConfig): void {
   const stateDir = agyStateDir(cfg);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(cfg.homeDir, 0o700);
+  scrubBrokerHome(cfg);
 
   const settings = { allowNonWorkspaceAccess: false, permissions: { allow: [], ask: [], deny: DENY_RULES } };
   fs.writeFileSync(path.join(stateDir, 'settings.json'), JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 });
 
   const source = fs.statSync(cfg.sourceTokenPath, { throwIfNoEntry: false });
-  if (!source) {
-    throw new BrokerError(
-      'the host is not signed in to Antigravity (no ~/.gemini/antigravity-cli/antigravity-oauth-token); Brad needs to run `agy` once on the Mac and sign in',
-    );
-  }
-  const target = path.join(stateDir, 'antigravity-oauth-token');
+  if (!source) throw new BrokerError(notSignedIn());
+  const target = path.join(stateDir, TOKEN_FILE);
   const current = fs.statSync(target, { throwIfNoEntry: false });
   if (!current || source.mtimeMs > current.mtimeMs) {
     fs.copyFileSync(cfg.sourceTokenPath, target);
@@ -61,25 +84,40 @@ export function prepareBrokerHome(cfg: BrokerConfig): void {
   }
 }
 
-/** Remove one run's conversation artifacts, plus any leftovers older than a day. */
-export function pruneConversations(cfg: BrokerConfig, conversationId: string | undefined, now = Date.now()): void {
-  const stateDir = agyStateDir(cfg);
-  for (const dir of CONVERSATION_DIRS) {
-    const full = path.join(stateDir, dir);
-    let entries: string[];
+export function notSignedIn(): string {
+  return 'the host is not signed in to Antigravity (no ~/.gemini/antigravity-cli/antigravity-oauth-token); Brad needs to run `agy` once on the Mac and sign in';
+}
+
+/**
+ * Secret strings in the sign-in token files (the operator's and the
+ * broker's copy). An answer that contains one is withheld: the token sits in
+ * agy's HOME, and only agy's own workspace rule keeps Gemini from reading it.
+ */
+export function tokenSecrets(cfg: BrokerConfig): string[] {
+  const out = new Set<string>();
+  for (const file of [cfg.sourceTokenPath, path.join(agyStateDir(cfg), TOKEN_FILE)]) {
+    let parsed: unknown;
     try {
-      entries = fs.readdirSync(full);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
-      throw err;
+      parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      // eslint-disable-next-line no-catch-all/no-catch-all -- a missing or unparsable file contributes nothing
+    } catch {
+      continue;
     }
-    for (const name of entries) {
-      const entryPath = path.join(full, name);
-      const mine = conversationId !== undefined && name.startsWith(conversationId);
-      const stale = (fs.lstatSync(entryPath, { throwIfNoEntry: false })?.mtimeMs ?? now) < now - 24 * 3600 * 1000;
-      if (mine || stale) fs.rmSync(entryPath, { recursive: true, force: true });
-    }
+    const walk = (v: unknown): void => {
+      if (typeof v === 'string' && v.length >= 24) out.add(v);
+      else if (v && typeof v === 'object') Object.values(v).forEach(walk);
+    };
+    walk(parsed);
   }
+  return [...out];
+}
+
+/** True if `text` contains any secret, or a 24-character stretch of one. */
+export function leaksSecret(text: string, secrets: readonly string[]): boolean {
+  return secrets.some((s) => {
+    for (let i = 0; i + 24 <= s.length; i += 12) if (text.includes(s.slice(i, i + 24))) return true;
+    return false;
+  });
 }
 
 export interface AgyResult {
@@ -114,6 +152,9 @@ export function parseAgyOutput(stdout: string): AgyResult {
   };
 }
 
+/** Thrown when agy produced no answer at all: the request never reached Gemini, so it is refunded. */
+export class AgyNoOutputError extends BrokerError {}
+
 const AUTH_HINT = /(sign[ -]?in|log[ -]?in|authenticat|oauth|unauthori[sz]ed|invalid_grant|credential)/i;
 
 function tail(text: string, max = 400): string {
@@ -128,7 +169,7 @@ export interface RunAgyOptions {
   signal?: AbortSignal;
 }
 
-/** Spawn agy once. Resolves with the parsed result; rejects with a BrokerError. */
+/** Spawn agy once. Resolves with the parsed result; rejects with a BrokerError once the process tree has exited. */
 export function runAgy(cfg: BrokerConfig, opts: RunAgyOptions): Promise<AgyResult> {
   const args = [
     '-p',
@@ -151,46 +192,65 @@ export function runAgy(cfg: BrokerConfig, opts: RunAgyOptions): Promise<AgyResul
   };
 
   return new Promise((resolve, reject) => {
-    const child = spawn(cfg.agyBin, args, { cwd: opts.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Own process group: a kill reaches agy's helpers too.
+    const child = spawn(cfg.agyBin, args, { cwd: opts.cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     let stdout = '';
     let stderr = '';
+    let stopReason: string | null = null;
     let settled = false;
+    let killTimer: NodeJS.Timeout | undefined;
+    let giveUpTimer: NodeJS.Timeout | undefined;
+
+    const killGroup = (signal: NodeJS.Signals) => {
+      if (child.pid === undefined) return;
+      try {
+        process.kill(-child.pid, signal);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- the group may already be gone
+      } catch {
+        child.kill(signal);
+      }
+    };
+    const stop = (reason: string) => {
+      if (stopReason) return;
+      stopReason = reason;
+      killGroup('SIGTERM');
+      killTimer = setTimeout(() => {
+        killGroup('SIGKILL');
+        // Settle even if 'close' never fires, so the worker cannot hang.
+        giveUpTimer = setTimeout(() => finish(() => reject(new AgyNoOutputError(reason))), 5_000);
+      }, 5_000);
+    };
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(hardStop);
+      if (killTimer) clearTimeout(killTimer);
+      if (giveUpTimer) clearTimeout(giveUpTimer);
       opts.signal?.removeEventListener('abort', onAbort);
       fn();
     };
-    const kill = () => {
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 10_000).unref();
-    };
     // agy enforces --print-timeout itself; this is the backstop for a hang.
     const hardStop = setTimeout(
-      () => {
-        kill();
-        finish(() => reject(new BrokerError(`Gemini did not finish within ${cfg.timeoutSec + 60}s`)));
-      },
+      () => stop(`Gemini did not finish within ${cfg.timeoutSec + 60}s`),
       (cfg.timeoutSec + 60) * 1000,
     );
-    const onAbort = () => {
-      kill();
-      finish(() => reject(new BrokerError('the host shut down while Gemini was running')));
-    };
-    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    const onAbort = () => stop('the host shut down while Gemini was running');
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener('abort', onAbort, { once: true });
 
-    child.stdout.on('data', (chunk: Buffer) => {
-      if (stdout.length < 8 * 1024 * 1024) stdout += chunk.toString('utf-8');
+    child.stdout.on('data', (chunk: string) => {
+      if (stdout.length < 8 * 1024 * 1024) stdout += chunk;
     });
-    child.stderr.on('data', (chunk: Buffer) => {
-      if (stderr.length < 64 * 1024) stderr += chunk.toString('utf-8');
+    child.stderr.on('data', (chunk: string) => {
+      if (stderr.length < 64 * 1024) stderr += chunk;
     });
     child.on('error', (err) => {
       const code = (err as NodeJS.ErrnoException).code;
       finish(() =>
         reject(
-          new BrokerError(
+          new AgyNoOutputError(
             code === 'ENOENT'
               ? `agy is not installed at ${cfg.agyBin} on the host`
               : `agy could not start (${code ?? err.message})`,
@@ -200,18 +260,16 @@ export function runAgy(cfg: BrokerConfig, opts: RunAgyOptions): Promise<AgyResul
     });
     child.on('close', (code) => {
       finish(() => {
+        if (stopReason) return reject(new AgyNoOutputError(stopReason));
         if (stdout.trim() === '') {
           const detail = tail(stderr) || `exit code ${code}`;
-          if (AUTH_HINT.test(stderr)) {
-            reject(
-              new BrokerError(
-                `the host's Antigravity sign-in has expired or was refused; Brad needs to run \`agy\` once on the Mac and sign in (${detail})`,
-              ),
-            );
-          } else {
-            reject(new BrokerError(`Gemini produced no answer (${detail})`));
-          }
-          return;
+          return reject(
+            new AgyNoOutputError(
+              AUTH_HINT.test(stderr)
+                ? `the host's Antigravity sign-in has expired or was refused; Brad needs to run \`agy\` once on the Mac and sign in (${detail})`
+                : `Gemini produced no answer (${detail})`,
+            ),
+          );
         }
         try {
           resolve(parseAgyOutput(stdout));

@@ -8,7 +8,9 @@ import {
   BrokerError,
   buildMountTable,
   deniedReason,
+  ensurePrivateDir,
   resolveContainerPath,
+  secretInContent,
   snapshotFile,
   workspaceName,
 } from './paths.js';
@@ -22,10 +24,19 @@ let outside: string;
 let dst: AnchoredDir;
 
 function table() {
-  return buildMountTable(groupDir, sessDir, [
-    { hostPath: vault, containerPath: '/workspace/extra/obsidian' },
-    { hostPath: empty, containerPath: '/workspace/extra/obsidian/.obsidian' },
-  ]);
+  return buildMountTable(
+    groupDir,
+    sessDir,
+    [
+      { hostPath: vault, containerPath: 'obsidian' },
+      { hostPath: empty, containerPath: 'obsidian/.obsidian/' },
+    ],
+    [
+      { hostPath: vault, containerPath: '/workspace/extra/obsidian' },
+      // Docker cleans the trailing slash; the broker must match it to keep the mask.
+      { hostPath: empty, containerPath: '/workspace/extra/obsidian/.obsidian/' },
+    ],
+  );
 }
 
 function copy(containerPath: string, limit = 1024 * 1024): number {
@@ -77,10 +88,37 @@ describe('resolveContainerPath', () => {
     expect(resolveContainerPath(table(), '/workspace/extra/obsidian/notes/a.md').entry.hostRoot).toBe(vault);
   });
 
-  it('uses the longest mount, so a mask wins over its parent', () => {
+  it('uses the longest mount, so a mask wins over its parent even with a trailing slash', () => {
     expect(resolveContainerPath(table(), '/workspace/extra/obsidian/.obsidian/workspace.json').entry.hostRoot).toBe(
       empty,
     );
+  });
+
+  it('refuses everything under a configured mount that no longer validates', () => {
+    const t = buildMountTable(
+      groupDir,
+      sessDir,
+      [
+        { hostPath: vault, containerPath: 'obsidian' },
+        { hostPath: path.join(root, 'gone'), containerPath: 'obsidian/.obsidian' },
+      ],
+      [{ hostPath: vault, containerPath: '/workspace/extra/obsidian' }],
+    );
+    expect(() => resolveContainerPath(t, '/workspace/extra/obsidian/.obsidian/plugins/x/data.json')).toThrow(
+      /failed validation/,
+    );
+    expect(resolveContainerPath(t, '/workspace/extra/obsidian/notes/a.md').entry.hostRoot).toBe(vault);
+  });
+
+  it('refuses a mount whose host path resolves through a symlink', () => {
+    fs.symlinkSync(outside, path.join(vault, 'swapped'));
+    const t = buildMountTable(
+      groupDir,
+      sessDir,
+      [{ hostPath: path.join(vault, 'swapped'), containerPath: 'nested' }],
+      [{ hostPath: outside, containerPath: '/workspace/extra/nested' }],
+    );
+    expect(() => resolveContainerPath(t, '/workspace/extra/nested/private.txt')).toThrow(/symlink/);
   });
 
   it('refuses paths outside every mount, relative or unnormalized paths, and mount points', () => {
@@ -99,23 +137,55 @@ describe('resolveContainerPath', () => {
     }
   });
 
-  it('refuses credential paths the container can read', () => {
-    expect(deniedReason(['workspace', 'extra', 'gws-config', 'accounts', 'brad.json'])).toMatch(/credentials/);
+  it('refuses credential paths the container can read, by name, directory or host root', () => {
+    for (const parts of [
+      ['workspace', 'extra', 'gws-config', 'accounts', 'brad.json'],
+      ['workspace', 'extra', 'google-ads-tokens', 'oauth.json'],
+      ['workspace', 'agent', '.git', 'config'],
+      ['workspace', 'agent', '.config', 'gh', 'hosts.yml'],
+    ]) {
+      expect(deniedReason(parts), parts.join('/')).toMatch(/credentials or tool state/);
+    }
+    expect(deniedReason(['workspace', 'extra', 'gws', 'accounts', 'x.json'], '/Users/me/.config/gws')).not.toBeNull();
     for (const name of [
       '.env',
       '.env.local',
+      'prod.env',
+      '.envrc',
       'client_secret.json',
+      'client_secret_123-abc.apps.googleusercontent.com.json',
       'credentials.json',
+      'credentials.json.tmp',
+      'token.json.bak',
+      'gcp-sa-key.json',
       'id_ed25519',
       'server.pem',
       'oauth_creds.json',
       'antigravity-oauth-token',
+      'secrets.txt',
     ]) {
       expect(deniedReason(['workspace', 'agent', name]), name).not.toBeNull();
     }
-    for (const name of ['token-economy.md', 'meeting-notes.md', 'secretary.md', 'Q3 credentials review notes.md']) {
+    for (const name of [
+      'token-economy.md',
+      'design-tokens.md',
+      'openai-usage-tokens.csv',
+      'handling-secrets.md',
+      'meeting-notes.md',
+      'secretary.md',
+      'Q3 credentials review notes.md',
+    ]) {
       expect(deniedReason(['workspace', 'agent', name]), name).toBeNull();
     }
+  });
+});
+
+describe('secretInContent', () => {
+  it('spots credentials copied to an innocent name, and leaves prose alone', () => {
+    expect(secretInContent(Buffer.from('{"refresh_token": "1//0abcdefghijklmnopqrstuvwxyz"}'))).toMatch(/refresh/);
+    expect(secretInContent(Buffer.from('-----BEGIN OPENSSH PRIVATE KEY-----\nabc'))).toMatch(/private key/);
+    expect(secretInContent(Buffer.from('Bearer ya29.a0AfH6SMBxxxxxxxxxxxxxxxxxxxxxxxx'))).toMatch(/Google/);
+    expect(secretInContent(Buffer.from('We rotated the refresh_token policy and the client_secret docs.'))).toBeNull();
   });
 });
 
@@ -145,11 +215,34 @@ describe('snapshotFile', () => {
     expect(() => copy('/workspace/inbox/msg-2/private.txt')).toThrow(/symlink|real path/);
   });
 
+  it('refuses a file whose contents are a credential, and removes the copy', () => {
+    fs.writeFileSync(path.join(groupDir, 'notes-backup.md'), '{"client_secret": "GOCSPX-abcdefghijklmnop"}');
+    expect(() => copy('/workspace/agent/notes-backup.md')).toThrow(/credentials to Google/);
+    expect(fs.readdirSync(path.join(root, 'work'))).toEqual([]);
+  });
+
   it('refuses missing files, directories and files over the limit', () => {
     expect(() => copy('/workspace/agent/missing.md')).toThrow(/does not exist/);
     fs.mkdirSync(path.join(groupDir, 'dir'));
     expect(() => copy('/workspace/agent/dir')).toThrow(BrokerError);
     expect(() => copy('/workspace/agent/note.md', 4)).toThrow(/limit/);
+  });
+});
+
+describe('ensurePrivateDir', () => {
+  it('creates a 0700 directory and tightens a loose one', () => {
+    const dir = path.join(root, 'private');
+    ensurePrivateDir(dir);
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    fs.chmodSync(dir, 0o755);
+    ensurePrivateDir(dir);
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+  });
+
+  it('refuses a pre-planted symlink', () => {
+    const link = path.join(root, 'planted');
+    fs.symlinkSync(outside, link);
+    expect(() => ensurePrivateDir(link)).toThrow(/not a real directory/);
   });
 });
 
