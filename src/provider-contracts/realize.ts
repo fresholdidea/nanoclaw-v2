@@ -147,7 +147,17 @@ export async function realizeProviderSpawnSurfaces(
     // inside a writable mount, so it is a segment here, not the root.
     const anchorRoot = skillBackingAnchorRoot(backing.location, volumes, agentGroupId, groupDir, sessionDirectory);
     const segments = segmentsWithinRoot(anchorRoot, skillsPath);
-    const linked = syncSharedSkillLinks(anchorRoot, segments, selectedSkills, backing.conflictDiagnostics === 'warn');
+    // A backing inside the group folder is not where the group's own skills
+    // live (groups/<folder>/skills/, reached by the agent at
+    // /workspace/agent/skills), so link those in beside the shared ones.
+    const localSkills = backing.location.kind === 'group-directory' ? groupLocalSkillNames(groupDir) : [];
+    const linked = syncSharedSkillLinks(
+      anchorRoot,
+      segments,
+      selectedSkills,
+      backing.conflictDiagnostics === 'warn',
+      localSkills,
+    );
     if (linked && backing.templateCopies === 'copy') {
       materializeTemplateSkills(agentGroupId, anchorRoot, segments);
     }
@@ -327,6 +337,7 @@ export function syncSharedSkillLinks(
   segments: readonly string[],
   desiredSkills: readonly string[],
   warnOnConflict: boolean,
+  localSkills: readonly string[] = [],
 ): boolean {
   const skillsPath = path.join(root, ...segments);
   let skillsDir: AnchoredDir | null;
@@ -339,7 +350,9 @@ export function syncSharedSkillLinks(
   if (!skillsDir) return false;
 
   try {
-    const desired = new Set(desiredSkills);
+    // A group's own skill wins over a shared skill of the same name.
+    const desired = new Map(desiredSkills.map((skill) => [skill, `/app/skills/${skill}`]));
+    for (const skill of localSkills) desired.set(skill, `/workspace/agent/skills/${skill}`);
     for (const entry of skillsDir.entries()) {
       let isSymlink = false;
       try {
@@ -347,10 +360,10 @@ export function syncSharedSkillLinks(
       } catch {
         continue;
       }
-      if (isSymlink && !desired.has(entry)) skillsDir.unlink(entry);
+      if (isSymlink && skillsDir.readlink(entry) !== desired.get(entry)) skillsDir.unlink(entry);
     }
 
-    for (const skill of desiredSkills) {
+    for (const [skill, target] of desired) {
       let entry: fs.Stats | undefined;
       try {
         entry = skillsDir.lstat(skill);
@@ -358,7 +371,7 @@ export function syncSharedSkillLinks(
         /* missing */
       }
       if (!entry) {
-        skillsDir.symlink(`/app/skills/${skill}`, skill);
+        skillsDir.symlink(target, skill);
       } else if (!entry.isSymbolicLink() && warnOnConflict) {
         log.warn(
           'Shared skill not symlinked: real entry occupies the path (template overlay or stale pre-refactor copy)',
@@ -370,6 +383,40 @@ export function syncSharedSkillLinks(
     skillsDir.close();
   }
   return true;
+}
+
+/**
+ * The group's own skills: real dirs holding a regular SKILL.md under
+ * `<groupDir>/skills/`. That tree is agent-writable, so it is walked by
+ * descriptor and a symlink anywhere in it is skipped, never followed.
+ */
+function groupLocalSkillNames(groupDir: string): string[] {
+  let skillsDir: AnchoredDir | null;
+  try {
+    skillsDir = AnchoredDir.open(groupDir, ['skills']);
+  } catch (err) {
+    log.warn('Group skills not linked: unsafe skills directory', { path: path.join(groupDir, 'skills'), err });
+    return [];
+  }
+  if (!skillsDir) return [];
+  try {
+    return skillsDir.entries().filter((name) => {
+      try {
+        if (!skillsDir.lstat(name).isDirectory()) return false;
+        const skill = skillsDir.openDir(name);
+        if (!skill) return false;
+        try {
+          return skill.lstat('SKILL.md').isFile();
+        } finally {
+          skill.close();
+        }
+      } catch {
+        return false;
+      }
+    });
+  } finally {
+    skillsDir.close();
+  }
 }
 
 /** `directory` as path segments below `root`; throws if it lexically escapes. */

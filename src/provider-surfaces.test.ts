@@ -635,6 +635,43 @@ describe('derived provider spawn surfaces', () => {
     expect(realized.contribution).toEqual({ env: { COMPAT: 'yes' } });
   });
 
+  it("links a group-directory backing to the group's own skills, ahead of shared ones", async () => {
+    const contract = backingContract({
+      id: 'skills',
+      location: { kind: 'group-directory', directory: '.agents', subdirectory: '' },
+      skillsSubdirectory: 'skills',
+      conflictDiagnostics: 'silent',
+      templateCopies: 'in-place',
+    });
+    const groupDir = path.join(TEST_ROOT, 'local-skills');
+    for (const name of ['meeting-prep', 'welcome']) {
+      fs.mkdirSync(path.join(groupDir, 'skills', name), { recursive: true });
+      fs.writeFileSync(path.join(groupDir, 'skills', name, 'SKILL.md'), `---\nname: ${name}\n---\n`);
+    }
+    fs.mkdirSync(path.join(groupDir, 'skills', 'notes')); // no SKILL.md: not a skill
+    fs.symlinkSync('/etc', path.join(groupDir, 'skills', 'planted')); // never followed
+    const skillsDir = path.join(groupDir, '.agents', 'skills');
+    fs.mkdirSync(skillsDir, { recursive: true });
+    fs.symlinkSync('/app/skills/welcome', path.join(skillsDir, 'welcome')); // an earlier spawn's shared link
+    const realize = (selected: string[]) =>
+      realizeProviderSpawnSurfaces('local', contract, 'group', groupDir, DATA_DIR, selected, {
+        legacyOverlay: async () => ({}),
+        composeProjectDocument: async () => {},
+      });
+
+    await realize(['welcome', 'agent-browser']);
+    const link = (name: string) => fs.readlinkSync(path.join(skillsDir, name));
+    expect(link('meeting-prep')).toBe('/workspace/agent/skills/meeting-prep');
+    expect(link('welcome')).toBe('/workspace/agent/skills/welcome');
+    expect(link('agent-browser')).toBe('/app/skills/agent-browser');
+    expect(fs.readdirSync(skillsDir).sort()).toEqual(['agent-browser', 'meeting-prep', 'welcome']);
+
+    // A group skill that is removed loses its link on the next spawn.
+    fs.rmSync(path.join(groupDir, 'skills', 'meeting-prep'), { recursive: true });
+    await realize(['agent-browser']);
+    expect(fs.readdirSync(skillsDir).sort()).toEqual(['agent-browser', 'welcome']);
+  });
+
   it('contains raw contract paths if registration validation is bypassed', async () => {
     const contract = backingContract({
       id: 'skills',
