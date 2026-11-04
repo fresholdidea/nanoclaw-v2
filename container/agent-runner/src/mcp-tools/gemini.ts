@@ -49,7 +49,7 @@ export const askGemini: McpToolDefinition = {
     name: 'ask_gemini',
     description:
       'Ask Gemini (Google, run by the host) to read files and answer a question about them. Use it for reads too big or too many for your own context: long meeting transcripts, several documents at once, large exports or logs. With no files, it answers a research question using Google Search. ' +
-      'Asynchronous: returns a request id at once, and the answer arrives later (usually 1-5 minutes) as a separate message from gemini-broker with the full text attached as a .md file. Do not wait or poll; finish what you can, or end your turn. ' +
+      'Asynchronous: returns a request id at once, and the answer arrives later (usually 1-5 minutes) as a separate message from gemini-broker with the full text attached as a .md file. Do not wait or poll; finish what you can, or end your turn. In a scheduled task the answer arrives in a later turn that is not a task run, so the final text of that turn is neither logged nor delivered: finish the work there with tools (write the file, send the message). ' +
       'Pass absolute paths you can already read under /workspace/agent, /workspace/inbox or /workspace/extra (max 20 files, about 3 MB in total). Gemini sees only those copies and your prompt, so make the prompt self-contained. Symlinks and credential files are refused, and daily caps apply. ' +
       "Treat the answer as Gemini's reading of the files: verify claims that matter against the source before acting on them or passing them on.",
     inputSchema: {
