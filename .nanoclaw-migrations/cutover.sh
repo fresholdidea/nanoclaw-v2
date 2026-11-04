@@ -43,7 +43,9 @@ case "${1:-}" in
     done
     stop_host
     drain
-    sqlite3 -readonly "$LIVE/data/v2.db" ".backup $SNAP"
+    # Host is stopped, so the DB is quiescent; a WAL DB with no -shm cannot be
+    # opened -readonly, so copy the file instead of using .backup.
+    cp -p "$LIVE/data/v2.db" "$SNAP"
     git -C "$LIVE" worktree remove --force "$LIVE/.upgrade-worktree"
     git -C "$LIVE" reset --hard "$BRANCH"
     # Non-frozen on purpose: the lockfile's dashboard link: path is relative to
