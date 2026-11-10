@@ -15,6 +15,7 @@ import {
   auxiliaryNetworkArgs,
   dockerEventToSessionEvent,
   ensureDockerRunning,
+  REMOVAL_CONFIRM_TIMEOUT_MS,
 } from './docker-driver.js';
 import { FakeCli } from './fake-cli.js';
 import { withSessionEvents } from './session-events.js';
@@ -834,4 +835,62 @@ it('does not report successful teardown when the Docker daemon refuses removal',
   const handle = await driver().prepare(fixtureSpec());
   cli.responses.unshift({ match: /^(stop|rm|ps) /, throws: new Error('Cannot connect to the Docker daemon') });
   await expect(handle.stop('shutdown')).rejects.toMatchObject({ kind: 'runtime-unavailable' });
+});
+
+describe('teardown of an --rm container the daemon is already removing', () => {
+  const inProgress = () =>
+    Object.assign(new Error('Command failed: docker rm --force agent'), {
+      stderr: 'Error response from daemon: removal of container agent is already in progress',
+    });
+
+  it('waits for the auto-removal to finish instead of reporting a failed stop', async () => {
+    vi.useFakeTimers();
+    try {
+      const handle = await driver().prepare(fixtureSpec());
+      cli.responses.unshift(
+        { match: /^rm --force /, throws: inProgress() },
+        // Still listed for two polls, then gone.
+        { match: /^ps -a /, output: 'agent\n', times: 2 },
+      );
+      const stopped = handle.stop('idle');
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(stopped).resolves.toBeUndefined();
+      expect(cli.joined().filter((c) => c.startsWith('ps -a ')).length).toBe(3);
+      expect(log.warn).not.toHaveBeenCalledWith('Container still present after removal', expect.anything());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('judges any other removal error on one check, without waiting', async () => {
+    const handle = await driver().prepare(fixtureSpec());
+    cli.responses.unshift(
+      { match: /^rm --force /, throws: new Error('Error response from daemon: device or resource busy') },
+      { match: /^ps -a /, output: 'agent\n' },
+    );
+    await expect(handle.stop('idle')).rejects.toMatchObject({ kind: 'unknown' });
+    expect(cli.joined().filter((c) => c.startsWith('ps -a ')).length).toBe(1);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Container still present after removal',
+      expect.objectContaining({ dockerError: expect.stringContaining('resource busy') }),
+    );
+  });
+
+  it('still fails, with the daemon reason logged, when the container never goes away', async () => {
+    vi.useFakeTimers();
+    try {
+      const handle = await driver().prepare(fixtureSpec());
+      cli.responses.unshift({ match: /^rm --force /, throws: inProgress() }, { match: /^ps -a /, output: 'agent\n' });
+      const stopped = handle.stop('idle');
+      const settled = expect(stopped).rejects.toMatchObject({ kind: 'unknown' });
+      await vi.advanceTimersByTimeAsync(REMOVAL_CONFIRM_TIMEOUT_MS + 1_000);
+      await settled;
+      expect(log.warn).toHaveBeenCalledWith(
+        'Container still present after removal',
+        expect.objectContaining({ dockerError: expect.stringContaining('already in progress') }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

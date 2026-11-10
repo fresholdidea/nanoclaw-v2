@@ -609,7 +609,7 @@ class DockerHandle implements SessionHandle {
     try {
       this.cli.run(['rm', '--force', this.name]);
     } catch (error) {
-      this.#confirmRemoved(this.name, error);
+      await this.#confirmRemoved(this.name, error);
     }
     for (const auxiliary of [...this.auxiliaryNames].reverse()) {
       try {
@@ -620,7 +620,7 @@ class DockerHandle implements SessionHandle {
       try {
         this.cli.run(['rm', '--force', auxiliary]);
       } catch (error) {
-        this.#confirmRemoved(auxiliary, error);
+        await this.#confirmRemoved(auxiliary, error);
       }
     }
     if (this.privateNetwork) {
@@ -632,14 +632,36 @@ class DockerHandle implements SessionHandle {
     }
   }
 
-  /** A successful daemon query distinguishes auto-removal from a daemon outage. */
-  #confirmRemoved(name: string, error: unknown): void {
-    try {
-      const remaining = this.cli.run(['ps', '-a', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
+  /**
+   * A successful daemon query distinguishes auto-removal from a daemon outage.
+   *
+   * Session containers are created with `--rm`, so `docker stop` already starts
+   * the daemon's own removal: the `rm --force` that follows can fail ("removal
+   * of container … is already in progress") while `ps -a` still lists the
+   * container for a moment. Only for that error, poll briefly before calling
+   * it a failure; a container still present at the deadline is a real
+   * leftover and throws. Any other error is judged on one check, as before.
+   */
+  async #confirmRemoved(name: string, error: unknown): Promise<void> {
+    const waitForDaemon = REMOVAL_IN_PROGRESS.test(dockerErrorText(error));
+    const deadline = Date.now() + (waitForDaemon ? REMOVAL_CONFIRM_TIMEOUT_MS : 0);
+    for (;;) {
+      let remaining: string;
+      try {
+        remaining = this.cli.run(['ps', '-a', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
+      } catch (probeError) {
+        throw normalizeDockerError(probeError);
+      }
       if (!remaining.trim()) return;
-    } catch (probeError) {
-      throw normalizeDockerError(probeError);
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, REMOVAL_CONFIRM_POLL_MS));
     }
+    // The normalized error is opaque by design; keep the daemon's own words in
+    // the host log so a leftover container can be diagnosed.
+    log.warn('Container still present after removal', {
+      containerName: name,
+      dockerError: dockerErrorText(error),
+    });
     throw normalizeDockerError(error);
   }
 
@@ -855,6 +877,18 @@ export function envArgs(env: Record<string, string>): string[] {
 
 export function labelArgs(labels: Record<string, string>): string[] {
   return Object.entries(labels).flatMap(([k, v]) => ['--label', `${k}=${v}`]);
+}
+
+/** How long teardown waits for Docker's own `--rm` removal to finish. */
+export const REMOVAL_CONFIRM_TIMEOUT_MS = 10_000;
+const REMOVAL_CONFIRM_POLL_MS = 500;
+const REMOVAL_IN_PROGRESS = /removal of container .* is already in progress/i;
+
+/** A CLI failure's stderr (or message), trimmed for a log line. Host log only. */
+function dockerErrorText(error: unknown): string {
+  const stderr = (error as { stderr?: unknown } | null)?.stderr;
+  const text = stderr ? String(stderr) : error instanceof Error ? error.message : String(error);
+  return text.trim().slice(0, 500);
 }
 
 export function normalizeDockerError(error: unknown): Error & SessionFailure {

@@ -49,8 +49,12 @@ export class FakeCli implements Cli {
   readonly calls: FakeCall[] = [];
   readonly started: Array<{ args: string[]; proc: FakeSupervisedProcess; seq: number }> = [];
   #seq = 0;
-  /** Matched in order against the joined argv; first hit wins. */
-  responses: Array<{ match: RegExp; output?: string; throws?: Error | string }> = [];
+  /**
+   * Matched in order against the joined argv; first hit wins. A response with
+   * `times` answers that many calls, then stops matching (a runtime whose
+   * state changes between calls).
+   */
+  responses: Array<{ match: RegExp; output?: string; throws?: Error | string; times?: number }> = [];
 
   constructor(readonly bin = 'fake') {}
 
@@ -59,6 +63,10 @@ export class FakeCli implements Cli {
     const joined = args.join(' ');
     for (const response of this.responses) {
       if (!response.match.test(joined)) continue;
+      if (response.times !== undefined) {
+        if (response.times <= 0) continue;
+        response.times -= 1;
+      }
       if (response.throws) {
         throw response.throws instanceof Error ? response.throws : new Error(response.throws);
       }
