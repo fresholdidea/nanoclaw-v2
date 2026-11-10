@@ -65,7 +65,12 @@ vi.mock('../env.js', () => ({
   }),
 }));
 
-import { contributionFromConfig, grantProviderCredentials, withProviderEnv } from './onecli.js';
+import {
+  contributionFromConfig,
+  grantProviderCredentials,
+  HEALTH_FAILURES_BEFORE_UNAVAILABLE,
+  withProviderEnv,
+} from './onecli.js';
 import { recordProviderCredentials } from './onecli-provider-credentials.js';
 import { log } from '../log.js';
 import { getGatewayProviderRegistration } from './gateway-provider-registry.js';
@@ -842,13 +847,43 @@ describe('OneCLI gateway package', () => {
     second.onUnavailable?.(unavailable);
 
     expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000 * (HEALTH_FAILURES_BEFORE_UNAVAILABLE - 1));
+    expect(fetchMock).toHaveBeenCalledTimes(HEALTH_FAILURES_BEFORE_UNAVAILABLE - 1);
+    expect(unavailable).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(HEALTH_FAILURES_BEFORE_UNAVAILABLE);
     expect(unavailable).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);
 
     firstController.abort();
     secondController.abort();
+    fetchMock.mockRestore();
+  });
+
+  it('keeps sessions through a blip shorter than the failure threshold and resets the count on success', async () => {
+    vi.useFakeTimers();
+    const fail = () => Promise.reject(new Error('timeout'));
+    const ok = () => Promise.resolve(new Response('{}', { status: 200 }));
+    const outcomes = [
+      ...Array.from({ length: HEALTH_FAILURES_BEFORE_UNAVAILABLE - 1 }, () => fail),
+      ok,
+      ...Array.from({ length: HEALTH_FAILURES_BEFORE_UNAVAILABLE - 1 }, () => fail),
+      ok,
+    ];
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(() => (outcomes.shift() ?? ok)());
+    const controller = new AbortController();
+    const lease = await provider.sessions.ensure(input('s1'), controller.signal);
+    const unavailable = vi.fn();
+    lease.onUnavailable?.(unavailable);
+
+    await vi.advanceTimersByTimeAsync(5_000 * (2 * HEALTH_FAILURES_BEFORE_UNAVAILABLE + 2));
+    expect(unavailable).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(1);
+
+    controller.abort();
+    expect(vi.getTimerCount()).toBe(0);
     fetchMock.mockRestore();
   });
 
