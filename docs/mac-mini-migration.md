@@ -1,6 +1,20 @@
 # Moving the NanoClaw host from the MacBook Pro to the Mac Mini
 
-Status: **plan only, nothing done yet** (drafted 2026-11-10). Nothing in this plan has touched the Mini.
+Status: **on hold, because the current Mini is too small** (checked 2026-11-10). The plan below assumes a Mini with 32 GB or more.
+
+> **Hardware check result:** the Mini is a `Mac14,3` (M2, 2023) with **8 GB** of RAM. That can't host NanoClaw:
+>
+> - Each agent image is about 4 GB.
+> - The Docker VM alone needs 8 to 12 GB.
+> - Hermes already runs on the Mini.
+>
+> The MacBook (24 GB) already swaps under this load. Options, in order:
+>
+> 1. **Stay on the MacBook and lighten it:** reclaim disk, try OrbStack, cap the Docker VM at 8 to 10 GB and 6 to 8 CPUs.
+> 2. **Replace the Mini** with one that has 32 GB or more, then follow this plan unchanged.
+> 3. **VPS:** still not recommended, for the reasons below.
+>
+> Mac RAM can't be upgraded, so the current Mini stays a Hermes-only box.
 
 ## Why
 
