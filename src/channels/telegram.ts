@@ -39,16 +39,14 @@ const TELEGRAM_DEFAULTS: ChannelDefaults = {
 };
 
 /**
- * Collapse a chat-level thread id to null. The adapter hands every message a
- * thread id; only a forum-topic message carries a third `:<topic>` segment.
- * Treating the topic-less id as "no thread" keeps General-topic and
- * plain-group traffic on the session that existed before topics were honored
- * (session lookup keys per-thread rows on thread_id, NULL = the shared row),
- * and keeps replies to it addressed to the chat rather than to a topic.
+ * Keep `/commands` on the message path. Adapters >= 4.31 send a message that
+ * starts with a bot command to onSlashCommand, which the bridge does not
+ * register, so `/connect_group`, `/start connect` and agent commands were
+ * dropped. Older adapters have no such method, so this is a no-op there.
  */
-export function normalizeTelegramThreadId(platformId: string, threadId: string | null): string | null {
-  if (threadId === null || threadId === platformId) return null;
-  return threadId;
+export function keepCommandsAsMessages(adapter: ReturnType<typeof createTelegramAdapter>): void {
+  const a = adapter as unknown as { handleSlashCommandUpdate?: unknown };
+  if (typeof a.handleSlashCommandUpdate === 'function') a.handleSlashCommandUpdate = () => false;
 }
 
 /**
@@ -398,6 +396,7 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     botToken: token,
     mode: 'polling',
   });
+  keepCommandsAsMessages(telegramAdapter);
   const bridge = createChatSdkBridge({
     adapter: telegramAdapter,
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)

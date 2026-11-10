@@ -81,6 +81,8 @@ const DEFAULT_FETCH_LIMIT = 60;
 /** Mattermost caps `per_page` at 200 on the post endpoints. */
 const MAX_PAGE_SIZE = 200;
 const MATTERMOST_ID = /^[a-z0-9]{26}$/;
+// Read outside code, so `_@here_` counts; `@channel-ops` is a user, `@here.` is not.
+const CHANNEL_WIDE_MENTION = /(^|[^\w@])@(?:all|channel|here)(?![a-z0-9]|[-._]+[a-z0-9])/i;
 
 /**
  * Path segment the NanoClaw host's webhook server routes to this adapter
@@ -90,12 +92,34 @@ const MATTERMOST_ID = /^[a-z0-9]{26}$/;
  */
 const WEBHOOK_PATH = '/webhook/mattermost';
 
+/** Compare UTF-8 bytes only after checking their lengths. */
+function secretMatches(presented: unknown, expected: string): boolean {
+  if (typeof presented !== 'string') return false;
+  const actual = Buffer.from(presented);
+  const configured = Buffer.from(expected);
+  return actual.length === configured.length && timingSafeEqual(actual, configured);
+}
+
+/** Domain label for the derived callback secret; distinct from the setup proofs' messages. */
+const DERIVED_CALLBACK_SECRET_LABEL = 'nanoclaw-mattermost-callback-secret:v1';
+
+/**
+ * An explicit secret wins. Otherwise derive one from the bot token, so every
+ * install authenticates clicks with no extra config. HMAC is one-way: the value
+ * Mattermost stores in card context never reveals the token. Rotating the token
+ * changes it, so cards posted before the rotation stop verifying.
+ */
+function resolveCallbackSecret(options: MattermostAdapterOptions): string | undefined {
+  if (options.callbackSecret?.trim()) return options.callbackSecret;
+  if (!options.token?.trim()) return undefined;
+  return createHmac('sha256', options.token).update(DERIVED_CALLBACK_SECRET_LABEL).digest('hex');
+}
+
 export interface MattermostAdapterOptions {
   /**
-   * Shared secret every interactive action carries back in its context.
-   * When set, `handleWebhook` rejects callbacks that do not present it —
-   * the only authentication Mattermost's action callbacks can have. Cards
-   * posted before the secret was configured stop being clickable.
+   * Shared secret every action carries back in its context. Optional: when
+   * absent or blank, one is derived from the bot token. Cards posted before
+   * the secret (or the token it derives from) changes stop being clickable.
    */
   callbackSecret?: string;
   /** Externally reachable base URL Mattermost POSTs button clicks to. */
@@ -267,7 +291,7 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
   constructor(options: MattermostAdapterOptions) {
     this.options = { ...options, url: normalizeBaseUrl(options.url) };
     this.callbackUrl = options.callbackUrl;
-    this.callbackSecret = options.callbackSecret;
+    this.callbackSecret = resolveCallbackSecret(options);
     this.logger = new ConsoleLogger('info', 'mattermost');
     this.rest = new MattermostRestClient({
       baseUrl: this.options.url,
@@ -564,9 +588,16 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
   // =========================================================================
 
   /** One post by id, or `null` when Mattermost has no such post. */
-  async fetchMessage(_threadId: string, messageId: string): Promise<Message<MattermostPost> | null> {
+  async fetchMessage(threadId: string, messageId: string): Promise<Message<MattermostPost> | null> {
     try {
       const post = await this.rest.getPost(toPostId(messageId));
+      // A live top-level group post lives in its own rooted thread, which the
+      // post alone can't show; keep the caller's thread when it is that one.
+      if (threadId === threadIdForPost(post, true)) {
+        const message = this.toMessage(post, threadId);
+        message.isMention = this.detectTextMention(post);
+        return message;
+      }
       return this.parseMessage(post);
     } catch (error) {
       if (error instanceof MattermostApiError && error.status === 404) {
@@ -830,12 +861,26 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
     // the display name or bot flag, and the host bylines messages with the
     // former. Failure is tolerated — the handle is still a fine name.
     await this.ensureUserResolved(post.user_id);
+    // As on Slack, other bots' posts never reach the router, even when they
+    // @mention the bot: agents name each other when they reply, so two in one
+    // thread would wake each other in a loop. A webhook owned by a person
+    // posts without `from_bot`, so it still passes.
+    if (post.props?.from_bot === 'true' || this.users.get(post.user_id)?.isBot === true) {
+      this.logger.info('Mattermost WS: post from another bot dropped', { userId: post.user_id });
+      return;
+    }
 
-    const threadId = threadIdForPost(post);
+    const isDirect = data?.channel_type === 'D' || this.channelTypes.get(post.channel_id) === 'D';
+    const threadId = threadIdForPost(post, !isDirect);
     const message = this.toMessage(post, threadId);
     // Mattermost puts the other participant in `data.mentions` on every DM
-    // post, so only non-DM channels can report an explicit @-mention.
-    message.isMention = isExplicitMention(event.data, this.botUserId);
+    // post, so only non-DM channels can report an explicit @-mention. It also
+    // lists the bot for `@channel`, `@all` and `@here`; then only `@bot` counts.
+    // Both are read outside code, as the server reads mentions.
+    const mentionText = textOutsideCode(message.formatted);
+    message.isMention =
+      isExplicitMention(event.data, this.botUserId) &&
+      (!CHANNEL_WIDE_MENTION.test(mentionText) || this.mentionsBotHandle(mentionText));
 
     void chat.processMessage(this, threadId, message);
   }
@@ -849,10 +894,10 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
    *    channel comes off `broadcast.channel_id` (see `reactionChannelId`);
    *  - the frame says nothing about the reacted-to post's thread. Slack pays a
    *    REST read to root a reaction in its parent thread, and so do we — one
-   *    `GetPost` — so reacting inside a thread does not surface as a
-   *    channel-level event. The same read supplies the event's `message`. A
-   *    failed read degrades to the channel-level thread id rather than
-   *    dropping the reaction.
+   *    `GetPost` — so a reaction lands in the same thread as its post (a
+   *    top-level group post is its own thread root). The same read supplies
+   *    the event's `message`. A failed read degrades to the channel-level
+   *    thread id rather than dropping the reaction.
    */
   private async handleReaction(event: MattermostWebSocketEvent): Promise<void> {
     const chat = this.chat;
@@ -881,8 +926,10 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
         error,
       });
     }
-    const rootId = post?.root_id || undefined;
-    const threadId = encodeThreadId({ channelId, ...(rootId ? { rootId } : {}) });
+    // Same thread as the post itself; the channel type keeps a DM channel-level.
+    if (post) await this.onThreadSubscribe(encodeThreadId({ channelId }));
+    const isDirect = this.channelTypes.get(channelId) === 'D';
+    const threadId = post ? threadIdForPost(post, !isDirect) : encodeThreadId({ channelId });
     await this.ensureUserResolved(reaction.user_id);
 
     const reactionEvent: Omit<ReactionEvent<MattermostPost>, 'adapter' | 'thread'> = {
@@ -897,7 +944,7 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
       threadId,
       user: this.projectAuthor(reaction.user_id),
     };
-    chat.processReaction({ ...reactionEvent, adapter: this });
+    void chat.processReaction({ ...reactionEvent, adapter: this });
   }
 
   // =========================================================================
@@ -912,10 +959,10 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
    * Socket Mode, this is a real inbound HTTP route, served by the host's
    * webhook server at `/webhook/mattermost`.
    *
-   * Mattermost signs nothing on this request. When a `callbackSecret` is
-   * configured, the click must present it in `context` (where
-   * `cardToAttachment` put it and where no client can read it); a callback
-   * without it is refused with 401 before anything is dispatched.
+   * Mattermost signs nothing on this request. Actions must present the
+   * callback secret (configured or derived from the bot token) in context,
+   * or receive 401 before dispatch. Setup proofs below use a separate
+   * credential and never dispatch actions.
    *
    * The dispatch is fire-and-forget, mirroring Slack's `handleBlockActions`:
    * `chat.processAction` is started and the 200 goes back immediately, because
@@ -942,6 +989,10 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
       return new Response('Invalid JSON', { status: 400 });
     }
 
+    if (!payload || typeof payload !== 'object') {
+      return new Response('Invalid JSON', { status: 400 });
+    }
+
     // A setup action uses a one-purpose proof, not the long-lived callback
     // secret: a mistyped callback destination cannot receive that secret.
     const setupNonce = payload.context?.nanoclaw_setup_action;
@@ -960,22 +1011,20 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
       return Response.json({});
     }
 
-    if (this.callbackSecret !== undefined) {
-      const presented = payload.context?.[CALLBACK_SECRET_KEY];
-      if (presented !== this.callbackSecret) {
-        this.logger.warn('Mattermost action callback rejected: missing or wrong callback secret', {
-          postId: payload.post_id,
-          userId: payload.user_id,
-        });
-        return new Response('Unauthorized', { status: 401 });
-      }
+    // Undefined only when the bot token is blank; every action is then refused.
+    const presented = payload.context?.[CALLBACK_SECRET_KEY];
+    if (this.callbackSecret === undefined || !secretMatches(presented, this.callbackSecret)) {
+      this.logger.warn('Mattermost action callback rejected: missing or wrong callback secret', {
+        postId: payload.post_id,
+        userId: payload.user_id,
+      });
+      return new Response('Unauthorized', { status: 401 });
     }
 
     // A setup challenge checks this initialized adapter without delivering an
     // action or posting a message. Authenticate before exposing runtime values.
     const challenge = payload.context?.nanoclaw_setup_probe;
     if (typeof challenge === 'string' && /^[a-f0-9-]{36}$/.test(challenge)) {
-      if (!this.callbackSecret) return new Response('Unauthorized', { status: 401 });
       const runtime = {
         challenge,
         bot_id: this.botUserId,
@@ -1393,11 +1442,22 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
    * never count as mentions, matching `isExplicitMention`.
    */
   private detectTextMention(post: MattermostPost): boolean {
-    if (!this.userName || this.channelTypes.get(post.channel_id) === 'D') {
+    if (this.channelTypes.get(post.channel_id) === 'D') {
+      return false;
+    }
+    return this.mentionsBotHandle(post.message ?? '');
+  }
+
+  /**
+   * `@<bot handle>` in the text. Trailing `.`, `-` or `_` is punctuation, as
+   * for Mattermost, unless more handle follows (`@bot-dev` is someone else).
+   */
+  private mentionsBotHandle(text: string): boolean {
+    if (!this.userName) {
       return false;
     }
     const handle = this.userName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`(^|[^\\w@])@${handle}(?![\\w.-])`, 'i').test(post.message ?? '');
+    return new RegExp(`(^|[^\\w@])@${handle}(?![a-z0-9]|[-._]+[a-z0-9])`, 'i').test(text);
   }
 
   private toMessage(post: MattermostPost, threadId: string): Message<MattermostPost> {
@@ -1478,16 +1538,43 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
   }
 }
 
+type MarkdownNode = { type: string; value?: unknown; alt?: unknown; url?: unknown; children?: MarkdownNode[] };
+
 /**
- * Thread id a post belongs to: the channel for a top-level post, the root
- * post's thread for a reply. A top-level post does **not** open a thread of
- * its own — that would make every channel message its own conversation and
- * leave the agent with no context between two consecutive posts.
+ * Text of a markdown AST where Mattermost looks for @-mentions, nodes joined
+ * by a space: no code and no bare URLs, but HTML and image alt text (inline
+ * or reference-style) count.
  */
-function threadIdForPost(post: MattermostPost): string {
+function textOutsideCode(node: MarkdownNode): string {
+  if (node.type === 'code' || node.type === 'inlineCode' || isBareUrl(node)) {
+    return '';
+  }
+  if (node.type === 'text' || node.type === 'html') {
+    return typeof node.value === 'string' ? node.value : '';
+  }
+  if (node.type === 'image' || node.type === 'imageReference') {
+    return typeof node.alt === 'string' ? node.alt : '';
+  }
+  return (node.children ?? []).map(textOutsideCode).join(' ');
+}
+
+/** A link whose visible text is its own URL (`https://x/@bot`, `<https://x>`). */
+function isBareUrl(node: MarkdownNode): boolean {
+  const only = node.type === 'link' && node.children?.length === 1 ? node.children[0] : undefined;
+  const text = only?.type === 'text' && typeof only.value === 'string' ? only.value : undefined;
+  return text !== undefined && [text, `http://${text}`, `mailto:${text}`].includes(String(node.url));
+}
+
+/**
+ * Thread id a post belongs to: its root for a reply, else the post itself when
+ * `rootTopLevel` (live group posts, as Slack does), else the channel. One
+ * channel-wide thread let a single @mention make every later post sticky.
+ */
+function threadIdForPost(post: MattermostPost, rootTopLevel = false): string {
+  const rootId = post.root_id || (rootTopLevel ? post.id : undefined);
   return encodeThreadId({
     channelId: post.channel_id,
-    rootId: post.root_id || undefined,
+    ...(rootId ? { rootId } : {}),
   });
 }
 
