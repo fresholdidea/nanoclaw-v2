@@ -43,6 +43,12 @@ const healthUrl = new URL('/v1/health', onecliUrl || 'https://api.onecli.sh').to
 const liveLeases = new Set<{ unavailable?: string; notify?: (reason: string) => void }>();
 let healthTimer: NodeJS.Timeout | null = null;
 let probing = false;
+let consecutiveProbeFailures = 0;
+/**
+ * One slow answer under host load (swap, a Docker Desktop stall) must not stop
+ * every live session; only an outage that outlasts several probes does.
+ */
+export const HEALTH_FAILURES_BEFORE_UNAVAILABLE = 3;
 
 type OneCLIContribution = Omit<GatewayContribution, 'networkAccess'>;
 type GatewayMount = NonNullable<GatewayContribution['mounts']>[number];
@@ -121,6 +127,7 @@ export function withProviderEnv(contribution: OneCLIContribution, baseUrl = anth
 function stopHealthMonitor(): void {
   if (healthTimer) clearInterval(healthTimer);
   healthTimer = null;
+  consecutiveProbeFailures = 0;
 }
 
 async function probeHealth(): Promise<void> {
@@ -129,9 +136,22 @@ async function probeHealth(): Promise<void> {
   try {
     const response = await fetch(healthUrl, { signal: AbortSignal.timeout(5_000) });
     if (!response.ok) throw new Error(`status ${response.status}`);
+    if (consecutiveProbeFailures > 0) {
+      log.info('OneCLI gateway health recovered', { failedProbes: consecutiveProbeFailures });
+    }
+    consecutiveProbeFailures = 0;
   } catch (err) {
+    consecutiveProbeFailures += 1;
+    if (consecutiveProbeFailures < HEALTH_FAILURES_BEFORE_UNAVAILABLE) {
+      log.warn('OneCLI gateway health probe failed; retrying before stopping sessions', {
+        err,
+        failedProbes: consecutiveProbeFailures,
+        threshold: HEALTH_FAILURES_BEFORE_UNAVAILABLE,
+      });
+      return;
+    }
     const reason = 'OneCLI gateway unavailable';
-    log.error(reason, { err });
+    log.error(reason, { err, failedProbes: consecutiveProbeFailures });
     stopHealthMonitor();
     for (const lease of liveLeases) {
       lease.unavailable = reason;
