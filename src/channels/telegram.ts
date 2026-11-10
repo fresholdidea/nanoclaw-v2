@@ -39,6 +39,19 @@ const TELEGRAM_DEFAULTS: ChannelDefaults = {
 };
 
 /**
+ * Collapse a chat-level thread id to null. The adapter hands every message a
+ * thread id; only a forum-topic message carries a third `:<topic>` segment.
+ * Treating the topic-less id as "no thread" keeps General-topic and
+ * plain-group traffic on the session that existed before topics were honored
+ * (session lookup keys per-thread rows on thread_id, NULL = the shared row),
+ * and keeps replies to it addressed to the chat rather than to a topic.
+ */
+export function normalizeTelegramThreadId(platformId: string, threadId: string | null): string | null {
+  if (threadId === null || threadId === platformId) return null;
+  return threadId;
+}
+
+/**
  * Keep `/commands` on the message path. Adapters >= 4.31 send a message that
  * starts with a bot command to onSlashCommand, which the bridge does not
  * register, so `/connect_group`, `/start connect` and agent commands were
@@ -266,11 +279,11 @@ export function createTelegramInboundInterceptor(
 
     try {
       if (!botUsername) {
-        hostOnInbound(platformId, threadId, message);
+        void hostOnInbound(platformId, threadId, message);
         return;
       }
       if (!text) {
-        hostOnInbound(platformId, threadId, message);
+        void hostOnInbound(platformId, threadId, message);
         return;
       }
       const consumed = await tryConsume({
@@ -282,7 +295,7 @@ export function createTelegramInboundInterceptor(
         instance: instanceKey,
       });
       if (!consumed) {
-        hostOnInbound(platformId, threadId, message);
+        void hostOnInbound(platformId, threadId, message);
         return;
       }
       // Pairing matched — record the chat and short-circuit so the
@@ -342,7 +355,7 @@ export function createTelegramInboundInterceptor(
     } catch (err) {
       log.error('Telegram pairing interceptor error', { err });
       // Fail open: pass through so a pairing bug doesn't break normal traffic.
-      hostOnInbound(platformId, threadId, message);
+      void hostOnInbound(platformId, threadId, message);
     }
   };
 }
