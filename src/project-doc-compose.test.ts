@@ -64,6 +64,11 @@ beforeEach(async () => {
   const skillDir = path.join(sourceRoot, 'container', 'skills', 'fixture-gateway');
   fs.mkdirSync(skillDir, { recursive: true });
   fs.writeFileSync(path.join(skillDir, 'instructions.md'), 'Fixture credential guidance.');
+  for (const slackSkill of ['slack-construct', 'slack-construct-agents']) {
+    const dir = path.join(sourceRoot, 'container', 'skills', slackSkill);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'instructions.md'), `Fixture ${slackSkill} room rules.`);
+  }
   for (const entry of ['CLAUDE.md', 'agent-runner']) {
     fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(sourceRoot, 'container', entry));
   }
@@ -463,6 +468,9 @@ describe('composeGroupProjectDoc module selection', () => {
     expect(doc).not.toContain('# NanoClaw Module: create-agent-slack');
     expect(doc).toContain('# NanoClaw Module: core');
     expect(doc).toContain('# NanoClaw Module: scheduling');
+    expect(doc).not.toContain('# NanoClaw Skill: slack-construct');
+    expect(doc).not.toContain('# NanoClaw Skill: slack-construct-agents');
+    expect(doc).toContain('# NanoClaw Skill: fixture-gateway');
   });
 
   it('inlines Slack-only module docs when the group is wired to a Slack channel', async () => {
@@ -492,6 +500,19 @@ describe('composeGroupProjectDoc module selection', () => {
     const doc = await compose(ag);
     expect(doc).toContain('# NanoClaw Module: canvas');
     expect(doc).toContain('# NanoClaw Module: rooms');
+    expect(doc).toContain('# NanoClaw Skill: slack-construct');
+    expect(doc).toContain('# NanoClaw Skill: slack-construct-agents');
+  });
+});
+
+describe('skillFragmentApplies', () => {
+  it('keeps Slack-only skill prose for Slack-wired groups and every other skill everywhere', async () => {
+    const { skillFragmentApplies } = await import('./project-doc-compose.js');
+    const none = { cliDisabled: false, hasSlack: false };
+    expect(skillFragmentApplies('onecli-gateway', none)).toBe(true);
+    expect(skillFragmentApplies('slack-construct', none)).toBe(false);
+    expect(skillFragmentApplies('slack-construct-agents', none)).toBe(false);
+    expect(skillFragmentApplies('slack-construct', { ...none, hasSlack: true })).toBe(true);
   });
 });
 

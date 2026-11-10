@@ -174,6 +174,17 @@ export function moduleApplies(moduleName: string, ctx: ModuleContext): boolean {
   return true;
 }
 
+// Resident skill prose that only governs Slack rooms and Slack sibling agents
+// (~6 KB together). It pushed scheduled-only Codex groups to within 1 KB of
+// AGENTS.md's 32 KB cap. The SKILL.md stays linked for discovery either way;
+// only the always-in-context fragment is skipped.
+export const SLACK_ONLY_SKILLS = new Set(['slack-construct', 'slack-construct-agents']);
+
+/** Pure: does this skill's resident `instructions.md` belong in the group's document? */
+export function skillFragmentApplies(skillName: string, ctx: ModuleContext): boolean {
+  return ctx.hasSlack || !SLACK_ONLY_SKILLS.has(skillName);
+}
+
 // Resolved at call time (process.cwd() = project root) so tests can swap cwd.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
 const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
@@ -257,6 +268,7 @@ export async function composeGroupProjectDoc(
   if (fs.existsSync(skillsHostDir)) {
     for (const skillName of fs.readdirSync(skillsHostDir).sort()) {
       if (selectedSkills !== 'all' && !selectedSkills.includes(skillName)) continue;
+      if (!skillFragmentApplies(skillName, moduleCtx)) continue;
       const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
       if (!fs.existsSync(hostFragment)) continue;
       push(`NanoClaw Skill: ${skillName}`, fs.readFileSync(hostFragment, 'utf-8'), true);
