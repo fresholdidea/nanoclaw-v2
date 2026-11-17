@@ -69,7 +69,7 @@ export function stopDashboardPusher(): void {
  * No-ops (and says so) when DASHBOARD_SECRET is unset.
  */
 export async function startDashboard(): Promise<void> {
-  const env = readEnvFile(['DASHBOARD_SECRET', 'DASHBOARD_PORT']);
+  const env = readEnvFile(['DASHBOARD_SECRET', 'DASHBOARD_PORT', 'DASHBOARD_TAILNET_HOST', 'DASHBOARD_TAILNET_LOGINS']);
   const secret = process.env.DASHBOARD_SECRET || env.DASHBOARD_SECRET;
   const port = parseInt(process.env.DASHBOARD_PORT || env.DASHBOARD_PORT || '3100', 10);
   if (!secret) {
@@ -77,7 +77,23 @@ export async function startDashboard(): Promise<void> {
     return;
   }
   const { startDashboard: startServer } = await import('@nanoco/nanoclaw-dashboard');
-  startServer({ port, secret });
+  // Optional: also answer the machine's tailnet name, behind `tailscale serve`.
+  // A variable, not a literal, so an older dashboard build that predates the
+  // `tailnet` option still typechecks and simply ignores it.
+  const tailnetHost = (process.env.DASHBOARD_TAILNET_HOST || env.DASHBOARD_TAILNET_HOST || '').trim();
+  const allowLogins = (process.env.DASHBOARD_TAILNET_LOGINS || env.DASHBOARD_TAILNET_LOGINS || '')
+    .split(',')
+    .map((login) => login.trim())
+    .filter(Boolean);
+  const serverConfig = {
+    port,
+    secret,
+    ...(tailnetHost && allowLogins.length > 0 ? { tailnet: { host: tailnetHost, allowLogins } } : {}),
+  };
+  if (tailnetHost && allowLogins.length === 0) {
+    log.warn('Dashboard tailnet access is off: DASHBOARD_TAILNET_LOGINS is empty');
+  }
+  startServer(serverConfig);
   startDashboardPusher({ port, secret, intervalMs: 60000 });
 }
 
