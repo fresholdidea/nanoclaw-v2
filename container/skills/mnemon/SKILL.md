@@ -29,11 +29,14 @@ Build a short keyword query. Do not paste the raw user message.
 ## Remember
 
 ```bash
-mnemon remember "<self-contained fact>" --cat <category> --imp <1-5> --entities "Entity A,Entity B" --source agent
+mnemon remember '<self-contained fact>' --cat <category> --imp <1-5> --entities 'Entity A,Entity B' --entity-mode provided --source agent
 ```
 
 - Categories: `preference` · `decision` · `fact` · `insight` · `context` · `general`
-- Store durable things: decisions, preferences, root causes, conventions, and pointers to where the full work lives. Skip routine chatter and transient status. Do not copy whole documents or Wiki pages.
+- Store durable things: decisions, preferences, root causes, conventions, and pointers to where the full work lives. Skip routine chatter and transient status ("as of", "still waiting", counts that will change). Do not copy whole documents or Wiki pages.
+- Search first (`mnemon search '<key names>'`). If it is already stored, stop. To correct an old memory, store the complete corrected version, then `mnemon forget <old-full-uuid>` once the new one shows up in search. Never store "CORRECTION to memory X" and leave X as it is.
+- Keep it short (under ~800 characters) with 3-8 real entities (people, clients, systems). Most memories are importance 2-3; use 4-5 only for standing rules and key decisions.
+- Use single quotes: double quotes let the shell eat `$` amounts (`$1,800` becomes `,800`).
 - Write each memory so it makes sense with no conversation around it. Include absolute dates.
 - Never store secrets, passwords, tokens, or API keys. Max 8,000 characters.
 
@@ -42,7 +45,7 @@ mnemon remember "<self-contained fact>" --cat <category> --imp <1-5> --entities 
 1. **Full 36-character UUIDs only.** `link`, `forget`, and `related` reject short prefixes like `3671aee0`. From a container, that failure is silent.
 2. **Copy IDs from output, never from memory.** Take the `"id"` value from `mnemon recall` or `mnemon search` output in this turn. Do not retype, abbreviate, or reuse IDs from earlier sessions.
 3. **A memory you just queued has no ID yet.** Do not try to link it in the same step. If a link really matters, wait about two minutes, then `mnemon search` for it and use the full `id` it returns. Otherwise skip the link, because entity and time edges are created automatically.
-4. **IDs can go dead.** Near-duplicates are skipped, and a conflicting new fact replaces the older memory. Before linking or forgetting, re-run `search` and use whatever ID it returns now.
+4. **IDs can go dead.** Exact repeats are skipped, and memories can be forgotten by other agents. Before linking or forgetting, re-run `search` and use whatever ID it returns now.
 5. **`forget` takes only an ID.** `mnemon forget <full-uuid>`. There is no `--reason` flag, and passing one makes the write fail.
 
 Link syntax, for genuinely related memories only:
