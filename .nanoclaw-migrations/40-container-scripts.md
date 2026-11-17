@@ -41,7 +41,7 @@ regex parses it and only asserts `poppler-utils` is present.
 
 ### I2. mnemon block - REAPPLY (Dockerfile + 2 wholly-ours files)
 - Copy as-is: `container/mnemon-shim.sh`, `container/mnemon-queue.mjs` (mode 644 is fine; Dockerfile chmods the shim).
-- Dockerfile block goes immediately ABOVE `# ---- Bun runtime` (the add-mnemon skill says the same). `ARG MNEMON_VERSION=0.1.14`; release binary
+- Dockerfile block goes immediately ABOVE `# ---- Bun runtime` (the add-mnemon skill says the same). `ARG MNEMON_VERSION=0.2.13`; release binary
   installed as `/usr/local/bin/mnemon-real`; `COPY mnemon-shim.sh /usr/local/bin/mnemon`; `COPY mnemon-queue.mjs /usr/local/lib/mnemon-queue.mjs`;
   `RUN chmod +x /usr/local/bin/mnemon`; `ENV MNEMON_DATA_DIR=/workspace/extra/mnemon`. Take it verbatim with
   `git diff 64706602 ed7eccd6 -- container/Dockerfile | git apply --reject` (hunks 2-4 apply, see below).

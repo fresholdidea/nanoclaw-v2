@@ -86,7 +86,7 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # Docker mount, so the real binary installs as mnemon-real and `mnemon` is a
 # shim: reads go to the host-refreshed snapshot, writes queue for host replay
 # (drained by src/mnemon-sync.ts). See container/mnemon-shim.sh.
-ARG MNEMON_VERSION=0.1.14
+ARG MNEMON_VERSION=0.2.13
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://github.com/mnemon-dev/mnemon/releases/download/v${MNEMON_VERSION}/mnemon_${MNEMON_VERSION}_linux_${ARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin mnemon && \
