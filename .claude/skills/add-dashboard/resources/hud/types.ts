@@ -56,6 +56,39 @@ export interface HudSkill extends Freshness {
   trigger?: string;
   href?: string;
 }
+/** A button on an inbox item. `name` is a key of the host's action map; `args` go to it unchanged. */
+export interface InboxAction {
+  name: string;
+  label: string;
+  args: Record<string, string>;
+  style?: 'primary' | 'danger';
+  /** Ask for a line of text first and send it as `args.text`. */
+  prompt?: string;
+}
+export type InboxKind = 'approval' | 'question' | 'unblock' | 'review' | 'waiting' | 'task';
+export interface InboxItem {
+  /** Stable across pushes: `<kind>:<source id>`. Snoozes and deep links key on it. */
+  id: string;
+  kind: InboxKind;
+  title: string;
+  detail?: string;
+  client?: string;
+  /** When it started waiting, ISO. */
+  since: string | null;
+  href?: string;
+  /** Why there is no button, or where else to act. */
+  note?: string;
+  /** Shown collapsed: true for things that are parked, not waiting. */
+  quiet?: boolean;
+  actions: InboxAction[];
+}
+export interface HudInbox {
+  items: InboxItem[];
+  /** Items left out per kind by the per-kind cap. */
+  more: Partial<Record<InboxKind, number>>;
+  snoozed: number;
+  sources: Array<Freshness & { kind: InboxKind }>;
+}
 export interface Hud {
   generatedAt: string;
   timezone: string;
@@ -64,6 +97,7 @@ export interface Hud {
   today: HudToday;
   skills: HudSkill[];
   hiddenCount: number;
+  inbox?: HudInbox;
 }
 export interface TaskSeries {
   agent_group_id: string;

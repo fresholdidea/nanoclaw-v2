@@ -3,7 +3,7 @@
  * snapshot to the dashboard's /api/ingest endpoint every interval.
  */
 import fs from 'fs';
-import { collectDashboardHud } from './hud/index.js';
+import { collectDashboardHud, dashboardHudActions } from './hud/index.js';
 import { localDay } from './hud/io.js';
 import path from 'path';
 import http from 'http';
@@ -85,10 +85,13 @@ export async function startDashboard(): Promise<void> {
     .split(',')
     .map((login) => login.trim())
     .filter(Boolean);
+  // Work actions the dashboard may trigger; the map's keys are the allowlist.
+  const actions = dashboardHudActions();
   const serverConfig = {
     port,
     secret,
     ...(tailnetHost && allowLogins.length > 0 ? { tailnet: { host: tailnetHost, allowLogins } } : {}),
+    ...(actions ? { actions } : {}),
   };
   if (tailnetHost && allowLogins.length === 0) {
     log.warn('Dashboard tailnet access is off: DASHBOARD_TAILNET_LOGINS is empty');
