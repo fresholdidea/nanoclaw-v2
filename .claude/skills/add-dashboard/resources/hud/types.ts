@@ -125,6 +125,22 @@ export interface HealthRow extends Freshness {
 export interface HudHealth {
   rows: HealthRow[];
 }
+export interface TimelineEvent {
+  t: string;
+  /** A registry client id, or null for something that belongs to no one client. */
+  client: string | null;
+  kind: 'issue' | 'waiting' | 'health' | 'action';
+  text: string;
+  /** The id the item has on its own page, for a link. */
+  item?: string;
+}
+export interface HudTimeline {
+  clients: Array<{ id: string; label: string }>;
+  /** Newest first. */
+  events: TimelineEvent[];
+  /** Status lines from each client's Client Log, oldest first. */
+  logs: Array<{ client: string; asOf: string | null; entries: Array<{ t: string; text: string }> }>;
+}
 export interface Hud {
   generatedAt: string;
   timezone: string;
@@ -136,6 +152,7 @@ export interface Hud {
   inbox?: HudInbox;
   clients?: HudClients;
   health?: HudHealth;
+  timeline?: HudTimeline;
 }
 export interface TaskSeries {
   agent_group_id: string;

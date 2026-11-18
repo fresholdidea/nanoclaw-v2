@@ -23,6 +23,8 @@ export interface ClientsInput {
   canEdit: boolean;
   snoozed: ReadonlyMap<string, string>;
   timezone: string;
+  /** Items listed per client; the page's cap unless the caller needs every one. */
+  limit?: number;
   now?: Date;
   deadline?: number;
 }
@@ -36,7 +38,10 @@ const snooze = (item: string, label: string, hours: string): InboxAction => ({
 });
 
 export function createClientsCollector(cache = new SourceCache()) {
-  return function collectClients(paths: HudPaths, input: ClientsInput): HudClients | undefined {
+  return function collectClients(
+    paths: HudPaths,
+    input: ClientsInput,
+  ): (HudClients & { waitingUnavailable?: boolean }) | undefined {
     const now = input.now ?? new Date();
     cache.deadline = input.deadline ?? performance.now() + 100;
     const primary = (...parts: string[]) =>
@@ -47,7 +52,10 @@ export function createClientsCollector(cache = new SourceCache()) {
     const keep = exclusionFilter(raw.value, paths.exclusions !== false).keep;
     const waiting = cache.load(primary('state/waiting-on/ledger.json'), parseWaiting);
     const today = localDay(now, input.timezone);
-    const result: HudClients = { clients: [], snoozed: 0 };
+    const limit = input.limit ?? PER_CLIENT;
+    const result: HudClients & { waitingUnavailable?: boolean } = { clients: [], snoozed: 0 };
+    // An unread ledger is not an empty one.
+    if (!waiting.value || waiting.unavailable) result.waitingUnavailable = true;
     const awake = (item: InboxItem) => {
       const until = input.snoozed.get(item.id);
       if (!until || Date.parse(until) <= now.getTime()) return true;
@@ -123,8 +131,8 @@ export function createClientsCollector(cache = new SourceCache()) {
         open: issues.length,
         overdue: issues.filter((i) => i.flag === 'overdue').length,
         mine: open.filter((i) => i.mine).length,
-        issues: issues.slice(0, PER_CLIENT),
-        waiting: asks.slice(0, PER_CLIENT),
+        issues: issues.slice(0, limit),
+        waiting: asks.slice(0, limit),
         waitingCount: asks.length,
         asOf: entry?.asOf ?? null,
         cadenceMin: 10,

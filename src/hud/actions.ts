@@ -223,6 +223,22 @@ export function createHudActions(deps: HudActionDeps): Record<string, HudAction>
         } catch {
           // An action that happened must still be reported as it went.
         }
+        // What was done from here goes on the timeline; hiding an item is not an event.
+        if (result.ok && name !== 'item.snooze') {
+          try {
+            deps.store.record([
+              {
+                t: now().toISOString(),
+                client: str(args?.client, CLIENT),
+                kind: 'action',
+                item: name.startsWith('issue.') && str(args?.id, UUID) ? `issue:${args.id}` : '',
+                text: `From the HUD: ${result.message}`,
+              },
+            ]);
+          } catch {
+            // The audit row above is the record that matters.
+          }
+        }
         if (result.ok) {
           try {
             deps.changed?.();

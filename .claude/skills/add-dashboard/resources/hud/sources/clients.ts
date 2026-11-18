@@ -6,6 +6,8 @@ export interface RegistryClient {
   projectId: string | null;
   /** Names this client goes by in the waiting-on ledger, lowercased. */
   names: string[];
+  /** The client's folder name under the vault's clients area, when it is a plain name. */
+  folder: string | null;
 }
 export interface ClientRegistry {
   planeBase: string | null;
@@ -31,7 +33,15 @@ export function parseClientRegistry(registry: unknown): ClientRegistry {
       .filter((n): n is string => typeof n === 'string')
       .map((n) => n.trim().toLowerCase())
       .filter(Boolean);
-    clients.push({ id, label, projectId: isUuid(c.plane_project_id) ? c.plane_project_id : null, names });
+    const folder = str(c.folder);
+    clients.push({
+      id,
+      label,
+      projectId: isUuid(c.plane_project_id) ? c.plane_project_id : null,
+      names,
+      // One path segment, nothing that climbs.
+      folder: folder && /^[^/\\]{1,80}$/.test(folder) && !/^\.+$/.test(folder) ? folder : null,
+    });
   }
   const terminal = Array.isArray(r.plane?.terminal_state_groups)
     ? r.plane.terminal_state_groups.filter((g: unknown): g is string => typeof g === 'string')

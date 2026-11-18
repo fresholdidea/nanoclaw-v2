@@ -19,6 +19,7 @@ import { createHudActions, type HudAction } from './actions.js';
 import { createClientsCollector } from './clients.js';
 import { createHudCollector } from './collect.js';
 import { createHealthCollector } from './health.js';
+import { createTimelineCollector, recordChanges, timelineFacts } from './timeline.js';
 import { parseLaunchctl, type LaunchdJob } from './sources/health.js';
 import { exclusionFilter } from './exclusions.js';
 import { createIssueBoard } from './issues.js';
@@ -31,6 +32,7 @@ const collect = createHudCollector();
 const collectInbox = createInboxCollector();
 const collectClients = createClientsCollector();
 const collectHealth = createHealthCollector();
+const collectTimeline = createTimelineCollector();
 const board = createIssueBoard();
 let lastInbox: HudInbox | null = null;
 // Approvals that restart, reconfigure or create things stay on the chat card.
@@ -301,6 +303,25 @@ export async function collectDashboardHud(tokens: { daily?: Record<string, numbe
     });
   } catch (err) {
     log.warn('HUD health collection failed', { err });
+  }
+  try {
+    if (hudDb) {
+      // Every issue and ask, hidden or not: a snooze is not a change to the work.
+      const all = collectClients(paths, {
+        board: (id) => board.get(id),
+        planeConfigured: planeOk,
+        canEdit: false,
+        snoozed: new Map(),
+        timezone: TIMEZONE,
+        limit: 1000,
+        deadline: performance.now() + 100,
+      });
+      const { facts, scopes } = timelineFacts(all, hud.health);
+      recordChanges(hudDb, facts, scopes, new Date().toISOString());
+    }
+    hud.timeline = collectTimeline(paths, { store: hudDb, deadline: performance.now() + 150 });
+  } catch (err) {
+    log.warn('HUD timeline collection failed', { err });
   }
   return hud;
 }
