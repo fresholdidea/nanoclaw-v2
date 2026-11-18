@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { readEnvFile } from '../env.js';
 import { DATA_DIR, GROUPS_DIR, TIMEZONE } from '../config.js';
@@ -14,12 +15,19 @@ import { requestWake } from '../request-wake.js';
 import { getResponseHandlers } from '../response-registry.js';
 import { writeSessionMessage } from '../session-manager.js';
 import { createHudActions, type HudAction } from './actions.js';
+import { createClientsCollector } from './clients.js';
 import { createHudCollector } from './collect.js';
+import { exclusionFilter } from './exclusions.js';
+import { createIssueBoard } from './issues.js';
+import { createPlane, type Plane } from './plane.js';
+import { parseClientRegistry, type ClientRegistry } from './sources/clients.js';
 import { createInboxCollector, type PendingApprovalRow, type PendingQuestionRow } from './inbox.js';
 import { openHudStore, type HudStore } from './store.js';
 import type { HudInbox, TaskSeries } from './types.js';
 const collect = createHudCollector();
 const collectInbox = createInboxCollector();
+const collectClients = createClientsCollector();
+const board = createIssueBoard();
 let lastInbox: HudInbox | null = null;
 // Approvals that restart, reconfigure or create things stay on the chat card.
 const DEFAULT_APPROVAL_ACTIONS = 'a2a_message_gate,gateway_request';
@@ -33,6 +41,7 @@ const HUD_ENV = [
   'HUD_EXCLUSIONS',
   'HUD_OPERATOR_USER_ID',
   'HUD_APPROVAL_ACTIONS',
+  'PLANE_API_KEY',
 ];
 let store: HudStore | null | undefined;
 /** The HUD's own store, or null when it cannot be opened: the inbox still renders, without snoozes or actions. */
@@ -95,6 +104,47 @@ async function pendingRows(): Promise<{
     /* shown as unavailable */
   }
   return { approvals, questions };
+}
+/** The client registry as it is on disk now, with its exclusion filter; null when unreadable. */
+function clientRegistry(env: Record<string, string | undefined>): { registry: ClientRegistry; raw: unknown } | null {
+  const folder = env.HUD_PRIMARY_GROUP;
+  if (!folder || !/^[\w-]+$/.test(folder)) return null;
+  try {
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(GROUPS_DIR, folder, 'scripts/client-dashboard/registry.json'), 'utf8'),
+    );
+    return { registry: parseClientRegistry(raw), raw };
+  } catch {
+    return null;
+  }
+}
+function planeClient(env: Record<string, string | undefined>, registry: ClientRegistry): Plane | null {
+  return registry.planeBase && env.PLANE_API_KEY
+    ? createPlane({ base: registry.planeBase, key: env.PLANE_API_KEY })
+    : null;
+}
+let planeRefreshing: Promise<void> | null = null;
+let planeRefreshedAt = 0;
+let planeOk = false;
+// Two calls per project at most, a few projects at a time: far under Plane's 60 a minute.
+const PLANE_REFRESH_MS = 5 * 60_000;
+function refreshPlane(env: Record<string, string | undefined>): void {
+  if (planeRefreshing || Date.now() - planeRefreshedAt < PLANE_REFRESH_MS) return;
+  const found = clientRegistry(env);
+  const plane = found && planeClient(env, found.registry);
+  planeOk = !!plane;
+  planeRefreshedAt = Date.now();
+  if (!found || !plane) return;
+  const keep = exclusionFilter(found.raw, env.HUD_EXCLUSIONS !== 'false').keep;
+  const projects = found.registry.clients
+    .filter((c) => c.projectId && keep({ id: c.id, label: c.label }))
+    .map((c) => c.projectId!);
+  planeRefreshing = board
+    .refresh(plane, projects)
+    .catch((err) => log.warn('HUD Plane refresh failed', { err }))
+    .finally(() => {
+      planeRefreshing = null;
+    });
 }
 let lastTasks: TaskSeries[] | null = null;
 let tasksAsOf: string | null = null;
@@ -181,6 +231,20 @@ export async function collectDashboardHud(tokens: { daily?: Record<string, numbe
   } catch (err) {
     log.warn('HUD inbox collection failed', { err });
   }
+  try {
+    // Runs beside the push; this snapshot carries whatever the board holds now.
+    refreshPlane(env);
+    hud.clients = collectClients(paths, {
+      board: (id) => board.get(id),
+      planeConfigured: planeOk,
+      canEdit: !!hudDb && planeOk,
+      snoozed,
+      timezone: TIMEZONE,
+      deadline: performance.now() + 100,
+    });
+  } catch (err) {
+    log.warn('HUD clients collection failed', { err });
+  }
   return hud;
 }
 
@@ -188,12 +252,27 @@ export async function collectDashboardHud(tokens: { daily?: Record<string, numbe
  * The action map handed to the dashboard, or undefined when the HUD store
  * cannot be opened (no audit, so no actions).
  */
-export function dashboardHudActions(): Record<string, HudAction> | undefined {
+export function dashboardHudActions(changed?: () => void): Record<string, HudAction> | undefined {
   const hudDb = hudStore();
   if (!hudDb) return undefined;
   const env = () => readEnvFile(HUD_ENV);
   return createHudActions({
     store: hudDb,
+    changed,
+    async editIssue(clientId, id, change) {
+      const e = env();
+      const found = clientRegistry(e);
+      const client = found?.registry.clients.find((c) => c.id === clientId);
+      if (
+        !found ||
+        !client?.projectId ||
+        !exclusionFilter(found.raw, e.HUD_EXCLUSIONS !== 'false').keep({ id: client.id, label: client.label })
+      )
+        return { ok: false, message: 'That client is not in the registry.' };
+      const plane = planeClient(e, found.registry);
+      if (!plane) return { ok: false, message: 'Plane is not configured on the host (PLANE_API_KEY).' };
+      return board.edit(plane, client.projectId, id, change);
+    },
     get operatorUserId() {
       return env().HUD_OPERATOR_USER_ID || null;
     },

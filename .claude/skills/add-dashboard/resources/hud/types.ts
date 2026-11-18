@@ -64,8 +64,10 @@ export interface InboxAction {
   style?: 'primary' | 'danger';
   /** Ask for a line of text first and send it as `args.text`. */
   prompt?: string;
+  /** The prompt is a date picker; `args.text` is then YYYY-MM-DD. */
+  input?: 'date';
 }
-export type InboxKind = 'approval' | 'question' | 'unblock' | 'review' | 'waiting' | 'task';
+export type InboxKind = 'approval' | 'question' | 'unblock' | 'review' | 'waiting' | 'task' | 'issue';
 export interface InboxItem {
   /** Stable across pushes: `<kind>:<source id>`. Snoozes and deep links key on it. */
   id: string;
@@ -80,6 +82,8 @@ export interface InboxItem {
   note?: string;
   /** Shown collapsed: true for things that are parked, not waiting. */
   quiet?: boolean;
+  /** One word the page may highlight. */
+  flag?: 'overdue' | 'mine';
   actions: InboxAction[];
 }
 export interface HudInbox {
@@ -88,6 +92,23 @@ export interface HudInbox {
   more: Partial<Record<InboxKind, number>>;
   snoozed: number;
   sources: Array<Freshness & { kind: InboxKind }>;
+}
+export interface HudClient extends Freshness {
+  id: string;
+  label: string;
+  /** Open issues, after exclusions and snoozes. */
+  open: number;
+  overdue: number;
+  mine: number;
+  /** The most pressing open issues, capped. */
+  issues: InboxItem[];
+  /** Asks waiting on the operator for this client, capped. */
+  waiting: InboxItem[];
+  waitingCount: number;
+}
+export interface HudClients {
+  clients: HudClient[];
+  snoozed: number;
 }
 export interface Hud {
   generatedAt: string;
@@ -98,6 +119,7 @@ export interface Hud {
   skills: HudSkill[];
   hiddenCount: number;
   inbox?: HudInbox;
+  clients?: HudClients;
 }
 export interface TaskSeries {
   agent_group_id: string;

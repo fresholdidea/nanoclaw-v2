@@ -14,6 +14,7 @@
  */
 import type { ResponsePayload } from '../response-registry.js';
 import { unblockReply } from './sources/unblock.js';
+import type { IssueChange } from './issues.js';
 import type { HudStore } from './store.js';
 
 export interface HudActor {
@@ -62,6 +63,13 @@ export interface HudActionDeps {
   openUnblock(date: string, id: string): boolean;
   /** Put a line into the operator's chat session, as if they had typed it. False when there is no such session. */
   reply(text: string): Promise<boolean>;
+  /**
+   * Change one Plane issue of one registry client. Refuses a client that is not
+   * in the registry (or is excluded) and an issue the host did not list for it.
+   */
+  editIssue(client: string, id: string, change: IssueChange): Promise<HudActionResult>;
+  /** Called after an action succeeds, so the dashboard gets a fresh snapshot now instead of at the next push. */
+  changed?(): void;
   store: HudStore;
   now?: () => Date;
 }
@@ -69,7 +77,11 @@ export interface HudActionDeps {
 const refuse = (message: string): HudActionResult => ({ ok: false, message });
 const str = (v: unknown, pattern: RegExp): string | null => (typeof v === 'string' && pattern.test(v) ? v : null);
 const ID = /^[\w.:-]{1,120}$/;
-const ITEM = /^(approval|question|unblock|review|waiting|task):[\w.:/-]{1,160}$/;
+const CLIENT = /^[\w-]{1,60}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A real calendar date, YYYY-MM-DD. */
+const isDate = (v: string) => /^\d{4}-\d\d-\d\d$/.test(v) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
+const ITEM = /^(approval|question|unblock|review|waiting|task|issue):[\w.:/-]{1,160}$/;
 
 export function createHudActions(deps: HudActionDeps): Record<string, HudAction> {
   const now = () => (deps.now ?? (() => new Date()))();
@@ -159,6 +171,26 @@ export function createHudActions(deps: HudActionDeps): Record<string, HudAction>
       return { ok: true, message: `Sent to chat: ${line}` };
     },
 
+    'issue.close': async (args) => {
+      const client = str(args.client, CLIENT),
+        id = str(args.id, UUID);
+      if (!client || !id) return refuse('Needs a client and an issue id.');
+      return deps.editIssue(client, id, { done: true });
+    },
+
+    'issue.update': async (args) => {
+      const client = str(args.client, CLIENT),
+        id = str(args.id, UUID),
+        field = str(args.field, /^(name|due)$/);
+      if (!client || !id || !field) return refuse('Needs a client, an issue id and a field (name or due).');
+      // One line, no control characters.
+      const text = str(args.text, /^[^\p{Cc}]{1,255}$/u)?.trim();
+      if (!text) return refuse('Needs a value, 255 characters at most.');
+      if (field === 'name') return deps.editIssue(client, id, { name: text });
+      if (!isDate(text)) return refuse('A due date looks like 2026-12-31.');
+      return deps.editIssue(client, id, { due: text });
+    },
+
     'item.snooze': async (args) => {
       const item = str(args.item, ITEM),
         hours = Number(str(args.hours, /^\d{1,3}$/));
@@ -190,6 +222,13 @@ export function createHudActions(deps: HudActionDeps): Record<string, HudAction>
           });
         } catch {
           // An action that happened must still be reported as it went.
+        }
+        if (result.ok) {
+          try {
+            deps.changed?.();
+          } catch {
+            // The next scheduled push carries the change.
+          }
         }
         return result;
       },

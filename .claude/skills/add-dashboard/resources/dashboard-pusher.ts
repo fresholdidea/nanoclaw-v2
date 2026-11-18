@@ -86,7 +86,10 @@ export async function startDashboard(): Promise<void> {
     .map((login) => login.trim())
     .filter(Boolean);
   // Work actions the dashboard may trigger; the map's keys are the allowlist.
-  const actions = dashboardHudActions();
+  // After one succeeds the snapshot is pushed again at once, so the page shows the result in seconds.
+  const actions = dashboardHudActions(() => {
+    push({ port, secret }).catch((err) => log.error('Dashboard push failed', { err }));
+  });
   const serverConfig = {
     port,
     secret,

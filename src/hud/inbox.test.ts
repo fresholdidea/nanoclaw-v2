@@ -315,6 +315,10 @@ describe('actions', () => {
       },
       openUnblock: (date, id) => date === '2026-11-17' && id === 'U16',
       reply: async (text) => (calls.push(['reply', text]), true),
+      editIssue: async (client, id, change) => (
+        calls.push(['editIssue', { client, id, change }]),
+        { ok: true, message: 'ok' }
+      ),
       ...over,
     };
     return { actions: createHudActions(deps), calls };
@@ -324,6 +328,8 @@ describe('actions', () => {
     expect(Object.keys(setup().actions).sort()).toEqual([
       'approval.approve',
       'approval.reject',
+      'issue.close',
+      'issue.update',
       'item.snooze',
       'question.answer',
       'task.pause',
