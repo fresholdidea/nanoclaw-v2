@@ -110,6 +110,21 @@ export interface HudClients {
   clients: HudClient[];
   snoozed: number;
 }
+export type HealthStatus = 'ok' | 'warn' | 'down';
+/** One integration, job or access path, with the verdict some existing record gives it. */
+export interface HealthRow extends Freshness {
+  /** Stable across pushes; deep links key on it. */
+  id: string;
+  group: 'ads' | 'collector' | 'tracker' | 'jobs' | 'walls';
+  label: string;
+  status: HealthStatus;
+  detail: string;
+  /** Reasons and next steps, shown when the row is opened. */
+  notes?: string[];
+}
+export interface HudHealth {
+  rows: HealthRow[];
+}
 export interface Hud {
   generatedAt: string;
   timezone: string;
@@ -120,6 +135,7 @@ export interface Hud {
   hiddenCount: number;
   inbox?: HudInbox;
   clients?: HudClients;
+  health?: HudHealth;
 }
 export interface TaskSeries {
   agent_group_id: string;

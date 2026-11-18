@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readEnvFile } from '../env.js';
@@ -17,6 +18,8 @@ import { writeSessionMessage } from '../session-manager.js';
 import { createHudActions, type HudAction } from './actions.js';
 import { createClientsCollector } from './clients.js';
 import { createHudCollector } from './collect.js';
+import { createHealthCollector } from './health.js';
+import { parseLaunchctl, type LaunchdJob } from './sources/health.js';
 import { exclusionFilter } from './exclusions.js';
 import { createIssueBoard } from './issues.js';
 import { createPlane, type Plane } from './plane.js';
@@ -27,6 +30,7 @@ import type { HudInbox, TaskSeries } from './types.js';
 const collect = createHudCollector();
 const collectInbox = createInboxCollector();
 const collectClients = createClientsCollector();
+const collectHealth = createHealthCollector();
 const board = createIssueBoard();
 let lastInbox: HudInbox | null = null;
 // Approvals that restart, reconfigure or create things stay on the chat card.
@@ -38,6 +42,8 @@ const HUD_ENV = [
   'HUD_INBOX_OPS_GROUP',
   'HUD_VAULT_DIR',
   'HUD_AD_METRICS_DB',
+  'HUD_AD_INGEST_DB',
+  'HUD_HEALTH_LAUNCHD',
   'HUD_EXCLUSIONS',
   'HUD_OPERATOR_USER_ID',
   'HUD_APPROVAL_ACTIONS',
@@ -146,6 +152,31 @@ function refreshPlane(env: Record<string, string | undefined>): void {
       planeRefreshing = null;
     });
 }
+let launchdJobs: Map<string, LaunchdJob> | null = null;
+let launchdAsOf: string | null = null;
+let launchdReadAt = 0;
+let launchdReading = false;
+const LAUNCHD_REFRESH_MS = 5 * 60_000;
+/** launchd labels the operator asked to watch (HUD_HEALTH_LAUNCHD, comma separated). */
+function launchdLabels(env: Record<string, string | undefined>): string[] {
+  return (env.HUD_HEALTH_LAUNCHD ?? '')
+    .split(',')
+    .map((l) => l.trim())
+    .filter((l) => /^[\w.-]{1,120}$/.test(l))
+    .slice(0, 30);
+}
+/** Reads job state beside the push; a failed read leaves the rows marked unread. */
+function refreshLaunchd(labels: string[]): void {
+  if (!labels.length || process.platform !== 'darwin' || launchdReading) return;
+  if (Date.now() - launchdReadAt < LAUNCHD_REFRESH_MS) return;
+  launchdReading = true;
+  launchdReadAt = Date.now();
+  execFile('/bin/launchctl', ['list'], { timeout: 5000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    launchdReading = false;
+    launchdJobs = err ? null : parseLaunchctl(stdout);
+    if (!err) launchdAsOf = new Date().toISOString();
+  });
+}
 let lastTasks: TaskSeries[] | null = null;
 let tasksAsOf: string | null = null;
 let refreshing: Promise<void> | null = null;
@@ -198,6 +229,7 @@ export async function collectDashboardHud(tokens: { daily?: Record<string, numbe
     inboxOps: env.HUD_INBOX_OPS_GROUP,
     vault: env.HUD_VAULT_DIR,
     adMetrics: env.HUD_AD_METRICS_DB,
+    adIngest: env.HUD_AD_INGEST_DB,
     exclusions: env.HUD_EXCLUSIONS !== 'false',
   };
   // The inbox's DB reads happen before the file budget starts.
@@ -244,6 +276,31 @@ export async function collectDashboardHud(tokens: { daily?: Record<string, numbe
     });
   } catch (err) {
     log.warn('HUD clients collection failed', { err });
+  }
+  try {
+    const labels = launchdLabels(env);
+    refreshLaunchd(labels);
+    const found = clientRegistry(env);
+    const keep = found ? exclusionFilter(found.raw, env.HUD_EXCLUSIONS !== 'false').keep : () => true;
+    hud.health = collectHealth(paths, {
+      tasks: lastTasks,
+      tasksAsOf,
+      launchd: { asOf: launchdAsOf, jobs: launchdJobs, labels },
+      tracker: found
+        ? {
+            configured: planeOk,
+            projects: found.registry.clients
+              .filter((c) => c.projectId && keep({ id: c.id, label: c.label }))
+              .map((c) => {
+                const entry = board.get(c.projectId!);
+                return { label: c.label, asOf: entry?.asOf ?? null, unavailable: !entry || !!entry.unavailable };
+              }),
+          }
+        : null,
+      deadline: performance.now() + 100,
+    });
+  } catch (err) {
+    log.warn('HUD health collection failed', { err });
   }
   return hud;
 }

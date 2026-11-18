@@ -27,6 +27,8 @@ export interface HudPaths {
   inboxOps?: string;
   vault?: string;
   adMetrics?: string;
+  /** The ad-metrics ingest database (its `ingest_runs` log), for the health table. */
+  adIngest?: string;
   exclusions?: boolean;
 }
 export interface HudInput {
