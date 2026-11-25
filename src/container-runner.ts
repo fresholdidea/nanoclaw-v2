@@ -67,6 +67,7 @@ import './provider-contracts/index.js';
 import { getProviderHostContract } from './provider-contracts/registry.js';
 import { resolveProviderName } from './providers/provider-name.js';
 import {
+  initializeProviderGroupSurfaces,
   providerStateVolumePath,
   realizeProviderSpawnSurfaces,
   syncSharedSkillLinks,
@@ -472,6 +473,9 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
   await initGroupFilesystem(agentGroup, { provider: providerName });
+  // Quota fallbacks (e.g. codex → claude) get their group surfaces, mounts and
+  // gateway grant alongside the primary so the runner can switch mid-batch.
+  const fallbackProviders = spawnFallbackProviders(providerName, containerConfig, agentGroup);
 
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
@@ -479,7 +483,15 @@ async function spawnContainer(session: Session): Promise<void> {
   const { provider, contribution, surfaces } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
-  const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, surfaces);
+  const mounts = await buildMounts(
+    agentGroup,
+    session,
+    containerConfig,
+    provider,
+    contribution,
+    surfaces,
+    fallbackProviders,
+  );
   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
 
   const driver = getSessionDriver();
@@ -495,6 +507,7 @@ async function spawnContainer(session: Session): Promise<void> {
     }),
     groupName: agentGroup.name,
     provider,
+    fallbackProviders,
     containerName,
     capabilities: driver.capabilities(),
   });
@@ -1210,6 +1223,7 @@ export async function buildMounts(
   provider: string,
   providerContribution: ProviderContainerContribution,
   providerSurfaces?: ProviderSpawnRealization,
+  fallbackProviders: readonly string[] = [],
 ): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
 
@@ -1413,6 +1427,111 @@ export async function buildMounts(
     mounts.push(...providerContribution.mounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
 
+  for (const fallback of fallbackProviders) {
+    mounts.push(...(await fallbackProviderMounts(fallback, agentGroup, groupDir, sessDir, containerConfig, mounts)));
+  }
+
+  return mounts;
+}
+
+/**
+ * The quota fallbacks this host can stand up for a spawn: the group's resolved
+ * chain after the primary, limited to providers with a declared host contract
+ * (only those can be realized next to another provider). A chain whose head is
+ * not the session's provider was resolved for a different one and is ignored.
+ */
+export function spawnFallbackProviders(
+  providerName: string,
+  containerConfig: import('./container-config.js').ContainerConfig,
+  agentGroup: AgentGroup,
+): string[] {
+  const chain = containerConfig.providerChain ?? [];
+  if (chain[0] !== providerName) return [];
+  const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
+  const fallbacks: string[] = [];
+  for (const name of chain.slice(1)) {
+    const contract = getProviderHostContract(name);
+    if (!contract) {
+      log.warn('Provider fallback skipped: no host contract for it on this install', {
+        agentGroup: agentGroup.name,
+        provider: name,
+      });
+      continue;
+    }
+    initializeProviderGroupSurfaces(name, contract, agentGroup.id, groupDir);
+    fallbacks.push(name);
+  }
+  return fallbacks;
+}
+
+/**
+ * Mounts for one fallback provider: its composed project document, state
+ * volumes and skill views, realized exactly as for a primary. A mount whose
+ * container path is already taken (by the primary or an earlier fallback) is
+ * skipped rather than shadowing it.
+ */
+async function fallbackProviderMounts(
+  provider: string,
+  agentGroup: AgentGroup,
+  groupDir: string,
+  sessDir: string,
+  containerConfig: import('./container-config.js').ContainerConfig,
+  existing: readonly VolumeMount[],
+): Promise<VolumeMount[]> {
+  const contract = getProviderHostContract(provider);
+  if (!contract) return [];
+  const scope = agentGroup.id;
+  const skills = selectedSkillNames(containerConfig);
+  const surfaces = await realizeProviderSpawnSurfaces(provider, contract, agentGroup.id, groupDir, sessDir, skills, {
+    legacyOverlay: async () => ({}),
+    composeProjectDocument: (spec) => composeGroupProjectDoc(agentGroup, groupDir, spec, skills),
+  });
+  const candidates: VolumeMount[] = [];
+  const projectDocument = contract.projectDocument;
+  const composed = path.join(groupDir, projectDocument.fileName);
+  if (fs.existsSync(composed)) {
+    candidates.push({
+      hostPath: composed,
+      containerPath: projectDocument.containerPath,
+      readonly: true,
+      mountClass: projectDocument.mountClass,
+      scope,
+    });
+  }
+  for (const volume of contract.stateVolumes) {
+    candidates.push({
+      hostPath: providerStateVolumePath(volume, agentGroup.id, sessDir),
+      containerPath: volume.containerPath,
+      readonly: volume.mode === 'ro',
+      mountClass: volume.mountClass,
+      scope,
+    });
+  }
+  for (const view of contract.skillViews) {
+    const hostPath = surfaces.skillBackingPaths.get(view.backingId);
+    if (!hostPath) throw new Error(`Provider '${provider}' skill view references unknown backing '${view.backingId}'`);
+    candidates.push({
+      hostPath,
+      containerPath: view.containerPath,
+      readonly: view.mode === 'ro',
+      mountClass: view.mountClass,
+      scope,
+    });
+  }
+  const taken = new Set(existing.map((mount) => mount.containerPath));
+  const mounts: VolumeMount[] = [];
+  for (const mount of candidates) {
+    if (taken.has(mount.containerPath)) {
+      log.warn('Provider fallback mount skipped: container path already mounted', {
+        agentGroup: agentGroup.name,
+        provider,
+        containerPath: mount.containerPath,
+      });
+      continue;
+    }
+    taken.add(mount.containerPath);
+    mounts.push(mount);
+  }
   return mounts;
 }
 

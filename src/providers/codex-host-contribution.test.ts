@@ -29,7 +29,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   GROUPS_DIR: '/tmp/nanoclaw-codex-host-contribution-test/groups',
 }));
 
-import { buildMounts } from '../container-runner.js';
+import { buildMounts, spawnFallbackProviders } from '../container-runner.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../db/index.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../db/container-configs.js';
 import { getProviderContainerConfig } from './provider-container-registry.js';
@@ -156,6 +156,63 @@ describe('codex host contribution against real core', () => {
     const mounts = await buildMounts(ag, session, config, 'codex', contribution);
     const codexShared = path.join(DATA_DIR, 'v2-sessions', ag.id, '.codex-shared');
     expect(codexMounts(mounts)).toEqual(expectedCodexMounts(groupDir, codexShared));
+  });
+
+  newCoreIt('mounts the Claude quota fallback next to codex without shadowing it', async () => {
+    const ag = group('ag-codex-fallback', 'codex-fallback-group');
+    await createAgentGroup(ag);
+    await ensureContainerConfig(ag.id, 'codex');
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    const contribution = await getProviderContainerConfig('codex')!({
+      sessionDir: path.join(DATA_DIR, 'v2-sessions', ag.id, 'session-1'),
+      agentGroupId: ag.id,
+      groupDir,
+      selectedSkills: [],
+      hostEnv: process.env,
+    });
+    const session = { id: 'session-1', agent_group_id: ag.id } as Session;
+    const config: ContainerConfig = {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: [],
+      provider: 'codex',
+      providerChain: ['codex', 'claude'],
+    };
+
+    const fallbacks = spawnFallbackProviders('codex', config, ag);
+    expect(fallbacks).toEqual(['claude']);
+    // Claude's group-lifetime surfaces exist (its settings file is created at init).
+    const claudeShared = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
+    expect(fs.existsSync(path.join(claudeShared, 'settings.json'))).toBe(true);
+
+    const mounts = await buildMounts(ag, session, config, 'codex', contribution, undefined, fallbacks);
+    const codexShared = path.join(DATA_DIR, 'v2-sessions', ag.id, '.codex-shared');
+    expect(codexMounts(mounts)).toEqual(expectedCodexMounts(groupDir, codexShared));
+    expect(mounts.find((m) => m.containerPath === '/home/node/.claude')).toMatchObject({
+      hostPath: claudeShared,
+      readonly: false,
+    });
+    expect(mounts.find((m) => m.containerPath === '/workspace/agent/CLAUDE.md')).toMatchObject({
+      hostPath: path.join(groupDir, 'CLAUDE.md'),
+      readonly: true,
+    });
+    expect(fs.existsSync(path.join(groupDir, 'CLAUDE.md'))).toBe(true);
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(new Set(containerPaths).size).toBe(containerPaths.length);
+  });
+
+  it('stands up no fallback for a chain resolved for another provider', () => {
+    const ag = group('ag-codex-nofallback', 'codex-nofallback-group');
+    const config: ContainerConfig = {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: [],
+      providerChain: ['claude', 'codex'],
+    };
+    expect(spawnFallbackProviders('codex', config, ag)).toEqual([]);
+    expect(spawnFallbackProviders('codex', { ...config, providerChain: ['codex'] }, ag)).toEqual([]);
   });
 
   it('mirrors per-group template skills from the Claude plane into .agents/skills', async () => {

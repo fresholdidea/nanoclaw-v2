@@ -21,6 +21,7 @@ import {
   sqliteGetState,
   sqliteGetUndeliveredMessages,
   sqliteMarkCompleted,
+  sqliteMarkDeferred,
   sqliteMarkFailed,
   sqliteMarkProcessing,
   sqliteMarkScriptSkipped,
@@ -31,6 +32,7 @@ import {
 import type { MessageInRow } from '../../db/messages-in.js';
 import type { MessageOutRow } from '../../db/messages-out.js';
 import {
+  deferredUntil,
   parseContainerRecord,
   parseInboundRecord,
   parseOutboundRecord,
@@ -124,6 +126,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
     if (status === 'processing') sqliteMarkProcessing(ids);
     else if (status === 'completed') sqliteMarkCompleted(ids);
     else if (status === 'failed') ids.forEach(sqliteMarkFailed);
+    else if (deferredUntil(status)) sqliteMarkDeferred(ids, status);
     else sqliteMarkScriptSkipped(ids.map((id) => ({ id, reason: 'error' })));
   }
 

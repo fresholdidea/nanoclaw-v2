@@ -17,6 +17,8 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { isSecretShaped, looksLikeCredential } from './drivers/types.js';
 import { isValidTimezone } from './timezone.js';
 import { log } from './log.js';
+import { resolveProviderChain } from './providers/provider-chain.js';
+import { resolveProviderName } from './providers/provider-name.js';
 import type { AgentGroup, ContainerConfigRow, ContainerSpeed } from './types.js';
 
 /**
@@ -310,6 +312,12 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   skills: string[] | 'all';
   provider?: string;
+  /**
+   * Quota fallback chain, primary first (`provider_chain`, else the provider's
+   * default). The runner switches down it when a provider reports its quota
+   * exhausted; a chain whose head is not the runner's provider is ignored.
+   */
+  providerChain?: string[];
   groupName?: string;
   assistantName?: string;
   agentGroupId?: string;
@@ -477,6 +485,9 @@ export function configFromDb(
     additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
     skills: parseSkillSelection(row.skills, group.name),
     provider: row.provider ?? undefined,
+    providerChain: resolveProviderChain(resolveProviderName(undefined, row.provider), row.provider_chain, {
+      groupName: group.name,
+    }),
     groupName: group.name,
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,

@@ -22,3 +22,23 @@ describe('runner config speed', () => {
     expect(runnerConfigFromRaw({ speed: 7 }).speed).toBeUndefined();
   });
 });
+
+describe('runner config provider chain', () => {
+  it('reads the chain the host resolved', () => {
+    expect(runnerConfigFromRaw({ provider: 'codex', providerChain: ['codex', 'claude'] }).providerChain).toEqual([
+      'codex',
+      'claude',
+    ]);
+  });
+
+  it('is just the provider when the host wrote none (an older host)', () => {
+    expect(runnerConfigFromRaw({ provider: 'codex' }).providerChain).toEqual(['codex']);
+    expect(runnerConfigFromRaw({}).providerChain).toEqual(['claude']);
+  });
+
+  it('ignores a chain resolved for a different provider', () => {
+    expect(runnerConfigFromRaw({ provider: 'codex', providerChain: ['claude', 'codex'] }).providerChain).toEqual([
+      'codex',
+    ]);
+  });
+});

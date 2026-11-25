@@ -4,6 +4,7 @@
 import { getConfig } from '../config.js';
 import { getAgentMailbox } from '../mailbox/index.js';
 import type { InboundMessage } from '../mailbox/types.js';
+import { deferredStatus } from '../mailbox/model.generated.js';
 
 export interface MessageInRow {
   id: string;
@@ -91,6 +92,15 @@ export function markCompleted(ids: string[]): void {
 
 export function markScriptSkipped(skips: Array<{ id: string; reason: string }>): void {
   getAgentMailbox().operations.markScriptSkipped(skips);
+}
+
+/**
+ * Hand messages back to the host to run again at `until` (quota fallback).
+ * They stay pending; the host moves process_after and counts a try.
+ */
+export function markDeferred(ids: string[], until: Date): void {
+  if (ids.length === 0) return;
+  getAgentMailbox().operations.markMessages(ids, deferredStatus(until));
 }
 
 export function markFailed(id: string): void {

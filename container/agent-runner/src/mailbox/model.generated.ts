@@ -19,7 +19,30 @@ export function parseIsoTimestamp(value: unknown): IsoTimestamp {
   return value as IsoTimestamp;
 }
 
-export type ProcessingStatus = 'processing' | 'completed' | 'failed' | 'script-skip:error';
+/**
+ * `deferred:<ISO time>` — the runner could not run the message now (every
+ * provider in its fallback chain is out of quota) and asks the host to keep it
+ * pending until that time. The host moves `process_after` there and counts a
+ * try; the runner treats the claim as released once the time has passed.
+ */
+export type DeferredStatus = `deferred:${string}`;
+export type ProcessingStatus = 'processing' | 'completed' | 'failed' | 'script-skip:error' | DeferredStatus;
+
+const DEFERRED_PREFIX = 'deferred:';
+
+export function deferredStatus(until: Date): DeferredStatus {
+  return `${DEFERRED_PREFIX}${until.toISOString()}`;
+}
+
+/** The time a `deferred:<ISO>` status holds the message until, or undefined for any other status. */
+export function deferredUntil(status: string): IsoTimestamp | undefined {
+  if (!status.startsWith(DEFERRED_PREFIX)) return undefined;
+  const value = status.slice(DEFERRED_PREFIX.length);
+  const milliseconds = Date.parse(value);
+  // Same rule as parseIsoTimestamp: exactly the toISOString() form.
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) return undefined;
+  return value as IsoTimestamp;
+}
 export type TaskStatus = 'pending' | 'paused' | 'completed' | 'failed' | 'cancelled';
 export type InboundStatus = TaskStatus | 'processing';
 
@@ -450,11 +473,17 @@ export function parseOutboundDelivery(value: unknown): OutboundDelivery {
   };
 }
 
+function processingStatus(record: UnknownRecord): ProcessingStatus {
+  const value = record.status;
+  if (typeof value === 'string' && deferredUntil(value)) return value as DeferredStatus;
+  return oneOf(record, 'status', ['processing', 'completed', 'failed', 'script-skip:error'] as const);
+}
+
 export function parseProcessingAckRecord(value: unknown): ProcessingAckRecord {
   const record = strictRecord(value, 'ProcessingAckRecord', ['messageId', 'status', 'statusChanged']);
   return {
     messageId: text(record, 'messageId'),
-    status: oneOf(record, 'status', ['processing', 'completed', 'failed', 'script-skip:error'] as const),
+    status: processingStatus(record),
     statusChanged: timestamp(record, 'statusChanged'),
   };
 }

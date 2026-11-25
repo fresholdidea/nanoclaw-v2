@@ -25,6 +25,7 @@ import { getSessionDriver } from '../../drivers/index.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { getProviderHostContract } from '../../provider-contracts/registry.js';
+import { resolveProviderChain } from '../../providers/provider-chain.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import {
@@ -63,6 +64,34 @@ function parseTimezoneFlag(value: unknown): string | null | undefined {
  * contract). Core only checks membership and stores the name; `""` (clear) is
  * handled by the caller and never reaches here.
  */
+/**
+ * `--provider-chain a,b` / `--no-fallback` → the stored `provider_chain` value:
+ * a JSON array (primary first), `null` to restore the default, or undefined
+ * when neither flag was given. The chain must start with the provider the
+ * group runs on, so a stored chain can never silently reorder the primary.
+ */
+function parseProviderChainFlags(args: Record<string, unknown>, provider: string): string | null | undefined {
+  const rawChain = args['provider-chain'] ?? args.provider_chain;
+  const noFallback = args['no-fallback'] ?? args.no_fallback;
+  if (rawChain !== undefined && noFallback !== undefined) {
+    throw new Error('--provider-chain and --no-fallback are mutually exclusive');
+  }
+  if (noFallback !== undefined) return JSON.stringify([provider]);
+  if (rawChain === undefined) return undefined;
+  const chain = String(rawChain)
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  if (chain.length === 0) return null;
+  const invalid = chain.find((entry) => !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry));
+  if (invalid) throw new Error(`--provider-chain: "${invalid}" is not a provider name`);
+  if (new Set(chain).size !== chain.length) throw new Error('--provider-chain lists a provider twice');
+  if (chain[0] !== provider) {
+    throw new Error(`--provider-chain must start with the group's provider "${provider}" (got "${chain[0]}")`);
+  }
+  return JSON.stringify(chain);
+}
+
 function assertDeclaredSpeedTier(speed: string, provider: string): void {
   const tiers = getProviderHostContract(provider)?.inference?.speedTiers;
   if (tiers === undefined) {
@@ -91,6 +120,8 @@ function presentConfig(row: ContainerConfigRow, ctx: CallerContext): Record<stri
     model: row.model,
     effort: row.effort,
     speed: row.speed,
+    provider_chain: row.provider_chain ?? null,
+    effective_provider_chain: resolveProviderChain(resolveProviderName(undefined, row.provider), row.provider_chain),
     image_tag: row.image_tag,
     assistant_name: row.assistant_name,
     max_messages_per_prompt: row.max_messages_per_prompt,
@@ -489,7 +520,9 @@ registerResource({
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
         '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
-        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
+        '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart), ' +
+        '--provider-chain <primary,fallback,...> (quota fallback order, starting with the group\'s provider; "" restores the default, which is codex → claude), ' +
+        '--no-fallback (never switch providers on quota; the turn waits for the reset instead).',
       handler: async (args, ctx) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -508,6 +541,7 @@ registerResource({
             | 'max_messages_per_prompt'
             | 'cli_scope'
             | 'timezone'
+            | 'provider_chain'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
@@ -534,10 +568,12 @@ registerResource({
           }
           updates.cli_scope = scope;
         }
+        const chainUpdate = parseProviderChainFlags(args, resolveProviderName(updates.provider, row.provider));
+        if (chainUpdate !== undefined) updates.provider_chain = chainUpdate;
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone, --provider-chain, --no-fallback',
           );
         }
 

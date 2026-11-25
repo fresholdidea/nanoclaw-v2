@@ -36,6 +36,7 @@ import {
   parseContainerRecord,
   parseDestinationRecord,
   parseOutboundRecord,
+  deferredUntil,
   parseProcessingAckRecord,
   parseSessionRoutingRecord,
   parseTaskRecord,
@@ -81,8 +82,19 @@ function applyProcessingAcks(db: Database.Database, acks: ProcessingAck[]): void
   const fail = db.prepare(
     "UPDATE messages_in SET status = 'failed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
   );
+  // A deferral keeps the row pending and moves it to the requested time. The
+  // ack stays in outbound.db until the runner re-claims the row, so this runs
+  // on every sweep: it only counts a try when the time actually changes.
+  const defer = db.prepare(
+    `UPDATE messages_in SET process_after = @until, tries = tries + 1
+      WHERE id = @id AND status = 'pending' AND (process_after IS NULL OR process_after <> @until)`,
+  );
   db.transaction(() => {
-    for (const ack of acks) (ack.status === 'script-skip:error' ? fail : complete).run(ack.messageId);
+    for (const ack of acks) {
+      const until = deferredUntil(ack.status);
+      if (until) defer.run({ id: ack.messageId, until });
+      else (ack.status === 'script-skip:error' ? fail : complete).run(ack.messageId);
+    }
   })();
 }
 
@@ -331,7 +343,7 @@ export function wrapSqliteOutbound(
       (
         readable()
           .prepare(
-            "SELECT message_id, status, status_changed FROM processing_ack WHERE status IN ('completed', 'failed', 'script-skip:error')",
+            "SELECT message_id, status, status_changed FROM processing_ack WHERE status IN ('completed', 'failed', 'script-skip:error') OR status LIKE 'deferred:%'",
           )
           .all() as Array<{ message_id: string; status: ProcessingAck['status']; status_changed: string }>
       ).map((row) =>

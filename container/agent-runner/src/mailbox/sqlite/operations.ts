@@ -5,6 +5,7 @@ import type { MessageInRow } from '../../db/messages-in.js';
 import type { MessageOutRow } from '../../db/messages-out.js';
 import {
   createOutboundRecord,
+  deferredUntil,
   parseDestinationRecord,
   parseSessionRoutingRecord,
   parseStateRecord,
@@ -42,10 +43,21 @@ export function sqliteGetPendingMessages(isFirstPoll: boolean, limit: number): M
       .all(isFirstPoll ? 1 : 0) as MessageInRow[];
   });
   if (pending.length === 0) return [];
+  // A deferred claim (quota exhausted on every provider) is released once its
+  // time has passed, whether or not the host has moved process_after yet.
+  const now = Date.now();
   const acked = new Set(
-    (getOutboundDb().prepare('SELECT message_id FROM processing_ack').all() as Array<{ message_id: string }>).map(
-      ({ message_id }) => message_id,
-    ),
+    (
+      getOutboundDb().prepare('SELECT message_id, status FROM processing_ack').all() as Array<{
+        message_id: string;
+        status: string;
+      }>
+    )
+      .filter(({ status }) => {
+        const until = deferredUntil(status);
+        return !until || Date.parse(until) > now;
+      })
+      .map(({ message_id }) => message_id),
   );
   const unclaimed = pending.filter(({ id }) => !acked.has(id));
   const wake = unclaimed.filter(({ trigger }) => trigger === 1).slice(0, limit);
@@ -70,6 +82,10 @@ export function sqliteMarkProcessing(ids: string[]): void {
 
 export function sqliteMarkCompleted(ids: string[]): void {
   mark(ids, 'completed');
+}
+
+export function sqliteMarkDeferred(ids: string[], status: string): void {
+  mark(ids, status);
 }
 
 export function sqliteMarkFailed(id: string): void {

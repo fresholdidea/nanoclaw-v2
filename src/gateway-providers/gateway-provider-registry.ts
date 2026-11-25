@@ -37,6 +37,13 @@ export interface GatewaySessionInput {
    * Gateways that grant model credentials per agent key on it.
    */
   provider?: string;
+  /**
+   * Providers the runtime may switch to when `provider` reports its quota
+   * exhausted (the group's resolved provider chain, minus the primary).
+   * Gateways that grant model access per provider grant these too; a failure
+   * here is logged and never blocks the spawn, since the primary can still run.
+   */
+  fallbackProviders?: readonly string[];
   /** The runtime container this session runs in, as the driver named it; providers key per-session resources on it. */
   containerName: string;
   /**

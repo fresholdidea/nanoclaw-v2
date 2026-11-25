@@ -3,9 +3,19 @@ import {
   getPendingMessages,
   markProcessing,
   markCompleted,
+  markDeferred,
   markScriptSkipped,
   type MessageInRow,
 } from './db/messages-in.js';
+import {
+  MAX_QUOTA_DEFERRALS,
+  ProviderQuotaExhausted,
+  SWITCH_DEFER_MS,
+  isQuotaErrorEvent,
+  parseResetHint,
+  quotaDeferralNotice,
+  type ProviderChain,
+} from './provider-fallback.js';
 import { getUndeliveredMessages, writeMessageOut, type MessageOutRow } from './db/messages-out.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import { resolveDestinationThread } from './db/session-routing.js';
@@ -59,6 +69,13 @@ export interface PollLoopConfig {
    * resurrect a stale id from a different backend.
    */
   providerName: string;
+  /**
+   * Quota fallback chain (primary first). With it, a quota error before any
+   * work defers the batch and ends the loop with 'provider-switch' so the host
+   * respawns the session on the next available provider; when every provider
+   * is out, batches wait for the earliest reset. Absent → errors fail as before.
+   */
+  providerChain?: ProviderChain;
   cwd: string;
   systemContext?: {
     instructions?: string;
@@ -81,7 +98,10 @@ export interface PollLoopConfig {
  * 5. Mark messages completed
  * 6. Loop
  */
-export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+/** Why the loop ended on its own: the runner must restart on another provider. */
+export type PollLoopExit = 'provider-switch';
+
+export async function runPollLoop(config: PollLoopConfig): Promise<PollLoopExit | void> {
   // Contract providers declare these; a contractless (legacy payload)
   // provider keeps declaring them as instance flags, exactly as before.
   const legacy = config.provider as { supportsNativeSlashCommands?: boolean; emitsMidTurnText?: boolean };
@@ -233,6 +253,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    const skippedSet = new Set(skipped.map((s) => s.id));
+    const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
+
+    // Quota fallback gate: run on the best available provider, or hold the
+    // batch until a quota resets (provider-fallback.ts).
+    if (config.providerChain) {
+      const gate = await quotaGate(config.providerChain, config.providerName, processingIds, keep, routing);
+      if (gate === 'switch') return 'provider-switch';
+      if (gate === 'deferred') continue;
+    }
+
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, nativeSlashCommands, config.providerName);
@@ -246,8 +277,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       systemContext: config.systemContext,
     });
     // Process the query while concurrently polling for new messages
-    const skippedSet = new Set(skipped.map((s) => s.id));
-    const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     // Publish the batch's route so MCP tools (send_message, send_file) thread
     // replies into the conversation being answered and stamp in_reply_to for
     // a2a return-path routing. Re-published at every turn boundary inside
@@ -263,6 +292,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const abortActiveQuery = () => query.abort();
     if (config.signal?.aborted) abortActiveQuery();
     else config.signal?.addEventListener('abort', abortActiveQuery, { once: true });
+    // Set when the batch was handed back to the host (quota): no completed
+    // ack, and the runner restarts so claims the dead query held are released.
+    let restartForQuota = false;
     try {
       const result = await processQuery(
         query,
@@ -274,13 +306,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation,
         midTurnCompleteDelivery,
         config.signal,
+        config.providerChain !== undefined,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
     } catch (err) {
-      log(`Query error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+      if (err instanceof ProviderQuotaExhausted && config.providerChain) {
+        restartForQuota = await handleQuotaExhausted(config.providerChain, err, processingIds, keep, routing);
+        if (!restartForQuota && sendsFailureNotice(routing)) {
+          // Out of deferrals: fail like any other run (processQuery held its notice back).
+          await deliverErrorResult(routing, GENERIC_FAILURE_NOTICE).catch((noticeError: unknown) =>
+            log(`Failed to deliver quota failure notice: ${String(noticeError)}`),
+          );
+        }
+      }
+      if (!restartForQuota) log(`Query error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
 
       // Stale/corrupt continuation recovery: ask the provider whether
       // this error means the stored continuation is unusable, and clear
@@ -297,10 +339,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // The batch is still acked completed below (no redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
       // followed by a "Completed" line that reads like success.
-      log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
+      if (!restartForQuota) {
+        log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
+      }
     } finally {
       clearCurrentReplyRoute();
       config.signal?.removeEventListener('abort', abortActiveQuery);
+    }
+    if (restartForQuota) {
+      query.abort();
+      return 'provider-switch';
     }
 
     // Ensure completed even if processQuery ended without a result event
@@ -308,6 +356,78 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+}
+
+/**
+ * Before running a batch: if a provider ahead of the active one is available
+ * (or the active one is cooling down), hand the batch back and restart on it;
+ * if every provider is out, hold the batch until the earliest reset.
+ */
+async function quotaGate(
+  chain: ProviderChain,
+  active: string,
+  ids: string[],
+  batch: MessageInRow[],
+  routing: RoutingContext,
+): Promise<'run' | 'switch' | 'deferred'> {
+  const selection = chain.select();
+  if (!selection.allExhausted) {
+    if (selection.name === active) return 'run';
+    log(`Quota fallback: ${selection.name} is available instead of ${active}; restarting on it`);
+    markDeferred(ids, new Date(Date.now() + SWITCH_DEFER_MS));
+    return 'switch';
+  }
+  const until = selection.earliestReset ?? new Date(Date.now() + SWITCH_DEFER_MS);
+  return (await deferUntilReset(chain, ids, batch, routing, until)) ? 'deferred' : 'run';
+}
+
+/**
+ * The active provider hit its quota before doing any work on the batch.
+ * Record the cooldown and hand the batch back: to the next provider in a few
+ * seconds, or to the earliest reset when the whole chain is out. Returns false
+ * when the batch has been deferred too often and must fail instead.
+ */
+async function handleQuotaExhausted(
+  chain: ProviderChain,
+  err: ProviderQuotaExhausted,
+  ids: string[],
+  batch: MessageInRow[],
+  routing: RoutingContext,
+): Promise<boolean> {
+  const until = chain.markExhausted(err.provider, err.resetsAt);
+  log(`Quota fallback: ${err.provider} out of quota until ${until.toISOString()} (${err.message})`);
+  const next = chain.select();
+  if (!next.allExhausted) {
+    log(`Quota fallback: handing ${ids.length} message(s) to ${next.name}`);
+    markDeferred(ids, new Date(Date.now() + SWITCH_DEFER_MS));
+    return true;
+  }
+  return deferUntilReset(chain, ids, batch, routing, next.earliestReset ?? until);
+}
+
+/** Hold a batch until `until`, telling the sender once. False when it has waited too often already. */
+async function deferUntilReset(
+  chain: ProviderChain,
+  ids: string[],
+  batch: MessageInRow[],
+  routing: RoutingContext,
+  until: Date,
+): Promise<boolean> {
+  const tries = Math.max(0, ...batch.filter((m) => m.trigger === 1).map((m) => m.tries ?? 0));
+  if (tries >= MAX_QUOTA_DEFERRALS) {
+    log(`Quota fallback: batch already deferred ${tries} time(s); running it anyway`);
+    return false;
+  }
+  markDeferred(ids, until);
+  log(`Quota fallback: every provider out of quota; ${ids.length} message(s) held until ${until.toISOString()}`);
+  if (tries === 0 && sendsFailureNotice(routing)) {
+    try {
+      await deliverErrorResult(routing, quotaDeferralNotice(chain.chain, until));
+    } catch (noticeError) {
+      log(`Failed to deliver quota deferral notice: ${String(noticeError)}`);
+    }
+  }
+  return true;
 }
 
 /**
@@ -371,9 +491,26 @@ export async function processQuery(
    */
   midTurnCompleteDelivery = false,
   signal?: AbortSignal,
+  /**
+   * Quota fallback (provider-fallback.ts): a quota error that ends the query
+   * before any turn finished or anything went out throws
+   * ProviderQuotaExhausted instead of sending failure notices, and the batch
+   * stays unacked so the caller can defer it.
+   */
+  quotaFallback = false,
 ): Promise<QueryResult> {
   // adoptTurn mutates routing in place; keep the caller's batch route intact.
   routing = { ...routing };
+  // The last non-retryable quota/rate-limit error this query reported, and
+  // whether the query has done anything a re-run would duplicate.
+  let quotaError: { message: string; resetsAt?: Date } | undefined;
+  let resultsSeen = 0;
+  const queryStartSeq = maxOutboundSeq();
+  const quotaExhaustedBeforeWork = (): ProviderQuotaExhausted | undefined => {
+    if (!quotaFallback || !quotaError || resultsSeen > 0) return undefined;
+    if (maxOutboundSeq() !== queryStartSeq) return undefined;
+    return new ProviderQuotaExhausted(providerName, quotaError.resetsAt, quotaError.message);
+  };
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
@@ -584,6 +721,9 @@ export async function processQuery(
     for await (const event of query.events) {
       handleEvent(event, routing);
       touchHeartbeat();
+      if (isQuotaErrorEvent(event)) {
+        quotaError = { message: event.message, resetsAt: parseResetHint(event.message) };
+      }
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
@@ -609,6 +749,11 @@ export async function processQuery(
           midTurnTail = scan.tail;
         }
       } else if (event.type === 'result') {
+        // A quota failure before any work: leave the batch unacked for the
+        // caller to defer (no notice, no completed ack).
+        const exhausted = event.isError === true ? quotaExhaustedBeforeWork() : undefined;
+        if (exhausted) throw exhausted;
+        resultsSeen += 1;
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
         // stale 'processing' claims while the query stays open for
@@ -717,6 +862,12 @@ export async function processQuery(
     // Freeze the queue before awaiting notices. Follow-ups have already been
     // acknowledged, so an abandoned queued turn cannot rely on redelivery.
     done = true;
+    if (err instanceof ProviderQuotaExhausted) throw err;
+    const exhausted = quotaExhaustedBeforeWork();
+    if (exhausted) {
+      log(`Quota exhausted before any work (${exhausted.message}) — handing the batch back for deferral`);
+      throw exhausted;
+    }
     const cancelled = endedForCommand || signal?.aborted;
     const errMsg = err instanceof Error ? err.message : String(err);
     notifyExchangeComplete(onExchangeComplete, {

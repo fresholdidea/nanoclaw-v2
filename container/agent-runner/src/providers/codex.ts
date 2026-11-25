@@ -78,7 +78,11 @@ export const defaultCodexRuntimeDeps: CodexRuntimeDeps = {
   killCodexAppServer,
 };
 
-function classifyError(message: string): string | undefined {
+export function classifyError(message: string): string | undefined {
+  // ChatGPT-plan exhaustion reads "You've hit your usage limit … try again at
+  // 3:43 PM" (codex_error_info usage_limit_exceeded). Checked first: the
+  // upgrade link in that message must not read as an auth failure.
+  if (/usage.?limit|usage_limit_exceeded/i.test(message)) return 'quota';
   if (/auth|api key|unauthorized|login|credential/i.test(message)) return 'auth';
   if (/quota|rate limit|insufficient|billing|credit/i.test(message)) return 'quota';
   if (/sandbox|permission|denied/i.test(message)) return 'sandbox';

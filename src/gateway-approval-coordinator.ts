@@ -2,6 +2,7 @@ import { gatewayApprovalPresentation } from './gateway-approval-presentation.js'
 import { permitsConfiguredGatewayRead, permitsUncredentialedGatewayRead } from './gateway-read-policy.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getProviderHostContract } from './provider-contracts/index.js';
+import { resolveProviderChain } from './providers/provider-chain.js';
 import { resolveProviderName } from './providers/provider-name.js';
 /** Core-owned human approval flow shared by every gateway provider. */
 import { createHash, randomBytes } from 'node:crypto';
@@ -407,12 +408,17 @@ async function processGatewayRequest(
       if (permitsConfiguredGatewayRead(request.destination)) return current() ? 'approve' : unavailableDecision();
       const config = await getContainerConfig(request.agentGroupId);
       const providerName = resolveProviderName(session.agent_provider, config?.provider);
-      const contract = getProviderHostContract(providerName);
-      const domains = contract?.modelDomains ?? [];
+      // The quota fallbacks run in the same container, so their model hosts
+      // are the group's own model traffic too (codex → claude reaches anthropic.com).
+      const contracts = resolveProviderChain(providerName, config?.provider_chain)
+        .map((name) => getProviderHostContract(name))
+        .filter((contract) => contract !== undefined);
+      const domains = contracts.flatMap((contract) => contract.modelDomains ?? []);
+      const authorities = contracts.flatMap((contract) => contract.modelAuthorities ?? []);
       const host = request.destination.host.toLowerCase().replace(/:443$/, '');
       if (
         domains.some((domain) => host === domain || host.endsWith(`.${domain}`)) ||
-        (contract?.modelAuthorities ?? []).includes(request.destination.host.toLowerCase())
+        authorities.includes(request.destination.host.toLowerCase())
       )
         return current() ? 'approve' : unavailableDecision();
       if (await attachesNoCredential(request.destination)) {

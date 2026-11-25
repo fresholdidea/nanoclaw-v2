@@ -333,6 +333,19 @@ async function ensureSession(input: GatewaySessionInput, signal: AbortSignal): P
   // The OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   await ensureAgentReady(input.key.agentGroupId, input.groupName, input.provider);
+  for (const fallback of input.fallbackProviders ?? []) {
+    if (fallback === input.provider) continue;
+    try {
+      await ensureAgentReady(input.key.agentGroupId, input.groupName, fallback);
+    } catch (err) {
+      // The primary is granted; only the quota fallback to this provider is unavailable.
+      log.warn('OneCLI: fallback provider not granted; quota fallback to it will fail', {
+        agentGroupId: input.key.agentGroupId,
+        provider: fallback,
+        err: (err as Error).message,
+      });
+    }
+  }
   const config = await onecli.getContainerConfig({ agent: input.key.agentGroupId });
   const accountId = await stubAccountId(config);
   log.info('OneCLI gateway applied', { agentGroupId: input.key.agentGroupId, sessionId: input.key.sessionId });

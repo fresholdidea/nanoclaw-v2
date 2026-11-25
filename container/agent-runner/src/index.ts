@@ -40,7 +40,8 @@ import './providers/index.js';
 // provider-contracts/index.ts alongside the providers barrel line.
 import './provider-contracts/index.js';
 import { createProvider } from './providers/factory.js';
-import { getProviderRuntimeContract, requireProviderName } from './providers/provider-registry.js';
+import { getProviderRuntimeContract, listProviderNames, requireProviderName } from './providers/provider-registry.js';
+import { ProviderChain } from './provider-fallback.js';
 import { resolvePluginServer } from './plugin-mcp.js';
 import { registerProviderMemorySessionHook } from './provider-contracts/realize.js';
 import type { McpServerConfig } from './providers/types.js';
@@ -54,11 +55,27 @@ const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const providerName = requireProviderName(config.provider);
+  const primaryProvider = requireProviderName(config.provider);
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
 
-  log(`Starting v2 agent-runner (provider: ${providerName})`);
+  // Quota fallback: run the first provider in the chain that is not cooling
+  // down (cooldowns are per session, in session_state). Fallbacks this image
+  // doesn't register are dropped.
+  const registered = listProviderNames();
+  const providerChain = new ProviderChain(
+    config.providerChain.filter((name, index) => index === 0 || registered.includes(name)),
+  );
+  const selection = providerChain.select();
+  const providerName = requireProviderName(selection.name);
+  const onPrimary = providerName === primaryProvider;
+
+  log(
+    `Starting v2 agent-runner (provider: ${providerName}` +
+      (providerChain.hasFallbacks ? `, chain: ${providerChain.chain.join(' → ')}` : '') +
+      (selection.allExhausted ? `, every provider out of quota until ${selection.earliestReset?.toISOString()}` : '') +
+      ')',
+  );
 
   // Every provider shares one persistent memory tree. Legacy imports are an
   // operator-run migration and never happen in this normal startup path.
@@ -126,22 +143,32 @@ async function main(): Promise<void> {
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
-    model: config.model,
-    effort: config.effort,
-    speed: config.speed,
+    // The group's model/effort/speed name the primary provider's options; a
+    // fallback runs on its own defaults (a Codex model id means nothing to Claude).
+    model: onPrimary ? config.model : undefined,
+    effort: onPrimary ? config.effort : undefined,
+    speed: onPrimary ? config.speed : undefined,
   });
   registerProviderMemorySessionHook(providerName, provider, MEMORY_SESSION_HOOK);
 
+  let exit: Awaited<ReturnType<typeof runPollLoop>>;
   try {
-    await runPollLoop({
+    exit = await runPollLoop({
       provider,
       providerContract: getProviderRuntimeContract(providerName),
       providerName,
+      providerChain,
       cwd: CWD,
       systemContext: { instructions },
     });
   } finally {
     await mailbox.stop();
+  }
+  if (exit === 'provider-switch') {
+    // The deferred batch is due in a few seconds; the host respawns this
+    // session and the next runner starts on the chain's next provider.
+    log('Exiting so the host respawns this session on another provider');
+    process.exit(0);
   }
 }
 

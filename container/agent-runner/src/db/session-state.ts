@@ -72,6 +72,27 @@ export function clearContinuation(providerName: string): void {
   deleteValue(continuationKey(providerName));
 }
 
+function quotaKey(providerName: string): string {
+  return `quota-cooldown:${providerName.toLowerCase()}`;
+}
+
+/**
+ * When a provider reported its quota exhausted, the time it is expected back
+ * (ISO). Kept per session in outbound.db so a respawned runner starts on the
+ * next provider in its fallback chain instead of hitting the same wall.
+ */
+export function getQuotaCooldown(providerName: string): string | undefined {
+  return getValue(quotaKey(providerName));
+}
+
+export function setQuotaCooldown(providerName: string, untilIso: string): void {
+  setValue(quotaKey(providerName), untilIso);
+}
+
+export function clearQuotaCooldown(providerName: string): void {
+  deleteValue(quotaKey(providerName));
+}
+
 /**
  * Where the message being answered came from, plus its id for the a2a return
  * path. Null routing fields mean the batch has no channel (a task run).

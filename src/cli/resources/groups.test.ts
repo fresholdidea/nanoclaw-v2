@@ -552,6 +552,44 @@ describe('groups config (host-only)', () => {
       expect(await speedOf()).toBe('turbo');
     });
   });
+
+  describe('--provider-chain / --no-fallback set the quota fallback chain', () => {
+    const GID = 'ag-chain';
+    const chainOf = async (): Promise<string | null | undefined> => (await getContainerConfig(GID))!.provider_chain;
+    const update = (args: Record<string, unknown>) =>
+      dispatch({ id: 'chain', command: 'groups-config-update', args: { id: GID, ...args } }, { caller: 'host' });
+
+    beforeEach(async () => {
+      await createAgentGroup({ id: GID, name: 'c', folder: 'c', agent_provider: null, created_at: now() });
+      await ensureContainerConfig(GID, 'codex');
+    });
+
+    it('shows the default chain for a Codex group', async () => {
+      const res = await dispatch({ id: 'get', command: 'groups-config-get', args: { id: GID } }, { caller: 'host' });
+      expect(res.ok).toBe(true);
+      expect((res as { data: Record<string, unknown> }).data.effective_provider_chain).toEqual(['codex', 'claude']);
+    });
+
+    it('stores an explicit chain, the opt-out, and clears back to the default', async () => {
+      expect((await update({ 'provider-chain': 'codex, claude' })).ok).toBe(true);
+      expect(await chainOf()).toBe('["codex","claude"]');
+      expect((await update({ 'no-fallback': true })).ok).toBe(true);
+      expect(await chainOf()).toBe('["codex"]');
+      expect((await update({ 'provider-chain': '' })).ok).toBe(true);
+      expect(await chainOf()).toBeNull();
+    });
+
+    it('refuses a chain that does not start with the group provider, a repeat, or both flags', async () => {
+      expect(errorMessage(await update({ 'provider-chain': 'claude,codex' }))).toContain(
+        'must start with the group\'s provider "codex"',
+      );
+      expect(errorMessage(await update({ 'provider-chain': 'codex,claude,codex' }))).toContain('twice');
+      expect(errorMessage(await update({ 'provider-chain': 'codex', 'no-fallback': true }))).toContain(
+        'mutually exclusive',
+      );
+      expect(await chainOf()).toBeNull();
+    });
+  });
 });
 
 /**

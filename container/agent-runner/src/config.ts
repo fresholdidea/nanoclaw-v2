@@ -13,6 +13,8 @@ const CONFIG_PATH = '/workspace/agent/container.json';
 
 export interface RunnerConfig {
   provider: string;
+  /** Quota fallback chain, primary first; `[provider]` when the host wrote none. */
+  providerChain: string[];
   assistantName: string;
   groupName: string;
   agentGroupId: string;
@@ -50,6 +52,7 @@ export function loadConfig(): RunnerConfig {
 export function runnerConfigFromRaw(raw: Record<string, unknown>): RunnerConfig {
   return {
     provider: (raw.provider as string) || 'claude',
+    providerChain: readProviderChain(raw),
     assistantName: (raw.assistantName as string) || '',
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
@@ -59,6 +62,19 @@ export function runnerConfigFromRaw(raw: Record<string, unknown>): RunnerConfig 
     effort: (raw.effort as string) || undefined,
     speed: readSpeed(raw),
   };
+}
+
+/**
+ * The host writes the resolved chain (primary first). A chain that does not
+ * start with this runner's provider was resolved for another one: no fallback.
+ */
+function readProviderChain(raw: Record<string, unknown>): string[] {
+  const provider = ((raw.provider as string) || 'claude').toLowerCase();
+  const chain = Array.isArray(raw.providerChain)
+    ? raw.providerChain.filter((entry): entry is string => typeof entry === 'string').map((e) => e.toLowerCase())
+    : [];
+  if (chain[0] !== provider) return [provider];
+  return [...new Set(chain)];
 }
 
 /**

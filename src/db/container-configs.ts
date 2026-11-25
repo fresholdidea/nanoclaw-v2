@@ -12,6 +12,8 @@ const SCALAR_COLUMNS = new Set([
   'cli_scope',
   'timezone',
   'speed',
+  // JSON array of provider names (primary first), or NULL for the default chain.
+  'provider_chain',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
@@ -88,6 +90,7 @@ export async function updateContainerConfigScalars(
       | 'cli_scope'
       | 'timezone'
       | 'speed'
+      | 'provider_chain'
     >
   >,
 ): Promise<void> {
